@@ -2,14 +2,39 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dtime
+from zoneinfo import ZoneInfo
 import requests
 from streamlit_autorefresh import st_autorefresh
 
 # Page configuration
 st.set_page_config(page_title="NIFTY Pro Trading Dashboard", layout="wide", initial_sidebar_state="expanded")
 
-REFRESH_INTERVAL_MS = 10_000  # Dhan Option Chain limit is 1 req/3s; 10s leaves headroom
+REFRESH_INTERVAL_MS = 10_000       # active-market polling: every 10s (API limit is 1 req/3s)
+IDLE_CHECK_INTERVAL_MS = 60_000    # while market is closed, just recheck the clock every 60s
+
+IST = ZoneInfo("Asia/Kolkata")
+NSE_OPEN = dtime(9, 15)
+NSE_CLOSE = dtime(15, 30)
+
+def market_status(now_ist=None):
+    """
+    Returns (is_open, reason, now_ist). Checks weekday + NSE cash/derivatives
+    session window (09:15-15:30 IST). Does NOT know about NSE trading
+    holidays (Diwali, Republic Day, etc.) since that needs a holiday
+    calendar Dhan doesn't expose here — on those days the market will show
+    as 'open' by this check but the option chain API will simply return
+    stale/last-close data, which is safe, just not fresh.
+    """
+    now_ist = now_ist or datetime.now(IST)
+    weekday = now_ist.weekday()  # Mon=0 ... Sun=6
+    if weekday >= 5:
+        return False, "Weekend — NSE is closed.", now_ist
+    if now_ist.time() < NSE_OPEN:
+        return False, f"Pre-market — NSE opens at {NSE_OPEN.strftime('%H:%M')} IST.", now_ist
+    if now_ist.time() > NSE_CLOSE:
+        return False, f"Post-market — NSE closed at {NSE_CLOSE.strftime('%H:%M')} IST.", now_ist
+    return True, "Market open.", now_ist
 
 # Custom CSS
 st.markdown("""
@@ -129,19 +154,46 @@ with st.sidebar:
     st.header("📊 Signal Logic")
     st.markdown("- **🟢 BUY CE:** Call OI ↓ + Put OI ↑\n- **🔴 BUY PE:** Call OI ↑ + Put OI ↓\n- **⚪ AVOID:** No clear trend")
 
-# Kick off the 10s auto-refresh loop only if the user has it enabled.
-# st_autorefresh must be called on every run to keep re-arming the timer.
-if auto_refresh_on:
+is_open, status_reason, now_ist = market_status()
+should_poll = auto_refresh_on and is_open
+
+# Keep re-arming the appropriate timer every run. Fast 10s poll while the
+# market's live and the user wants it; a slow 60s clock-check while closed
+# so the page notices when the market opens again — without ever calling
+# the Dhan option chain API outside trading hours.
+if should_poll:
     st_autorefresh(interval=REFRESH_INTERVAL_MS, key="oi_autorefresh")
+elif not is_open:
+    st_autorefresh(interval=IDLE_CHECK_INTERVAL_MS, key="idle_clock_check")
 
 status_col1, status_col2 = st.columns([3, 1])
 with status_col1:
-    st.markdown(f'<span class="live-badge">● LIVE DATA (EXPIRY: {st.session_state.selected_expiry})</span>', unsafe_allow_html=True)
+    if is_open:
+        st.markdown(f'<span class="live-badge">● LIVE DATA (EXPIRY: {st.session_state.selected_expiry})</span>', unsafe_allow_html=True)
+    else:
+        st.markdown(f'<span class="live-badge" style="background-color:#6c757d;">● MARKET CLOSED</span>', unsafe_allow_html=True)
+        st.caption(f"{status_reason} (IST now: {now_ist.strftime('%a %d-%b %H:%M:%S')})")
 with status_col2:
-    if auto_refresh_on:
+    if not is_open:
+        st.caption("⏸️ Polling stopped")
+    elif should_poll:
         st.caption("🔄 Auto-refreshing every 10s")
     else:
         st.caption("⏸️ Auto-refresh paused")
+
+if not is_open:
+    if st.session_state.previous_df is not None and st.session_state.last_fetch is not None:
+        st.info(
+            f"Showing the last snapshot fetched at "
+            f"{st.session_state.last_fetch.strftime('%H:%M:%S')} before the market closed. "
+            f"No new API calls are being made until the next session."
+        )
+        current_df = st.session_state.previous_df.copy()
+    else:
+        st.warning("Market is closed and no data has been fetched yet this session.")
+        st.stop()
+else:
+    pass  # falls through to the live fetch below
 
 # ==========================================
 # 1. FETCH LIVE OPTION CHAIN FOR SELECTED EXPIRY
@@ -189,13 +241,16 @@ def fetch_dhan_option_chain(expiry_date):
     except Exception as e:
         return None, f"Connection Error: {str(e)}"
 
-# Fetch and Process Data
-with st.spinner("🔄 Fetching live option chain..."):
-    current_df, error = fetch_dhan_option_chain(st.session_state.selected_expiry)
+# Fetch and Process Data — only during market hours (the closed-market
+# branch above already set current_df from the last cached snapshot and
+# falls through to here for the rest of the page to render).
+if is_open:
+    with st.spinner("🔄 Fetching live option chain..."):
+        current_df, error = fetch_dhan_option_chain(st.session_state.selected_expiry)
 
-if error:
-    st.error(f"❌ {error}")
-    st.stop()
+    if error:
+        st.error(f"❌ {error}")
+        st.stop()
 
 # ==========================================
 # 2. CALCULATE OI CHANGES USING MEMORY
