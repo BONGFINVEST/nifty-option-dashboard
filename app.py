@@ -5,39 +5,24 @@ from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
 import requests
 
-# Page configuration
-st.set_page_config(page_title="NIFTY Pro Trading Dashboard", layout="wide", initial_sidebar_state="expanded")
-
-# Custom CSS for PDF-like styling
-st.markdown("""
-<style>
-    .signal-bullish { background-color: #d4edda; color: #155724; padding: 20px; border-radius: 10px; text-align: center; font-size: 24px; font-weight: bold; margin: 10px 0; }
-    .signal-bearish { background-color: #f8d7da; color: #721c24; padding: 20px; border-radius: 10px; text-align: center; font-size: 24px; font-weight: bold; margin: 10px 0; }
-    .signal-neutral { background-color: #fff3cd; color: #856404; padding: 20px; border-radius: 10px; text-align: center; font-size: 24px; font-weight: bold; margin: 10px 0; }
-    .live-badge { background-color: #28a745; color: white; padding: 5px 15px; border-radius: 20px; display: inline-block; animation: pulse 2s infinite; }
-    @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.5; } 100% { opacity: 1; } }
-</style>
-""", unsafe_allow_html=True)
+# Page Configuration
+st.set_page_config(page_title="NIFTY Pro Trading Dashboard", layout="wide")
 
 st.title("📊 NIFTY PRO TRADING DASHBOARD")
-st.markdown('<span class="live-badge">● LIVE DATA</span>', unsafe_allow_html=True)
 st.markdown("---")
 
-# Initialize session state for memory tracking
+# Initialize Session State for Memory Tracking
 if 'previous_df' not in st.session_state:
     st.session_state.previous_df = None
-if 'last_fetch' not in st.session_state:
-    st.session_state.last_fetch = None
 
 # Sidebar Controls
 with st.sidebar:
     st.header("⚙️ Risk Parameters")
-    risk_reward = st.selectbox("Risk:Reward Ratio", ["1:2", "1:3", "1:1.5"], index=1)
     sl_points = st.slider("Stop Loss (Points)", 10, 100, 30, 5)
     
     st.markdown("---")
     st.header("📊 Signal Logic")
-    st.markdown("- **🟢 BUY CE:** Call OI ↓ + Put OI ↑\n- ** BUY PE:** Call OI ↑ + Put OI ↓\n- **⚪ AVOID:** No clear trend")
+    st.markdown("- ** BUY CE:** Call OI ↓ + Put OI ↑\n- **🔴 BUY PE:** Call OI ↑ + Put OI ↓\n- **⚪ AVOID:** No clear trend")
 
 # Check Credentials
 if 'DHAN_CLIENT_ID' not in st.secrets or 'DHAN_ACCESS_TOKEN' not in st.secrets:
@@ -59,18 +44,24 @@ def fetch_dhan_option_chain():
             "Content-Type": "application/json"
         }
         
-        # Calculate next Thursday expiry
+        # Calculate Next Weekly Expiry (Thursday)
         today = datetime.today()
-        days_ahead = 3 - today.weekday()
+        days_ahead = 3 - today.weekday()  # 3 = Thursday
+        
+        # CRITICAL FIX: If expiry is today (0) or tomorrow (1), fetch NEXT week
         if days_ahead <= 1:
             days_ahead += 7
-        expiry_date = (today + timedelta(days=days_ahead)).strftime("%d-%m-%Y")
+            
+        next_expiry = today + timedelta(days=days_ahead)
+        
+        # ROOT CAUSE FIX: Dhan API strictly requires DD-MM-YYYY format
+        expiry_date = next_expiry.strftime("%d-%m-%Y")
         
         url = "https://api.dhan.co/v2/optionchain"
         payload = {
-            "underlyingScrip": 13,  # 13 for NIFTY
-            "underlyingSeg": "IDX_I",
-            "expiry": expiry_date
+            "underlyingScrip": 13,      # 13 for NIFTY
+            "underlyingSeg": "IDX_I",   # IDX_I for Indices
+            "expiry": expiry_date       # Format: DD-MM-YYYY
         }
         
         response = requests.post(url, headers=headers, json=payload, timeout=30)
@@ -115,7 +106,6 @@ if error:
 # 2. CALCULATE OI CHANGES USING MEMORY
 # ==========================================
 if st.session_state.previous_df is not None:
-    # Merge current and previous data to calculate exact OI Change
     merged = pd.merge(current_df[['Strike', 'Call OI', 'Put OI']], 
                       st.session_state.previous_df[['Strike', 'Call OI', 'Put OI']], 
                       on='Strike', suffixes=('_cur', '_prev'))
@@ -125,13 +115,11 @@ if st.session_state.previous_df is not None:
     
     current_df = current_df.merge(merged[['Strike', 'Call OI Change', 'Put OI Change']], on='Strike')
 else:
-    # First run: OI Change is 0
     current_df['Call OI Change'] = 0
     current_df['Put OI Change'] = 0
 
 # Update memory for next run
 st.session_state.previous_df = current_df.copy()
-st.session_state.last_fetch = datetime.now()
 
 # Clean data
 for col in current_df.columns:
@@ -149,36 +137,32 @@ total_call_oi_chg = zone_data['Call OI Change'].sum()
 total_put_oi_chg = zone_data['Put OI Change'].sum()
 
 # ==========================================
-# 3. PCR RANKING (Smart Money Footprint)
+# 3. PCR RANKING & WRITER STRENGTH
 # ==========================================
-st.subheader("📊 PCR Strike Ranking (Smart Money Footprint)")
 valid_pcr_df = current_df[(current_df['PCR'] > 0.1) & (current_df['PCR'] < 10.0)].copy()
 
+col1, col2 = st.columns(2)
 if not valid_pcr_df.empty:
     highest_pcr_row = valid_pcr_df.loc[valid_pcr_df['PCR'].idxmax()]
     lowest_pcr_row = valid_pcr_df.loc[valid_pcr_df['PCR'].idxmin()]
     
-    col1, col2 = st.columns(2)
     with col1:
         st.markdown(f"""
         <div style='background-color: #d4edda; padding: 15px; border-radius: 10px; border-left: 5px solid #28a745;'>
-            <h4 style='margin: 0; color: #155724;'>🟢 Highest PCR (Strongest Support)</h4>
+            <h4 style='margin: 0; color: #155724;'>🟢 Highest PCR (Support)</h4>
             <h2 style='margin: 10px 0; color: #155724;'>Strike: {highest_pcr_row['Strike']:.0f}</h2>
-            <p style='margin: 0; color: #155724;'><b>PCR Value:</b> {highest_pcr_row['PCR']:.2f} | <b>Put OI:</b> {highest_pcr_row['Put OI']:,.0f}</p>
+            <p style='margin: 0; color: #155724;'>PCR: {highest_pcr_row['PCR']:.2f} | Put OI: {highest_pcr_row['Put OI']:,.0f}</p>
         </div>""", unsafe_allow_html=True)
     with col2:
         st.markdown(f"""
         <div style='background-color: #f8d7da; padding: 15px; border-radius: 10px; border-left: 5px solid #dc3545;'>
-            <h4 style='margin: 0; color: #721c24;'>🔴 Lowest PCR (Strongest Resistance)</h4>
+            <h4 style='margin: 0; color: #721c24;'>🔴 Lowest PCR (Resistance)</h4>
             <h2 style='margin: 10px 0; color: #721c24;'>Strike: {lowest_pcr_row['Strike']:.0f}</h2>
-            <p style='margin: 0; color: #721c24;'><b>PCR Value:</b> {lowest_pcr_row['PCR']:.2f} | <b>Call OI:</b> {lowest_pcr_row['Call OI']:,.0f}</p>
+            <p style='margin: 0; color: #721c24;'>PCR: {lowest_pcr_row['PCR']:.2f} | Call OI: {lowest_pcr_row['Call OI']:,.0f}</p>
         </div>""", unsafe_allow_html=True)
 
 st.markdown("---")
 
-# ==========================================
-# 4. WRITER STRENGTH INDICATOR (GAUGE)
-# ==========================================
 st.subheader("📊 Writer Strength Indicator")
 total_activity = abs(total_call_oi_chg) + abs(total_put_oi_chg)
 call_strength = (abs(total_call_oi_chg) / total_activity * 100) if total_activity > 0 else 50
@@ -188,30 +172,17 @@ dominant = "BULLISH" if put_strength > call_strength else "BEARISH"
 net_strength = abs(put_strength - call_strength)
 
 fig_gauge = go.Figure(go.Indicator(
-    mode="gauge+number+delta",
-    value=put_strength,
-    domain={'x': [0, 1], 'y': [0, 1]},
-    title={'text': f"Writer Strength Indicator<br><span style='font-size:18px'>{dominant} ({net_strength:.1f}% net)</span>", 'font': {'size': 24}},
-    delta={'reference': 50, 'increasing': {'color': "green"}, 'decreasing': {'color': "red"}},
-    gauge={'axis': {'range': [0, 100], 'tickwidth': 1, 'tickcolor': "darkblue"}, 'bar': {'color': "darkblue"}, 'bgcolor': "white", 'borderwidth': 2, 'bordercolor': "gray",
-           'steps': [{'range': [0, 30], 'color': '#ffcccc'}, {'range': [30, 70], 'color': '#ffffcc'}, {'range': [70, 100], 'color': '#ccffcc'}],
-           'threshold': {'line': {'color': "red", 'width': 4}, 'thickness': 0.75, 'value': 70}}
+    mode="gauge+number+delta", value=put_strength,
+    title={'text': f"Writer Strength<br><span>{dominant} ({net_strength:.1f}% net)</span>"},
+    gauge={'axis': {'range': [0, 100]}, 'bar': {'color': "darkblue"},
+           'steps': [{'range': [0, 30], 'color': '#ffcccc'}, {'range': [30, 70], 'color': '#ffffcc'}, {'range': [70, 100], 'color': '#ccffcc'}]}
 ))
-fig_gauge.update_layout(height=400)
 st.plotly_chart(fig_gauge, use_container_width=True)
 
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("Call Writing (Bearish)", f"{call_strength:.1f}%")
-col2.metric("Put Writing (Bullish)", f"{put_strength:.1f}%")
-col3.metric("Dominant Side", dominant)
-col4.metric("Net Strength", f"{net_strength:.1f}%")
-
-st.markdown("---")
-
 # ==========================================
-# 5. TRADING SIGNAL & LEVELS
+# 4. TRADING SIGNAL & LEVELS
 # ==========================================
-st.subheader("🚨 TRADING SIGNAL & LEVELS")
+st.subheader(" TRADING SIGNAL & LEVELS")
 atm_data = current_df[current_df['Strike'] == atm_strike].iloc[0] if len(current_df[current_df['Strike'] == atm_strike]) > 0 else None
 ce_ltp = atm_data['Call LTP'] if atm_data is not None else 100
 pe_ltp = atm_data['Put LTP'] if atm_data is not None else 100
@@ -243,7 +214,7 @@ if option_type != "NONE":
     with col1:
         st.markdown('<div style="background-color: #f8f9fa; border-radius: 10px; padding: 15px; border-left: 5px solid #007bff;">', unsafe_allow_html=True)
         st.metric("🎯 Recommended Strike", f"{atm_strike} {option_type}")
-        st.metric(" Entry Premium", f"₹{entry_premium:.2f}")
+        st.metric("💰 Entry Premium", f"₹{entry_premium:.2f}")
         st.markdown('</div>', unsafe_allow_html=True)
     with col2:
         st.markdown('<div style="background-color: #f8f9fa; border-radius: 10px; padding: 15px; border-left: 5px solid #dc3545;">', unsafe_allow_html=True)
@@ -255,7 +226,7 @@ if option_type != "NONE":
 st.markdown("---")
 
 # ==========================================
-# 6. COMBINED OI CHANGE VISUALIZATION
+# 5. COMBINED OI CHANGE VISUALIZATION
 # ==========================================
 st.subheader("📈 Combined Call & Put OI Changes")
 strikes = zone_data['Strike'].values
@@ -263,32 +234,13 @@ call_chg = zone_data['Call OI Change'].values
 put_chg = zone_data['Put OI Change'].values
 net_oi = put_chg - call_chg
 
-fig_combined = make_subplots(rows=2, cols=1, subplot_titles=('Combined OI Change Analysis', 'Net Sentiment (Put Writing - Call Writing)'), vertical_spacing=0.12, row_heights=[0.6, 0.4])
-fig_combined.add_trace(go.Bar(x=strikes, y=-call_chg, name='Call Unwinding (Bullish)', marker_color='green', opacity=0.7), row=1, col=1)
-fig_combined.add_trace(go.Bar(x=strikes, y=put_chg, name='Put Writing (Bullish)', marker_color='blue', opacity=0.7), row=1, col=1)
+fig_combined = make_subplots(rows=2, cols=1, subplot_titles=('Combined OI Change Analysis', 'Net Sentiment'), vertical_spacing=0.12, row_heights=[0.6, 0.4])
+fig_combined.add_trace(go.Bar(x=strikes, y=-call_chg, name='Call Unwinding', marker_color='green', opacity=0.7), row=1, col=1)
+fig_combined.add_trace(go.Bar(x=strikes, y=put_chg, name='Put Writing', marker_color='blue', opacity=0.7), row=1, col=1)
 colors = ['red' if x < 0 else 'green' for x in net_oi]
 fig_combined.add_trace(go.Bar(x=strikes, y=net_oi, name='Net Sentiment', marker_color=colors, opacity=0.8), row=2, col=1)
 fig_combined.add_hline(y=0, line_dash="dash", line_color="gray", row=2, col=1)
-fig_combined.update_layout(height=800, showlegend=True, legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1), hovermode='x unified')
-fig_combined.update_xaxes(title_text="Strike", row=2, col=1)
-fig_combined.update_yaxes(title_text="OI Change", row=1, col=1)
-fig_combined.update_yaxes(title_text="Net OI (Put - Call)", row=2, col=1)
+fig_combined.update_layout(height=800, showlegend=True, legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
 st.plotly_chart(fig_combined, use_container_width=True)
 
-st.markdown("---")
-
-# ==========================================
-# 7. SIGNAL INTERPRETATION
-# ==========================================
-st.subheader(" Signal Interpretation")
-if "BUY CE" in signal:
-    st.success(f"**STRONG BULLISH SIGNAL** - Put writers dominating with {put_strength:.1f}% strength")
-    st.info("Recommended: Look for **BUY CE** opportunities on dips")
-elif "BUY PE" in signal:
-    st.error(f"**STRONG BEARISH SIGNAL** - Call writers dominating with {call_strength:.1f}% strength")
-    st.info("Recommended: Look for **BUY PE** opportunities on rallies")
-else:
-    st.warning(f"⚪ **NEUTRAL/CHURN** - No clear dominance (Call: {call_strength:.1f}%, Put: {put_strength:.1f}%)")
-    st.info("Recommended: **AVOID** fresh positions, wait for clarity")
-
-st.info(f"🕐 Last Updated: {st.session_state.last_fetch.strftime('%H:%M:%S') if st.session_state.last_fetch else 'N/A'}")
+st.info(f"🕐 Last Updated: {datetime.now().strftime('%H:%M:%S')}")
