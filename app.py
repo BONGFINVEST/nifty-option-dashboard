@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from datetime import datetime
 
 st.set_page_config(page_title="NIFTY Pro Trading Dashboard", layout="wide", initial_sidebar_state="expanded")
 
@@ -17,25 +16,54 @@ st.markdown("""
 st.title("📊 NIFTY PRO TRADING DASHBOARD")
 st.markdown("---")
 
-with st.sidebar:
-    st.header("⚙️ Risk Parameters")
-    risk_reward = st.selectbox("Risk:Reward Ratio", ["1:2", "1:3", "1:1.5"], index=1)
-    sl_points = st.slider("Stop Loss (Points)", 10, 100, 30, 5)
-    st.markdown("---")
-    st.header("📊 Signal Logic")
-    st.markdown("- **🟢 BUY CE:** Call OI ↓ + Put OI ↑\n- **🔴 BUY PE:** Call OI ↑ + Put OI ↓\n- ** AVOID:** No clear trend")
+# ==========================================
+# 1. FILE UPLOAD & SESSION STATE FIX
+# ==========================================
+# Initialize session state to remember the file during the session
+if 'df' not in st.session_state:
+    st.session_state.df = None
 
 uploaded_file = st.file_uploader("📁 Upload NIFTY Option Chain CSV", type=["csv"])
 
-if uploaded_file is None:
-    st.info(" Please upload your NIFTY Option Chain CSV file to generate signals.")
+if uploaded_file is not None:
+    # Read the file and save it to session state so it doesn't disappear on refresh
+    df = pd.read_csv(uploaded_file)
+    st.session_state.df = df
+    st.success("✅ File loaded successfully! Data is saved in memory.")
+
+# Check if we have data to work with
+if st.session_state.df is None:
+    st.info("👆 Please upload your NIFTY Option Chain CSV file above to generate signals.")
     st.stop()
 
-df = pd.read_csv(uploaded_file)
+# Load data from session state
+df = st.session_state.df
+
+# Clean data
 df.columns = df.columns.str.strip()
 for col in df.columns:
     df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
 
+# ==========================================
+# 2. SIDEBAR CONTROLS
+# ==========================================
+with st.sidebar:
+    st.header("⚙️ Risk Parameters")
+    risk_reward = st.selectbox("Risk:Reward Ratio", ["1:2", "1:3", "1:1.5"], index=1)
+    sl_points = st.slider("Stop Loss (Points)", 10, 100, 30, 5)
+    
+    st.markdown("---")
+    st.header("📊 Signal Logic")
+    st.markdown("- **🟢 BUY CE:** Call OI ↓ + Put OI ↑\n- **🔴 BUY PE:** Call OI ↑ + Put OI ↓\n- **⚪ AVOID:** No clear trend")
+    
+    # Button to clear memory
+    if st.button("️ Clear Memory & Upload New File"):
+        st.session_state.df = None
+        st.rerun()
+
+# ==========================================
+# 3. PCR TRACKING
+# ==========================================
 st.subheader("📊 PCR Analysis - Support & Resistance Levels")
 valid_pcr_df = df[(df['PCR'] > 0.1) & (df['PCR'] < 10.0)].copy()
 
@@ -72,6 +100,7 @@ if not valid_pcr_df.empty:
 
 st.markdown("---")
 
+# Find ATM Strike
 df['Total_Volume'] = df['Call Volume'] + df['Put Volume']
 atm_row = df.loc[df['Total_Volume'].idxmax()]
 atm_strike = round(atm_row['Strike'] / 50) * 50
@@ -84,6 +113,9 @@ total_put_oi_chg = zone_data['Put OI Change'].sum()
 total_call_oi = zone_data['Call OI'].sum()
 total_put_oi = zone_data['Put OI'].sum()
 
+# ==========================================
+# 4. WRITER STRENGTH INDICATOR (GAUGE)
+# ==========================================
 st.subheader("📊 Writer Strength Indicator")
 total_activity = abs(total_call_oi_chg) + abs(total_put_oi_chg)
 if total_activity == 0:
@@ -130,6 +162,10 @@ with col3: st.metric("Dominant Side", dominant)
 with col4: st.metric("Net Strength", f"{net_strength:.1f}%")
 
 st.markdown("---")
+
+# ==========================================
+# 5. TRADING SIGNAL & LEVELS
+# ==========================================
 st.subheader("🚨 TRADING SIGNAL & LEVELS")
 
 atm_data = df[df['Strike'] == atm_strike].iloc[0] if len(df[df['Strike'] == atm_strike]) > 0 else None
@@ -148,7 +184,7 @@ recommended_strike = atm_strike
 pcr_validation = ""
 
 if total_call_oi_chg < -500000 and total_put_oi_chg > 1000000 and put_strength > 60:
-    signal = " HIGH PROBABILITY BUY CE"
+    signal = "🟢 HIGH PROBABILITY BUY CE"
     signal_color = "green"
     confidence = "HIGH"
     option_type = "CE"
@@ -176,7 +212,7 @@ elif total_call_oi_chg < 0 and total_put_oi_chg > 0 and put_strength > 50:
     sl_premium = max(entry_premium - 20, 5)
     target1_premium = entry_premium + 40
     target2_premium = entry_premium + 80
-    pcr_validation = "⚠️ Wait for price to dip near support"
+    pcr_validation = "️ Wait for price to dip near support"
 elif total_call_oi_chg > 0 and total_put_oi_chg < 0 and call_strength > 50:
     signal = "🔴 Mild Bearish - Buy PE on Rallies"
     signal_color = "salmon"
@@ -208,44 +244,48 @@ if option_type != "NONE" and entry_premium > 0:
     col1, col2 = st.columns(2)
     with col1:
         st.markdown('<div style="background-color: #f8f9fa; border-radius: 10px; padding: 15px; border-left: 5px solid #007bff;">', unsafe_allow_html=True)
-        st.metric(" Recommended Strike", f"{recommended_strike} {option_type}")
+        st.metric("🎯 Recommended Strike", f"{recommended_strike} {option_type}")
         st.metric("💰 Entry Premium", f"₹{entry_premium:.2f}")
         st.markdown('</div>', unsafe_allow_html=True)
     with col2:
         st.markdown('<div style="background-color: #f8f9fa; border-radius: 10px; padding: 15px; border-left: 5px solid #dc3545;">', unsafe_allow_html=True)
-        st.metric("🛑 Stop Loss", f"₹{sl_premium:.2f}", delta=f"-₹{abs(entry_premium - sl_premium):.2f}")
+        st.metric("🛑 Stop Loss", f"₹{sl_premium:.2f}", delta=f"-{abs(entry_premium - sl_premium):.2f}")
         st.metric("🎯 Target 1", f"₹{target1_premium:.2f}", delta=f"+₹{target1_premium - entry_premium:.2f}")
         st.metric("🎯 Target 2", f"₹{target2_premium:.2f}", delta=f"+₹{target2_premium - entry_premium:.2f}")
         st.markdown('</div>', unsafe_allow_html=True)
     
     st.markdown("---")
-    st.markdown("### 📝 TRADING INSTRUCTIONS")
+    st.markdown("###  TRADING INSTRUCTIONS")
     if option_type == "CE":
         st.markdown(f"""
         ✅ **Action:** Buy NIFTY {recommended_strike} CE (Next Weekly Expiry)<br>
-        💰 **Entry Premium:** ₹{entry_premium:.2f}<br>
+         **Entry Premium:** ₹{entry_premium:.2f}<br>
         🛑 **Stop Loss:** ₹{sl_premium:.2f} (Premium basis) - Strict SL<br>
         🎯 **Target 1:** ₹{target1_premium:.2f} (Book 50% position)<br>
-         **Target 2:** ₹{target2_premium:.2f} (Trail balance)<br>
+        🎯 **Target 2:** ₹{target2_premium:.2f} (Trail balance)<br>
         📍 **Key Support:** {highest_pcr_strike:.0f} (PCR: {highest_pcr_value:.2f})<br>
-         **Time Frame:** Intraday/Next day expiry<br>
+        ⏰ **Time Frame:** Intraday/Next day expiry<br>
         💡 **Note:** Maintain strict SL. Do not average down.
         """, unsafe_allow_html=True)
     else:
         st.markdown(f"""
         ✅ **Action:** Buy NIFTY {recommended_strike} PE (Next Weekly Expiry)<br>
         💰 **Entry Premium:** ₹{entry_premium:.2f}<br>
-         **Stop Loss:** ₹{sl_premium:.2f} (Premium basis) - Strict SL<br>
+        🛑 **Stop Loss:** ₹{sl_premium:.2f} (Premium basis) - Strict SL<br>
         🎯 **Target 1:** ₹{target1_premium:.2f} (Book 50% position)<br>
-        🎯 **Target 2:** ₹{target2_premium:.2f} (Trail balance)<br>
+         **Target 2:** ₹{target2_premium:.2f} (Trail balance)<br>
         📍 **Key Resistance:** {lowest_pcr_strike:.0f} (PCR: {lowest_pcr_value:.2f})<br>
-        ⏰ **Time Frame:** Intraday/Next day expiry<br>
+         **Time Frame:** Intraday/Next day expiry<br>
         💡 **Note:** Maintain strict SL. Do not average down.
         """, unsafe_allow_html=True)
 else:
-    st.warning("⚠️ No trading signal generated. Wait for clear OI patterns.")
+    st.warning("️ No trading signal generated. Wait for clear OI patterns.")
 
 st.markdown("---")
+
+# ==========================================
+# 6. COMBINED OI CHANGE VISUALIZATION
+# ==========================================
 st.subheader("📈 Combined Call & Put OI Changes")
 st.markdown("""
 **How to read this chart:**
@@ -276,14 +316,14 @@ fig_combined.update_yaxes(title_text="Net OI (Put - Call)", row=2, col=1)
 st.plotly_chart(fig_combined, use_container_width=True)
 
 st.markdown("---")
-st.subheader(" Signal Interpretation")
-if signal == " HIGH PROBABILITY BUY CE":
+st.subheader("🎯 Signal Interpretation")
+if signal == "🟢 HIGH PROBABILITY BUY CE":
     st.success(f"**STRONG BULLISH SIGNAL** - Put writers dominating with {put_strength:.1f}% strength")
     st.info("Recommended: Look for **BUY CE** opportunities on dips")
-elif signal == " HIGH PROBABILITY BUY PE":
+elif signal == "🔴 HIGH PROBABILITY BUY PE":
     st.error(f"**STRONG BEARISH SIGNAL** - Call writers dominating with {call_strength:.1f}% strength")
     st.info("Recommended: Look for **BUY PE** opportunities on rallies")
-elif signal == "🟢 Mild Bullish - Buy CE on Dips":
+elif signal == " Mild Bullish - Buy CE on Dips":
     st.warning(f"⚠️ **MILD BULLISH** - Put writers slightly stronger ({put_strength:.1f}%)")
     st.info("Recommended: Wait for confirmation before entering")
 elif signal == "🔴 Mild Bearish - Buy PE on Rallies":
