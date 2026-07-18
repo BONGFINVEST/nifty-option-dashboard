@@ -23,7 +23,7 @@ st.markdown("---")
 
 # Check credentials
 if 'DHAN_CLIENT_ID' not in st.secrets or 'DHAN_ACCESS_TOKEN' not in st.secrets:
-    st.error(" Dhan API credentials not found in Streamlit Secrets!")
+    st.error("❌ Dhan API credentials not found in Streamlit Secrets!")
     st.info("Please add DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN to your Streamlit Secrets.")
     st.stop()
 
@@ -41,7 +41,7 @@ with st.sidebar:
 
 # Function to fetch NIFTY option chain from Dhan
 def fetch_dhan_option_chain():
-    """Fetch NIFTY option chain from Dhan API"""
+    """Fetch NIFTY option chain from Dhan API v2"""
     try:
         # Dhan API v2 headers
         headers = {
@@ -59,56 +59,65 @@ def fetch_dhan_option_chain():
         next_expiry = today + timedelta(days=days_ahead)
         expiry_date = next_expiry.strftime("%Y-%m-%d")
         
-        # Dhan API v2 endpoint for option chain
-        url = "https://api.dhan.co/v2/optionchain"
+        # CORRECT Dhan API v2 endpoint for option chain
+        url = "https://api.dhan.co/v2/screener"
         
-        params = {
+        # Request payload for option chain
+        payload = {
+            "exchange": "NFO",
+            "segment": "OPTIDX",
             "symbol": "NIFTY",
-            "expiry": expiry_date
+            "expiry": expiry_date,
+            "strikePrice": None,
+            "optionType": None
         }
         
-        response = requests.get(url, headers=headers, params=params, timeout=30)
+        # Make POST request (Dhan API v2 uses POST for screener)
+        response = requests.post(url, headers=headers, json=payload, timeout=30)
         
         if response.status_code == 200:
             data = response.json()
             
             # Parse the response
-            records = []
-            for item in data:
-                strike = item.get('strikePrice')
-                opt_type = item.get('optionType')  # 'CE' or 'PE'
+            if 'data' in data and len(data['data']) > 0:
+                records = []
+                for item in data['data']:
+                    strike = item.get('strikePrice')
+                    opt_type = item.get('optionType')  # 'CE' or 'PE'
+                    
+                    row = {
+                        'Strike': strike,
+                        'Call OI': 0, 'Call OI Change': 0, 'Call Volume': 0, 'Call LTP': 0,
+                        'Put OI': 0, 'Put OI Change': 0, 'Put Volume': 0, 'Put LTP': 0
+                    }
+                    
+                    if opt_type == 'CE':
+                        row['Call OI'] = item.get('openInterest', 0)
+                        row['Call OI Change'] = item.get('changeInOI', 0)
+                        row['Call Volume'] = item.get('totalTradedVolume', 0)
+                        row['Call LTP'] = item.get('lastPrice', 0)
+                    elif opt_type == 'PE':
+                        row['Put OI'] = item.get('openInterest', 0)
+                        row['Put OI Change'] = item.get('changeInOI', 0)
+                        row['Put Volume'] = item.get('totalTradedVolume', 0)
+                        row['Put LTP'] = item.get('lastPrice', 0)
+                        
+                    records.append(row)
                 
-                row = {
-                    'Strike': strike,
-                    'Call OI': 0, 'Call OI Change': 0, 'Call Volume': 0, 'Call LTP': 0,
-                    'Put OI': 0, 'Put OI Change': 0, 'Put Volume': 0, 'Put LTP': 0
-                }
+                # Group by Strike to combine CE and PE
+                df_raw = pd.DataFrame(records)
+                df = df_raw.groupby('Strike').sum().reset_index()
                 
-                if opt_type == 'CE':
-                    row['Call OI'] = item.get('openInterest', 0)
-                    row['Call OI Change'] = item.get('changeInOI', 0)
-                    row['Call Volume'] = item.get('totalTradedVolume', 0)
-                    row['Call LTP'] = item.get('lastPrice', 0)
-                elif opt_type == 'PE':
-                    row['Put OI'] = item.get('openInterest', 0)
-                    row['Put OI Change'] = item.get('changeInOI', 0)
-                    row['Put Volume'] = item.get('totalTradedVolume', 0)
-                    row['Put LTP'] = item.get('lastPrice', 0)
+                # Calculate PCR
+                df['PCR'] = df['Put OI'] / df['Call OI']
+                df['PCR'] = df['PCR'].replace([float('inf'), -float('inf')], 0).fillna(0)
                 
-                records.append(row)
-            
-            # Group by Strike to combine CE and PE
-            df_raw = pd.DataFrame(records)
-            df = df_raw.groupby('Strike').sum().reset_index()
-            
-            # Calculate PCR
-            df['PCR'] = df['Put OI'] / df['Call OI']
-            df['PCR'] = df['PCR'].replace([float('inf'), -float('inf')], 0).fillna(0)
-            
-            return df, None
+                return df, None
+            else:
+                return None, "❌ No data returned from API. Check if market is open or expiry date is correct."
             
         elif response.status_code == 405:
-            return None, "❌ API Error 405: Method Not Allowed. Please check your API endpoint and credentials."
+            return None, "❌ API Error 405: Method Not Allowed. The endpoint or request method is incorrect."
         elif response.status_code == 401:
             return None, "❌ API Error 401: Unauthorized. Your Access Token may be expired or invalid."
         elif response.status_code == 403:
@@ -151,7 +160,7 @@ total_put_oi = zone_data['Put OI'].sum()
 # ============================================
 # 1. PCR TRACKING
 # ============================================
-st.subheader(" PCR Analysis - Support & Resistance Levels")
+st.subheader("📊 PCR Analysis - Support & Resistance Levels")
 valid_pcr_df = df[(df['PCR'] > 0.1) & (df['PCR'] < 10.0)].copy()
 
 if not valid_pcr_df.empty:
@@ -240,7 +249,7 @@ st.markdown("---")
 # ============================================
 # 3. TRADING SIGNAL & LEVELS
 # ============================================
-st.subheader("🚨 TRADING SIGNAL & LEVELS")
+st.subheader(" TRADING SIGNAL & LEVELS")
 
 atm_data = df[df['Strike'] == atm_strike].iloc[0] if len(df[df['Strike'] == atm_strike]) > 0 else None
 ce_ltp = atm_data.get('Call LTP', 100) if atm_data is not None else 100
@@ -268,7 +277,7 @@ if total_call_oi_chg < -500000 and total_put_oi_chg > 1000000 and put_strength >
     target2_premium = entry_premium + (sl_points * 3)
     pcr_validation = f"✅ PCR Confirmed: Highest PCR {highest_pcr_value:.2f} at {highest_pcr_strike:.0f}"
 elif total_call_oi_chg > 1000000 and total_put_oi_chg < -500000 and call_strength > 60:
-    signal = "🔴 HIGH PROBABILITY BUY PE"
+    signal = " HIGH PROBABILITY BUY PE"
     signal_color = "red"
     confidence = "HIGH"
     option_type = "PE"
@@ -288,7 +297,7 @@ elif total_call_oi_chg < 0 and total_put_oi_chg > 0 and put_strength > 50:
     target2_premium = entry_premium + 80
     pcr_validation = "⚠️ Wait for price to dip near support"
 elif total_call_oi_chg > 0 and total_put_oi_chg < 0 and call_strength > 50:
-    signal = "🔴 Mild Bearish - Buy PE on Rallies"
+    signal = " Mild Bearish - Buy PE on Rallies"
     signal_color = "salmon"
     confidence = "MEDIUM"
     option_type = "PE"
@@ -296,13 +305,13 @@ elif total_call_oi_chg > 0 and total_put_oi_chg < 0 and call_strength > 50:
     sl_premium = max(entry_premium - 20, 5)
     target1_premium = entry_premium + 40
     target2_premium = entry_premium + 80
-    pcr_validation = "⚠️ Wait for price to rally near resistance"
+    pcr_validation = "️ Wait for price to rally near resistance"
 else:
     signal = "⚪ AVOID - No Clear Signal"
     signal_color = "gray"
     confidence = "LOW"
     option_type = "NONE"
-    pcr_validation = "⚠️ OI signals are mixed or weak"
+    pcr_validation = "️ OI signals are mixed or weak"
 
 st.markdown(f"""
 <div style='background-color: {signal_color}; padding: 30px; border-radius: 10px; text-align: center; margin-bottom: 20px;'>
@@ -323,7 +332,7 @@ if option_type != "NONE" and entry_premium > 0:
         st.markdown('</div>', unsafe_allow_html=True)
     with col2:
         st.markdown('<div style="background-color: #f8f9fa; border-radius: 10px; padding: 15px; border-left: 5px solid #dc3545;">', unsafe_allow_html=True)
-        st.metric("🛑 Stop Loss", f"₹{sl_premium:.2f}", delta=f"-₹{abs(entry_premium - sl_premium):.2f}")
+        st.metric("🛑 Stop Loss", f"{sl_premium:.2f}", delta=f"-₹{abs(entry_premium - sl_premium):.2f}")
         st.metric("🎯 Target 1", f"₹{target1_premium:.2f}", delta=f"+₹{target1_premium - entry_premium:.2f}")
         st.metric("🎯 Target 2", f"₹{target2_premium:.2f}", delta=f"+₹{target2_premium - entry_premium:.2f}")
         st.markdown('</div>', unsafe_allow_html=True)
@@ -344,7 +353,7 @@ if option_type != "NONE" and entry_premium > 0:
     else:
         st.markdown(f"""
         ✅ **Action:** Buy NIFTY {recommended_strike} PE (Next Weekly Expiry)<br>
-         **Entry Premium:** ₹{entry_premium:.2f}<br>
+        💰 **Entry Premium:** ₹{entry_premium:.2f}<br>
         🛑 **Stop Loss:** ₹{sl_premium:.2f} (Premium basis) - Strict SL<br>
         🎯 **Target 1:** ₹{target1_premium:.2f} (Book 50% position)<br>
         🎯 **Target 2:** ₹{target2_premium:.2f} (Trail balance)<br>
