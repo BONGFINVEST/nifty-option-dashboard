@@ -31,113 +31,116 @@ CLIENT_ID = st.secrets['DHAN_CLIENT_ID']
 ACCESS_TOKEN = st.secrets['DHAN_ACCESS_TOKEN']
 
 with st.sidebar:
+    st.header("⚙️ Data Source")
+    data_source = st.radio("Choose data source:", ["Dhan API (Live)", "Manual CSV Upload"])
+    
+    st.markdown("---")
     st.header("⚙️ Risk Parameters")
     risk_reward = st.selectbox("Risk:Reward Ratio", ["1:2", "1:3", "1:1.5"], index=1)
     sl_points = st.slider("Stop Loss (Points)", 10, 100, 30, 5)
     
     st.markdown("---")
     st.header("📊 Signal Logic")
-    st.markdown("- **🟢 BUY CE:** Call OI ↓ + Put OI ↑\n- ** BUY PE:** Call OI ↑ + Put OI ↓\n- **⚪ AVOID:** No clear trend")
+    st.markdown("- **🟢 BUY CE:** Call OI ↓ + Put OI ↑\n- **🔴 BUY PE:** Call OI ↑ + Put OI ↓\n- **⚪ AVOID:** No clear trend")
 
-# Function to fetch NIFTY option chain from Dhan
-def fetch_dhan_option_chain():
-    """Fetch NIFTY option chain from Dhan API v2"""
-    try:
-        # Dhan API v2 headers
-        headers = {
-            "client-id": CLIENT_ID,
-            "access-token": ACCESS_TOKEN,
-            "Accept": "application/json"
-        }
-        
-        # Calculate next Thursday expiry
-        today = datetime.today()
-        days_ahead = 3 - today.weekday()  # 3 = Thursday
-        if days_ahead <= 0:
-            days_ahead += 7
-        next_expiry = today + timedelta(days=days_ahead)
-        expiry_date = next_expiry.strftime("%Y-%m-%d")
-        
-        # CORRECT Dhan API v2 endpoint for option chain
-        url = f"https://api.dhan.co/v2/optionchain"
-        
-        params = {
-            "symbol": "NIFTY",
-            "expiry": expiry_date
-        }
-        
-        response = requests.get(url, headers=headers, params=params, timeout=30)
-        
-        if response.status_code == 200:
-            data = response.json()
+df = None
+
+# ==========================================
+# 1. FETCH DATA (DHAN API OR CSV)
+# ==========================================
+if data_source == "Dhan API (Live)":
+    def fetch_dhan_option_chain():
+        try:
+            headers = {
+                "client-id": CLIENT_ID,
+                "access-token": ACCESS_TOKEN,
+                "Accept": "application/json",
+                "Content-Type": "application/json"
+            }
             
-            # Parse the response - Dhan returns a list of option instruments
-            if isinstance(data, list) and len(data) > 0:
-                records = []
-                for item in data:
-                    strike = item.get('strikePrice')
-                    opt_type = item.get('optionType')  # 'CE' or 'PE'
+            # Calculate next Thursday expiry
+            today = datetime.today()
+            days_ahead = 3 - today.weekday()
+            if days_ahead <= 0:
+                days_ahead += 7
+            next_expiry = today + timedelta(days=days_ahead)
+            expiry_date = next_expiry.strftime("%Y-%m-%d")
+            
+            # CORRECT Dhan API v2 endpoint (Requires POST)
+            url = "https://api.dhan.co/v2/optionchain"
+            
+            payload = {
+                "underlyingScrip": 13,  # 13 for NIFTY
+                "underlyingSeg": "IDX_I",
+                "expiry": expiry_date
+            }
+            
+            response = requests.post(url, headers=headers, json=payload, timeout=30)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if isinstance(data, list) and len(data) > 0:
+                    records = []
+                    for item in data:
+                        strike = item.get('strikePrice')
+                        opt_type = item.get('optionType')
+                        row = {
+                            'Strike': strike,
+                            'Call OI': 0, 'Call OI Change': 0, 'Call Volume': 0, 'Call LTP': 0,
+                            'Put OI': 0, 'Put OI Change': 0, 'Put Volume': 0, 'Put LTP': 0
+                        }
+                        if opt_type == 'CE':
+                            row['Call OI'] = item.get('openInterest', 0)
+                            row['Call OI Change'] = item.get('changeInOI', 0)
+                            row['Call Volume'] = item.get('totalTradedVolume', 0)
+                            row['Call LTP'] = item.get('lastPrice', 0)
+                        elif opt_type == 'PE':
+                            row['Put OI'] = item.get('openInterest', 0)
+                            row['Put OI Change'] = item.get('changeInOI', 0)
+                            row['Put Volume'] = item.get('totalTradedVolume', 0)
+                            row['Put LTP'] = item.get('lastPrice', 0)
+                        records.append(row)
                     
-                    row = {
-                        'Strike': strike,
-                        'Call OI': 0, 'Call OI Change': 0, 'Call Volume': 0, 'Call LTP': 0,
-                        'Put OI': 0, 'Put OI Change': 0, 'Put Volume': 0, 'Put LTP': 0
-                    }
-                    
-                    if opt_type == 'CE':
-                        row['Call OI'] = item.get('openInterest', 0)
-                        row['Call OI Change'] = item.get('changeInOI', 0)
-                        row['Call Volume'] = item.get('totalTradedVolume', 0)
-                        row['Call LTP'] = item.get('lastPrice', 0)
-                    elif opt_type == 'PE':
-                        row['Put OI'] = item.get('openInterest', 0)
-                        row['Put OI Change'] = item.get('changeInOI', 0)
-                        row['Put Volume'] = item.get('totalTradedVolume', 0)
-                        row['Put LTP'] = item.get('lastPrice', 0)
-                    
-                    records.append(row)
-                
-                # Group by Strike to combine CE and PE
-                df_raw = pd.DataFrame(records)
-                df = df_raw.groupby('Strike').sum().reset_index()
-                
-                # Calculate PCR
-                df['PCR'] = df['Put OI'] / df['Call OI']
-                df['PCR'] = df['PCR'].replace([float('inf'), -float('inf')], 0).fillna(0)
-                
-                return df, None
+                    df_raw = pd.DataFrame(records)
+                    df = df_raw.groupby('Strike').sum().reset_index()
+                    df['PCR'] = df['Put OI'] / df['Call OI']
+                    df['PCR'] = df['PCR'].replace([float('inf'), -float('inf')], 0).fillna(0)
+                    return df, None
+                else:
+                    return None, " No data returned from API."
+            elif response.status_code == 401:
+                return None, "❌ API Error 401: Unauthorized. Your Access Token may be expired."
             else:
-                return None, "❌ No data returned from API. The response format might be different."
-            
-        elif response.status_code == 404:
-            return None, "❌ API Error 404: Endpoint not found. The option chain endpoint might not be available in Dhan API v2."
-        elif response.status_code == 401:
-            return None, "❌ API Error 401: Unauthorized. Your Access Token may be expired or invalid."
-        elif response.status_code == 403:
-            return None, "❌ API Error 403: Forbidden. Please check your API permissions."
-        else:
-            return None, f"❌ API Error {response.status_code}: {response.text}"
-            
-    except Exception as e:
-        return None, f"❌ Connection Error: {str(e)}"
+                return None, f"❌ API Error {response.status_code}: {response.text}"
+        except Exception as e:
+            return None, f"❌ Connection Error: {str(e)}"
 
-# Fetch data
-with st.spinner("🔄 Fetching live NIFTY Option Chain data..."):
-    df, error = fetch_dhan_option_chain()
+    with st.spinner("🔄 Fetching live NIFTY Option Chain data..."):
+        df, error = fetch_dhan_option_chain()
 
-if error:
-    st.error(error)
-    st.info("💡 **Troubleshooting:**\n1. Check if your Access Token is valid (expires every 24 hours)\n2. Verify your Client ID in Streamlit Secrets\n3. Ensure your Dhan API subscription is active\n4. Check Dhan API documentation for correct endpoint")
-    st.stop()
+    if error:
+        st.error(error)
+        st.info("💡 **Troubleshooting:**\n1. Check if your Access Token is valid (expires every 24 hours)\n2. Verify your Client ID in Streamlit Secrets\n3. Ensure your Dhan API subscription is active")
+        st.stop()
+    
+    st.success("✅ Live data fetched successfully!")
 
-st.success("✅ Live data fetched successfully!")
+else:
+    uploaded_file = st.file_uploader(" Upload NIFTY Option Chain CSV", type=["csv"])
+    if uploaded_file is not None:
+        df = pd.read_csv(uploaded_file)
+        df.columns = df.columns.str.strip()
+        st.success("✅ CSV loaded successfully!")
+    else:
+        st.info("👆 Please upload a CSV file or switch to Dhan API in the sidebar.")
+        st.stop()
 
-# Clean data
-df.columns = df.columns.str.strip()
+# ==========================================
+# 2. DATA PROCESSING
+# ==========================================
 for col in df.columns:
     df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
 
-# Find ATM Strike
 df['Total_Volume'] = df['Call Volume'] + df['Put Volume']
 atm_row = df.loc[df['Total_Volume'].idxmax()]
 atm_strike = round(atm_row['Strike'] / 50) * 50
@@ -150,9 +153,9 @@ total_put_oi_chg = zone_data['Put OI Change'].sum()
 total_call_oi = zone_data['Call OI'].sum()
 total_put_oi = zone_data['Put OI'].sum()
 
-# ============================================
-# 1. PCR TRACKING
-# ============================================
+# ==========================================
+# 3. PCR TRACKING
+# ==========================================
 st.subheader("📊 PCR Analysis - Support & Resistance Levels")
 valid_pcr_df = df[(df['PCR'] > 0.1) & (df['PCR'] < 10.0)].copy()
 
@@ -189,9 +192,9 @@ if not valid_pcr_df.empty:
 
 st.markdown("---")
 
-# ============================================
-# 2. WRITER STRENGTH INDICATOR
-# ============================================
+# ==========================================
+# 4. WRITER STRENGTH INDICATOR
+# ==========================================
 st.subheader("📊 Writer Strength Indicator")
 total_activity = abs(total_call_oi_chg) + abs(total_put_oi_chg)
 if total_activity == 0:
@@ -239,9 +242,9 @@ with col4: st.metric("Net Strength", f"{net_strength:.1f}%")
 
 st.markdown("---")
 
-# ============================================
-# 3. TRADING SIGNAL & LEVELS
-# ============================================
+# ==========================================
+# 5. TRADING SIGNAL & LEVELS
+# ==========================================
 st.subheader("🚨 TRADING SIGNAL & LEVELS")
 
 atm_data = df[df['Strike'] == atm_strike].iloc[0] if len(df[df['Strike'] == atm_strike]) > 0 else None
@@ -313,31 +316,31 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-st.info(f"🧠 **PCR Validation:** {pcr_validation}")
+st.info(f" **PCR Validation:** {pcr_validation}")
 
 if option_type != "NONE" and entry_premium > 0:
-    st.markdown("###  TRADING PARAMETERS")
+    st.markdown("### 📋 TRADING PARAMETERS")
     col1, col2 = st.columns(2)
     with col1:
         st.markdown('<div style="background-color: #f8f9fa; border-radius: 10px; padding: 15px; border-left: 5px solid #007bff;">', unsafe_allow_html=True)
-        st.metric(" Recommended Strike", f"{recommended_strike} {option_type}")
+        st.metric("🎯 Recommended Strike", f"{recommended_strike} {option_type}")
         st.metric("💰 Entry Premium", f"₹{entry_premium:.2f}")
         st.markdown('</div>', unsafe_allow_html=True)
     with col2:
         st.markdown('<div style="background-color: #f8f9fa; border-radius: 10px; padding: 15px; border-left: 5px solid #dc3545;">', unsafe_allow_html=True)
         st.metric("🛑 Stop Loss", f"₹{sl_premium:.2f}", delta=f"-₹{abs(entry_premium - sl_premium):.2f}")
-        st.metric("🎯 Target 1", f"₹{target1_premium:.2f}", delta=f"+₹{target1_premium - entry_premium:.2f}")
+        st.metric(" Target 1", f"₹{target1_premium:.2f}", delta=f"+₹{target1_premium - entry_premium:.2f}")
         st.metric("🎯 Target 2", f"₹{target2_premium:.2f}", delta=f"+₹{target2_premium - entry_premium:.2f}")
         st.markdown('</div>', unsafe_allow_html=True)
     
     st.markdown("---")
-    st.markdown("### 📝 TRADING INSTRUCTIONS")
+    st.markdown("###  TRADING INSTRUCTIONS")
     if option_type == "CE":
         st.markdown(f"""
         ✅ **Action:** Buy NIFTY {recommended_strike} CE (Next Weekly Expiry)<br>
         💰 **Entry Premium:** ₹{entry_premium:.2f}<br>
-         **Stop Loss:** ₹{sl_premium:.2f} (Premium basis) - Strict SL<br>
-        🎯 **Target 1:** ₹{target1_premium:.2f} (Book 50% position)<br>
+        🛑 **Stop Loss:** ₹{sl_premium:.2f} (Premium basis) - Strict SL<br>
+         **Target 1:** ₹{target1_premium:.2f} (Book 50% position)<br>
         🎯 **Target 2:** ₹{target2_premium:.2f} (Trail balance)<br>
         📍 **Key Support:** {highest_pcr_strike:.0f} (PCR: {highest_pcr_value:.2f})<br>
         ⏰ **Time Frame:** Intraday/Next day expiry<br>
@@ -346,12 +349,12 @@ if option_type != "NONE" and entry_premium > 0:
     else:
         st.markdown(f"""
         ✅ **Action:** Buy NIFTY {recommended_strike} PE (Next Weekly Expiry)<br>
-         **Entry Premium:** ₹{entry_premium:.2f}<br>
+        💰 **Entry Premium:** ₹{entry_premium:.2f}<br>
         🛑 **Stop Loss:** ₹{sl_premium:.2f} (Premium basis) - Strict SL<br>
         🎯 **Target 1:** ₹{target1_premium:.2f} (Book 50% position)<br>
         🎯 **Target 2:** ₹{target2_premium:.2f} (Trail balance)<br>
         📍 **Key Resistance:** {lowest_pcr_strike:.0f} (PCR: {lowest_pcr_value:.2f})<br>
-        ⏰ **Time Frame:** Intraday/Next day expiry<br>
+         **Time Frame:** Intraday/Next day expiry<br>
         💡 **Note:** Maintain strict SL. Do not average down.
         """, unsafe_allow_html=True)
 else:
@@ -359,9 +362,9 @@ else:
 
 st.markdown("---")
 
-# ============================================
-# 4. COMBINED OI CHANGE VISUALIZATION
-# ============================================
+# ==========================================
+# 6. COMBINED OI CHANGE VISUALIZATION
+# ==========================================
 st.subheader("📈 Combined Call & Put OI Changes")
 st.markdown("""
 **How to read this chart:**
@@ -396,13 +399,13 @@ st.subheader("🎯 Signal Interpretation")
 if signal == "🟢 HIGH PROBABILITY BUY CE":
     st.success(f"**STRONG BULLISH SIGNAL** - Put writers dominating with {put_strength:.1f}% strength")
     st.info("Recommended: Look for **BUY CE** opportunities on dips")
-elif signal == "🔴 HIGH PROBABILITY BUY PE":
+elif signal == " HIGH PROBABILITY BUY PE":
     st.error(f"**STRONG BEARISH SIGNAL** - Call writers dominating with {call_strength:.1f}% strength")
     st.info("Recommended: Look for **BUY PE** opportunities on rallies")
-elif signal == " Mild Bullish - Buy CE on Dips":
+elif signal == "🟢 Mild Bullish - Buy CE on Dips":
     st.warning(f"⚠️ **MILD BULLISH** - Put writers slightly stronger ({put_strength:.1f}%)")
     st.info("Recommended: Wait for confirmation before entering")
-elif signal == "🔴 Mild Bearish - Buy PE on Rallies":
+elif signal == " Mild Bearish - Buy PE on Rallies":
     st.warning(f"⚠️ **MILD BEARISH** - Call writers slightly stronger ({call_strength:.1f}%)")
     st.info("Recommended: Wait for confirmation before entering")
 else:
