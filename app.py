@@ -20,24 +20,19 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.title("📊 NIFTY PRO TRADING DASHBOARD")
-st.markdown('<span class="live-badge">● LIVE DATA (TUESDAY EXPIRY)</span>', unsafe_allow_html=True)
 st.markdown("---")
 
-# Initialize session state for memory tracking
+# Initialize session state
 if 'previous_df' not in st.session_state:
     st.session_state.previous_df = None
 if 'last_fetch' not in st.session_state:
     st.session_state.last_fetch = None
-
-# Sidebar Controls
-with st.sidebar:
-    st.header("⚙️ Risk Parameters")
-    risk_reward = st.selectbox("Risk:Reward Ratio", ["1:2", "1:3", "1:1.5"], index=1)
-    sl_points = st.slider("Stop Loss (Points)", 10, 100, 30, 5)
-    
-    st.markdown("---")
-    st.header("📊 Signal Logic")
-    st.markdown("- **🟢 BUY CE:** Call OI ↓ + Put OI ↑\n- **🔴 BUY PE:** Call OI ↑ + Put OI ↓\n- **⚪ AVOID:** No clear trend")
+if 'expiry_list' not in st.session_state:
+    st.session_state.expiry_list = None
+if 'expiry_list_fetched_at' not in st.session_state:
+    st.session_state.expiry_list_fetched_at = None
+if 'selected_expiry' not in st.session_state:
+    st.session_state.selected_expiry = None
 
 # Check Credentials
 if 'DHAN_CLIENT_ID' not in st.secrets or 'DHAN_ACCESS_TOKEN' not in st.secrets:
@@ -47,67 +42,136 @@ if 'DHAN_CLIENT_ID' not in st.secrets or 'DHAN_ACCESS_TOKEN' not in st.secrets:
 CLIENT_ID = st.secrets['DHAN_CLIENT_ID']
 ACCESS_TOKEN = st.secrets['DHAN_ACCESS_TOKEN']
 
+DHAN_HEADERS = {
+    "client-id": CLIENT_ID,
+    "access-token": ACCESS_TOKEN,
+    "Accept": "application/json",
+    "Content-Type": "application/json"
+}
+
 # ==========================================
-# 1. FETCH LIVE DATA FROM DHAN API
+# 0. FETCH VALID EXPIRY LIST (this is the actual fix)
 # ==========================================
-def fetch_dhan_option_chain():
+def fetch_expiry_list():
+    """
+    Dhan requires an EXACT, exchange-recognized expiry date in YYYY-MM-DD
+    format. Hand-calculating 'next Tuesday' produces dates that don't
+    exist on the exchange (holidays, expiry-day shifts, etc.) and in the
+    wrong date format, which is exactly what threw the 'Invalid Expiry
+    Date' (error 811) you were seeing.
+    """
     try:
-        headers = {
-            "client-id": CLIENT_ID,
-            "access-token": ACCESS_TOKEN,
-            "Accept": "application/json",
-            "Content-Type": "application/json"
-        }
-        
-        # UPDATED LOGIC: Calculate next TUESDAY expiry
-        today = datetime.today()
-        # 1 represents Tuesday in Python's weekday() (Monday=0, Tuesday=1)
-        days_ahead = (1 - today.weekday()) % 7
-        next_expiry = today + timedelta(days=days_ahead)
-        
-        # Dhan API strictly requires DD-MM-YYYY format
-        expiry_date = next_expiry.strftime("%d-%m-%Y")
-        
-        url = "https://api.dhan.co/v2/optionchain"
+        url = "https://api.dhan.co/v2/optionchain/expirylist"
         payload = {
-            "underlyingScrip": 13,      # 13 for NIFTY
-            "underlyingSeg": "IDX_I",   # IDX_I for Indices
-            "expiry": expiry_date       
+            "UnderlyingScrip": 13,     # NIFTY
+            "UnderlyingSeg": "IDX_I"
         }
-        
-        response = requests.post(url, headers=headers, json=payload, timeout=30)
-        
+        response = requests.post(url, headers=DHAN_HEADERS, json=payload, timeout=15)
         if response.status_code == 200:
             data = response.json()
+            expiries = data.get("data", [])
+            if not expiries:
+                return None, "Expiry list came back empty."
+            return sorted(expiries), None
+        else:
+            return None, f"Expiry List API Error {response.status_code}: {response.text}"
+    except Exception as e:
+        return None, f"Expiry List Connection Error: {str(e)}"
+
+def get_nearest_expiry(expiry_list):
+    """Pick the closest expiry that is today or in the future."""
+    today_str = datetime.today().strftime("%Y-%m-%d")
+    upcoming = [e for e in expiry_list if e >= today_str]
+    return upcoming[0] if upcoming else expiry_list[-1]
+
+# Fetch the expiry list once per session (or once per hour) instead of
+# every rerun — this also respects Dhan's rate limits.
+need_refresh = (
+    st.session_state.expiry_list is None
+    or st.session_state.expiry_list_fetched_at is None
+    or (datetime.now() - st.session_state.expiry_list_fetched_at) > timedelta(hours=1)
+)
+
+if need_refresh:
+    with st.spinner("🔄 Fetching valid expiry dates..."):
+        expiry_list, expiry_error = fetch_expiry_list()
+    if expiry_error:
+        st.error(f"❌ {expiry_error}")
+        st.stop()
+    st.session_state.expiry_list = expiry_list
+    st.session_state.expiry_list_fetched_at = datetime.now()
+    st.session_state.selected_expiry = get_nearest_expiry(expiry_list)
+
+# Sidebar Controls
+with st.sidebar:
+    st.header("📅 Expiry")
+    chosen_expiry = st.selectbox(
+        "Select Expiry",
+        options=st.session_state.expiry_list,
+        index=st.session_state.expiry_list.index(st.session_state.selected_expiry)
+    )
+    st.session_state.selected_expiry = chosen_expiry
+
+    st.markdown("---")
+    st.header("⚙️ Risk Parameters")
+    risk_reward = st.selectbox("Risk:Reward Ratio", ["1:2", "1:3", "1:1.5"], index=1)
+    sl_points = st.slider("Stop Loss (Points)", 10, 100, 30, 5)
+
+    st.markdown("---")
+    st.header("📊 Signal Logic")
+    st.markdown("- **🟢 BUY CE:** Call OI ↓ + Put OI ↑\n- **🔴 BUY PE:** Call OI ↑ + Put OI ↓\n- **⚪ AVOID:** No clear trend")
+
+st.markdown(f'<span class="live-badge">● LIVE DATA (EXPIRY: {st.session_state.selected_expiry})</span>', unsafe_allow_html=True)
+
+# ==========================================
+# 1. FETCH LIVE OPTION CHAIN FOR SELECTED EXPIRY
+# ==========================================
+def fetch_dhan_option_chain(expiry_date):
+    try:
+        url = "https://api.dhan.co/v2/optionchain"
+        payload = {
+            "UnderlyingScrip": 13,      # 13 for NIFTY
+            "UnderlyingSeg": "IDX_I",   # IDX_I for Indices
+            "Expiry": expiry_date        # exact string from expirylist, YYYY-MM-DD
+        }
+
+        response = requests.post(url, headers=DHAN_HEADERS, json=payload, timeout=30)
+
+        if response.status_code == 200:
+            data = response.json()
+            oc = data.get("data", {}).get("oc", {})
             records = []
-            
-            for item in data:
-                strike = item.get('strikePrice')
-                opt_type = item.get('optionType')
-                row = {'Strike': strike, 'Call OI': 0, 'Call Volume': 0, 'Call LTP': 0,
-                       'Put OI': 0, 'Put Volume': 0, 'Put LTP': 0}
-                
-                if opt_type == 'CE':
-                    row.update({'Call OI': item.get('openInterest', 0),
-                               'Call Volume': item.get('totalTradedVolume', 0),
-                               'Call LTP': item.get('lastPrice', 0)})
-                elif opt_type == 'PE':
-                    row.update({'Put OI': item.get('openInterest', 0),
-                               'Put Volume': item.get('totalTradedVolume', 0),
-                               'Put LTP': item.get('lastPrice', 0)})
-                records.append(row)
-            
+
+            for strike_str, strike_data in oc.items():
+                strike = float(strike_str)
+                ce = strike_data.get("ce", {}) or {}
+                pe = strike_data.get("pe", {}) or {}
+                records.append({
+                    'Strike': strike,
+                    'Call OI': ce.get('oi', 0),
+                    'Call Volume': ce.get('volume', 0),
+                    'Call LTP': ce.get('last_price', 0),
+                    'Put OI': pe.get('oi', 0),
+                    'Put Volume': pe.get('volume', 0),
+                    'Put LTP': pe.get('last_price', 0),
+                })
+
+            if not records:
+                return None, "No option chain rows returned for this expiry."
+
             df = pd.DataFrame(records).groupby('Strike').sum().reset_index()
             df['PCR'] = df['Put OI'] / df['Call OI'].replace(0, 1)
             return df, None
+        elif response.status_code == 429:
+            return None, "Rate limited by Dhan (1 request / 3s for Option Chain). Slow down auto-refresh."
         else:
             return None, f"API Error {response.status_code}: {response.text}"
     except Exception as e:
         return None, f"Connection Error: {str(e)}"
 
 # Fetch and Process Data
-with st.spinner("🔄 Fetching live data..."):
-    current_df, error = fetch_dhan_option_chain()
+with st.spinner("🔄 Fetching live option chain..."):
+    current_df, error = fetch_dhan_option_chain(st.session_state.selected_expiry)
 
 if error:
     st.error(f"❌ {error}")
@@ -117,13 +181,13 @@ if error:
 # 2. CALCULATE OI CHANGES USING MEMORY
 # ==========================================
 if st.session_state.previous_df is not None:
-    merged = pd.merge(current_df[['Strike', 'Call OI', 'Put OI']], 
-                      st.session_state.previous_df[['Strike', 'Call OI', 'Put OI']], 
+    merged = pd.merge(current_df[['Strike', 'Call OI', 'Put OI']],
+                      st.session_state.previous_df[['Strike', 'Call OI', 'Put OI']],
                       on='Strike', suffixes=('_cur', '_prev'))
-    
+
     merged['Call OI Change'] = merged['Call OI_cur'] - merged['Call OI_prev']
     merged['Put OI Change'] = merged['Put OI_cur'] - merged['Put OI_prev']
-    
+
     current_df = current_df.merge(merged[['Strike', 'Call OI Change', 'Put OI Change']], on='Strike')
 else:
     current_df['Call OI Change'] = 0
@@ -158,7 +222,7 @@ col1, col2 = st.columns(2)
 if not valid_pcr_df.empty:
     highest_pcr_row = valid_pcr_df.loc[valid_pcr_df['PCR'].idxmax()]
     lowest_pcr_row = valid_pcr_df.loc[valid_pcr_df['PCR'].idxmin()]
-    
+
     with col1:
         st.markdown(f"""
         <div style='background-color: #d4edda; padding: 15px; border-radius: 10px; border-left: 5px solid #28a745;'>
@@ -203,7 +267,7 @@ pe_ltp = atm_data['Put LTP'] if atm_data is not None else 100
 signal, signal_color, option_type, entry_premium, sl_premium = "⚪ AVOID - No Clear Signal", "gray", "NONE", 0, 0
 
 if total_call_oi_chg < -500000 and total_put_oi_chg > 1000000 and put_strength > 60:
-    signal, signal_color, option_type, entry_premium = " HIGH PROBABILITY BUY CE", "green", "CE", ce_ltp
+    signal, signal_color, option_type, entry_premium = "🟢 HIGH PROBABILITY BUY CE", "green", "CE", ce_ltp
     sl_premium = max(entry_premium - sl_points, 5)
 elif total_call_oi_chg > 1000000 and total_put_oi_chg < -500000 and call_strength > 60:
     signal, signal_color, option_type, entry_premium = "🔴 HIGH PROBABILITY BUY PE", "red", "PE", pe_ltp
