@@ -5,24 +5,39 @@ from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
 import requests
 
-# Page Configuration
-st.set_page_config(page_title="NIFTY Pro Trading Dashboard", layout="wide")
+# Page configuration
+st.set_page_config(page_title="NIFTY Pro Trading Dashboard", layout="wide", initial_sidebar_state="expanded")
+
+# Custom CSS
+st.markdown("""
+<style>
+    .signal-bullish { background-color: #d4edda; color: #155724; padding: 20px; border-radius: 10px; text-align: center; font-size: 24px; font-weight: bold; margin: 10px 0; }
+    .signal-bearish { background-color: #f8d7da; color: #721c24; padding: 20px; border-radius: 10px; text-align: center; font-size: 24px; font-weight: bold; margin: 10px 0; }
+    .signal-neutral { background-color: #fff3cd; color: #856404; padding: 20px; border-radius: 10px; text-align: center; font-size: 24px; font-weight: bold; margin: 10px 0; }
+    .live-badge { background-color: #28a745; color: white; padding: 5px 15px; border-radius: 20px; display: inline-block; animation: pulse 2s infinite; }
+    @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.5; } 100% { opacity: 1; } }
+</style>
+""", unsafe_allow_html=True)
 
 st.title("📊 NIFTY PRO TRADING DASHBOARD")
+st.markdown('<span class="live-badge">● LIVE DATA (TUESDAY EXPIRY)</span>', unsafe_allow_html=True)
 st.markdown("---")
 
-# Initialize Session State for Memory Tracking
+# Initialize session state for memory tracking
 if 'previous_df' not in st.session_state:
     st.session_state.previous_df = None
+if 'last_fetch' not in st.session_state:
+    st.session_state.last_fetch = None
 
 # Sidebar Controls
 with st.sidebar:
     st.header("⚙️ Risk Parameters")
+    risk_reward = st.selectbox("Risk:Reward Ratio", ["1:2", "1:3", "1:1.5"], index=1)
     sl_points = st.slider("Stop Loss (Points)", 10, 100, 30, 5)
     
     st.markdown("---")
     st.header("📊 Signal Logic")
-    st.markdown("- ** BUY CE:** Call OI ↓ + Put OI ↑\n- **🔴 BUY PE:** Call OI ↑ + Put OI ↓\n- **⚪ AVOID:** No clear trend")
+    st.markdown("- **🟢 BUY CE:** Call OI ↓ + Put OI ↑\n- **🔴 BUY PE:** Call OI ↑ + Put OI ↓\n- **⚪ AVOID:** No clear trend")
 
 # Check Credentials
 if 'DHAN_CLIENT_ID' not in st.secrets or 'DHAN_ACCESS_TOKEN' not in st.secrets:
@@ -44,24 +59,20 @@ def fetch_dhan_option_chain():
             "Content-Type": "application/json"
         }
         
-        # Calculate Next Weekly Expiry (Thursday)
+        # UPDATED LOGIC: Calculate next TUESDAY expiry
         today = datetime.today()
-        days_ahead = 3 - today.weekday()  # 3 = Thursday
-        
-        # CRITICAL FIX: If expiry is today (0) or tomorrow (1), fetch NEXT week
-        if days_ahead <= 1:
-            days_ahead += 7
-            
+        # 1 represents Tuesday in Python's weekday() (Monday=0, Tuesday=1)
+        days_ahead = (1 - today.weekday()) % 7
         next_expiry = today + timedelta(days=days_ahead)
         
-        # ROOT CAUSE FIX: Dhan API strictly requires DD-MM-YYYY format
+        # Dhan API strictly requires DD-MM-YYYY format
         expiry_date = next_expiry.strftime("%d-%m-%Y")
         
         url = "https://api.dhan.co/v2/optionchain"
         payload = {
             "underlyingScrip": 13,      # 13 for NIFTY
             "underlyingSeg": "IDX_I",   # IDX_I for Indices
-            "expiry": expiry_date       # Format: DD-MM-YYYY
+            "expiry": expiry_date       
         }
         
         response = requests.post(url, headers=headers, json=payload, timeout=30)
@@ -120,6 +131,7 @@ else:
 
 # Update memory for next run
 st.session_state.previous_df = current_df.copy()
+st.session_state.last_fetch = datetime.now()
 
 # Clean data
 for col in current_df.columns:
@@ -139,6 +151,7 @@ total_put_oi_chg = zone_data['Put OI Change'].sum()
 # ==========================================
 # 3. PCR RANKING & WRITER STRENGTH
 # ==========================================
+st.subheader("📊 PCR Strike Ranking (Smart Money Footprint)")
 valid_pcr_df = current_df[(current_df['PCR'] > 0.1) & (current_df['PCR'] < 10.0)].copy()
 
 col1, col2 = st.columns(2)
@@ -182,7 +195,7 @@ st.plotly_chart(fig_gauge, use_container_width=True)
 # ==========================================
 # 4. TRADING SIGNAL & LEVELS
 # ==========================================
-st.subheader(" TRADING SIGNAL & LEVELS")
+st.subheader("🚨 TRADING SIGNAL & LEVELS")
 atm_data = current_df[current_df['Strike'] == atm_strike].iloc[0] if len(current_df[current_df['Strike'] == atm_strike]) > 0 else None
 ce_ltp = atm_data['Call LTP'] if atm_data is not None else 100
 pe_ltp = atm_data['Put LTP'] if atm_data is not None else 100
@@ -190,7 +203,7 @@ pe_ltp = atm_data['Put LTP'] if atm_data is not None else 100
 signal, signal_color, option_type, entry_premium, sl_premium = "⚪ AVOID - No Clear Signal", "gray", "NONE", 0, 0
 
 if total_call_oi_chg < -500000 and total_put_oi_chg > 1000000 and put_strength > 60:
-    signal, signal_color, option_type, entry_premium = "🟢 HIGH PROBABILITY BUY CE", "green", "CE", ce_ltp
+    signal, signal_color, option_type, entry_premium = " HIGH PROBABILITY BUY CE", "green", "CE", ce_ltp
     sl_premium = max(entry_premium - sl_points, 5)
 elif total_call_oi_chg > 1000000 and total_put_oi_chg < -500000 and call_strength > 60:
     signal, signal_color, option_type, entry_premium = "🔴 HIGH PROBABILITY BUY PE", "red", "PE", pe_ltp
@@ -199,7 +212,7 @@ elif total_call_oi_chg < 0 and total_put_oi_chg > 0 and put_strength > 50:
     signal, signal_color, option_type, entry_premium = "🟢 Mild Bullish - Buy CE on Dips", "lightgreen", "CE", ce_ltp * 0.9
     sl_premium = max(entry_premium - 20, 5)
 elif total_call_oi_chg > 0 and total_put_oi_chg < 0 and call_strength > 50:
-    signal, signal_color, option_type, entry_premium = " Mild Bearish - Buy PE on Rallies", "salmon", "PE", pe_ltp * 0.9
+    signal, signal_color, option_type, entry_premium = "🔴 Mild Bearish - Buy PE on Rallies", "salmon", "PE", pe_ltp * 0.9
     sl_premium = max(entry_premium - 20, 5)
 
 st.markdown(f"""
@@ -218,7 +231,7 @@ if option_type != "NONE":
         st.markdown('</div>', unsafe_allow_html=True)
     with col2:
         st.markdown('<div style="background-color: #f8f9fa; border-radius: 10px; padding: 15px; border-left: 5px solid #dc3545;">', unsafe_allow_html=True)
-        st.metric(" Stop Loss", f"₹{sl_premium:.2f}", delta=f"-{abs(entry_premium - sl_premium):.2f}")
+        st.metric("🛑 Stop Loss", f"₹{sl_premium:.2f}", delta=f"-{abs(entry_premium - sl_premium):.2f}")
         st.metric("🎯 Target 1", f"₹{target1:.2f}", delta=f"+₹{target1 - entry_premium:.2f}")
         st.metric("🎯 Target 2", f"₹{target2:.2f}", delta=f"+₹{target2 - entry_premium:.2f}")
         st.markdown('</div>', unsafe_allow_html=True)
@@ -243,4 +256,4 @@ fig_combined.add_hline(y=0, line_dash="dash", line_color="gray", row=2, col=1)
 fig_combined.update_layout(height=800, showlegend=True, legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
 st.plotly_chart(fig_combined, use_container_width=True)
 
-st.info(f"🕐 Last Updated: {datetime.now().strftime('%H:%M:%S')}")
+st.info(f"🕐 Last Updated: {st.session_state.last_fetch.strftime('%H:%M:%S') if st.session_state.last_fetch else 'N/A'}")
