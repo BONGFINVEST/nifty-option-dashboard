@@ -37,7 +37,7 @@ with st.sidebar:
     
     st.markdown("---")
     st.header("📊 Signal Logic")
-    st.markdown("- **🟢 BUY CE:** Call OI ↓ + Put OI ↑\n- **🔴 BUY PE:** Call OI ↑ + Put OI ↓\n- **⚪ AVOID:** No clear trend")
+    st.markdown("- **🟢 BUY CE:** Call OI ↓ + Put OI ↑\n- ** BUY PE:** Call OI ↑ + Put OI ↓\n- **⚪ AVOID:** No clear trend")
 
 # Function to fetch NIFTY option chain from Dhan
 def fetch_dhan_option_chain():
@@ -47,8 +47,7 @@ def fetch_dhan_option_chain():
         headers = {
             "client-id": CLIENT_ID,
             "access-token": ACCESS_TOKEN,
-            "Accept": "application/json",
-            "Content-Type": "application/json"
+            "Accept": "application/json"
         }
         
         # Calculate next Thursday expiry
@@ -60,28 +59,22 @@ def fetch_dhan_option_chain():
         expiry_date = next_expiry.strftime("%Y-%m-%d")
         
         # CORRECT Dhan API v2 endpoint for option chain
-        url = "https://api.dhan.co/v2/screener"
+        url = f"https://api.dhan.co/v2/optionchain"
         
-        # Request payload for option chain
-        payload = {
-            "exchange": "NFO",
-            "segment": "OPTIDX",
+        params = {
             "symbol": "NIFTY",
-            "expiry": expiry_date,
-            "strikePrice": None,
-            "optionType": None
+            "expiry": expiry_date
         }
         
-        # Make POST request (Dhan API v2 uses POST for screener)
-        response = requests.post(url, headers=headers, json=payload, timeout=30)
+        response = requests.get(url, headers=headers, params=params, timeout=30)
         
         if response.status_code == 200:
             data = response.json()
             
-            # Parse the response
-            if 'data' in data and len(data['data']) > 0:
+            # Parse the response - Dhan returns a list of option instruments
+            if isinstance(data, list) and len(data) > 0:
                 records = []
-                for item in data['data']:
+                for item in data:
                     strike = item.get('strikePrice')
                     opt_type = item.get('optionType')  # 'CE' or 'PE'
                     
@@ -101,7 +94,7 @@ def fetch_dhan_option_chain():
                         row['Put OI Change'] = item.get('changeInOI', 0)
                         row['Put Volume'] = item.get('totalTradedVolume', 0)
                         row['Put LTP'] = item.get('lastPrice', 0)
-                        
+                    
                     records.append(row)
                 
                 # Group by Strike to combine CE and PE
@@ -114,10 +107,10 @@ def fetch_dhan_option_chain():
                 
                 return df, None
             else:
-                return None, "❌ No data returned from API. Check if market is open or expiry date is correct."
+                return None, "❌ No data returned from API. The response format might be different."
             
-        elif response.status_code == 405:
-            return None, "❌ API Error 405: Method Not Allowed. The endpoint or request method is incorrect."
+        elif response.status_code == 404:
+            return None, "❌ API Error 404: Endpoint not found. The option chain endpoint might not be available in Dhan API v2."
         elif response.status_code == 401:
             return None, "❌ API Error 401: Unauthorized. Your Access Token may be expired or invalid."
         elif response.status_code == 403:
@@ -249,7 +242,7 @@ st.markdown("---")
 # ============================================
 # 3. TRADING SIGNAL & LEVELS
 # ============================================
-st.subheader(" TRADING SIGNAL & LEVELS")
+st.subheader("🚨 TRADING SIGNAL & LEVELS")
 
 atm_data = df[df['Strike'] == atm_strike].iloc[0] if len(df[df['Strike'] == atm_strike]) > 0 else None
 ce_ltp = atm_data.get('Call LTP', 100) if atm_data is not None else 100
@@ -277,7 +270,7 @@ if total_call_oi_chg < -500000 and total_put_oi_chg > 1000000 and put_strength >
     target2_premium = entry_premium + (sl_points * 3)
     pcr_validation = f"✅ PCR Confirmed: Highest PCR {highest_pcr_value:.2f} at {highest_pcr_strike:.0f}"
 elif total_call_oi_chg > 1000000 and total_put_oi_chg < -500000 and call_strength > 60:
-    signal = " HIGH PROBABILITY BUY PE"
+    signal = "🔴 HIGH PROBABILITY BUY PE"
     signal_color = "red"
     confidence = "HIGH"
     option_type = "PE"
@@ -297,7 +290,7 @@ elif total_call_oi_chg < 0 and total_put_oi_chg > 0 and put_strength > 50:
     target2_premium = entry_premium + 80
     pcr_validation = "⚠️ Wait for price to dip near support"
 elif total_call_oi_chg > 0 and total_put_oi_chg < 0 and call_strength > 50:
-    signal = " Mild Bearish - Buy PE on Rallies"
+    signal = "🔴 Mild Bearish - Buy PE on Rallies"
     signal_color = "salmon"
     confidence = "MEDIUM"
     option_type = "PE"
@@ -305,13 +298,13 @@ elif total_call_oi_chg > 0 and total_put_oi_chg < 0 and call_strength > 50:
     sl_premium = max(entry_premium - 20, 5)
     target1_premium = entry_premium + 40
     target2_premium = entry_premium + 80
-    pcr_validation = "️ Wait for price to rally near resistance"
+    pcr_validation = "⚠️ Wait for price to rally near resistance"
 else:
     signal = "⚪ AVOID - No Clear Signal"
     signal_color = "gray"
     confidence = "LOW"
     option_type = "NONE"
-    pcr_validation = "️ OI signals are mixed or weak"
+    pcr_validation = "⚠️ OI signals are mixed or weak"
 
 st.markdown(f"""
 <div style='background-color: {signal_color}; padding: 30px; border-radius: 10px; text-align: center; margin-bottom: 20px;'>
@@ -323,16 +316,16 @@ st.markdown(f"""
 st.info(f"🧠 **PCR Validation:** {pcr_validation}")
 
 if option_type != "NONE" and entry_premium > 0:
-    st.markdown("### 📋 TRADING PARAMETERS")
+    st.markdown("###  TRADING PARAMETERS")
     col1, col2 = st.columns(2)
     with col1:
         st.markdown('<div style="background-color: #f8f9fa; border-radius: 10px; padding: 15px; border-left: 5px solid #007bff;">', unsafe_allow_html=True)
-        st.metric("🎯 Recommended Strike", f"{recommended_strike} {option_type}")
+        st.metric(" Recommended Strike", f"{recommended_strike} {option_type}")
         st.metric("💰 Entry Premium", f"₹{entry_premium:.2f}")
         st.markdown('</div>', unsafe_allow_html=True)
     with col2:
         st.markdown('<div style="background-color: #f8f9fa; border-radius: 10px; padding: 15px; border-left: 5px solid #dc3545;">', unsafe_allow_html=True)
-        st.metric("🛑 Stop Loss", f"{sl_premium:.2f}", delta=f"-₹{abs(entry_premium - sl_premium):.2f}")
+        st.metric("🛑 Stop Loss", f"₹{sl_premium:.2f}", delta=f"-₹{abs(entry_premium - sl_premium):.2f}")
         st.metric("🎯 Target 1", f"₹{target1_premium:.2f}", delta=f"+₹{target1_premium - entry_premium:.2f}")
         st.metric("🎯 Target 2", f"₹{target2_premium:.2f}", delta=f"+₹{target2_premium - entry_premium:.2f}")
         st.markdown('</div>', unsafe_allow_html=True)
@@ -343,17 +336,17 @@ if option_type != "NONE" and entry_premium > 0:
         st.markdown(f"""
         ✅ **Action:** Buy NIFTY {recommended_strike} CE (Next Weekly Expiry)<br>
         💰 **Entry Premium:** ₹{entry_premium:.2f}<br>
-        🛑 **Stop Loss:** ₹{sl_premium:.2f} (Premium basis) - Strict SL<br>
+         **Stop Loss:** ₹{sl_premium:.2f} (Premium basis) - Strict SL<br>
         🎯 **Target 1:** ₹{target1_premium:.2f} (Book 50% position)<br>
         🎯 **Target 2:** ₹{target2_premium:.2f} (Trail balance)<br>
         📍 **Key Support:** {highest_pcr_strike:.0f} (PCR: {highest_pcr_value:.2f})<br>
         ⏰ **Time Frame:** Intraday/Next day expiry<br>
-         **Note:** Maintain strict SL. Do not average down.
+        💡 **Note:** Maintain strict SL. Do not average down.
         """, unsafe_allow_html=True)
     else:
         st.markdown(f"""
         ✅ **Action:** Buy NIFTY {recommended_strike} PE (Next Weekly Expiry)<br>
-        💰 **Entry Premium:** ₹{entry_premium:.2f}<br>
+         **Entry Premium:** ₹{entry_premium:.2f}<br>
         🛑 **Stop Loss:** ₹{sl_premium:.2f} (Premium basis) - Strict SL<br>
         🎯 **Target 1:** ₹{target1_premium:.2f} (Book 50% position)<br>
         🎯 **Target 2:** ₹{target2_premium:.2f} (Trail balance)<br>
@@ -406,7 +399,7 @@ if signal == "🟢 HIGH PROBABILITY BUY CE":
 elif signal == "🔴 HIGH PROBABILITY BUY PE":
     st.error(f"**STRONG BEARISH SIGNAL** - Call writers dominating with {call_strength:.1f}% strength")
     st.info("Recommended: Look for **BUY PE** opportunities on rallies")
-elif signal == "🟢 Mild Bullish - Buy CE on Dips":
+elif signal == " Mild Bullish - Buy CE on Dips":
     st.warning(f"⚠️ **MILD BULLISH** - Put writers slightly stronger ({put_strength:.1f}%)")
     st.info("Recommended: Wait for confirmation before entering")
 elif signal == "🔴 Mild Bearish - Buy PE on Rallies":
