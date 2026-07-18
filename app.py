@@ -4,9 +4,12 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
 import requests
+from streamlit_autorefresh import st_autorefresh
 
 # Page configuration
 st.set_page_config(page_title="NIFTY Pro Trading Dashboard", layout="wide", initial_sidebar_state="expanded")
+
+REFRESH_INTERVAL_MS = 10_000  # Dhan Option Chain limit is 1 req/3s; 10s leaves headroom
 
 # Custom CSS
 st.markdown("""
@@ -113,6 +116,11 @@ with st.sidebar:
     st.session_state.selected_expiry = chosen_expiry
 
     st.markdown("---")
+    st.header("🔄 Auto-Refresh")
+    auto_refresh_on = st.checkbox("Enable 10s auto-refresh", value=True)
+    st.caption("Dhan Option Chain limit: 1 request / 3s. 10s leaves headroom.")
+
+    st.markdown("---")
     st.header("⚙️ Risk Parameters")
     risk_reward = st.selectbox("Risk:Reward Ratio", ["1:2", "1:3", "1:1.5"], index=1)
     sl_points = st.slider("Stop Loss (Points)", 10, 100, 30, 5)
@@ -121,7 +129,19 @@ with st.sidebar:
     st.header("📊 Signal Logic")
     st.markdown("- **🟢 BUY CE:** Call OI ↓ + Put OI ↑\n- **🔴 BUY PE:** Call OI ↑ + Put OI ↓\n- **⚪ AVOID:** No clear trend")
 
-st.markdown(f'<span class="live-badge">● LIVE DATA (EXPIRY: {st.session_state.selected_expiry})</span>', unsafe_allow_html=True)
+# Kick off the 10s auto-refresh loop only if the user has it enabled.
+# st_autorefresh must be called on every run to keep re-arming the timer.
+if auto_refresh_on:
+    st_autorefresh(interval=REFRESH_INTERVAL_MS, key="oi_autorefresh")
+
+status_col1, status_col2 = st.columns([3, 1])
+with status_col1:
+    st.markdown(f'<span class="live-badge">● LIVE DATA (EXPIRY: {st.session_state.selected_expiry})</span>', unsafe_allow_html=True)
+with status_col2:
+    if auto_refresh_on:
+        st.caption("🔄 Auto-refreshing every 10s")
+    else:
+        st.caption("⏸️ Auto-refresh paused")
 
 # ==========================================
 # 1. FETCH LIVE OPTION CHAIN FOR SELECTED EXPIRY
