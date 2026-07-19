@@ -1,0 +1,35 @@
+name: Keep NIFTY Scanner Awake (Market Hours Only)
+
+on:
+  schedule:
+    # Runs every 10 minutes, UTC 03:00-11:00 (covers IST 08:30-16:30 with
+    # margin). The Python script itself does the precise IST 09:15-15:30,
+    # Mon-Fri check and exits immediately (no browser launch, no minutes
+    # spent) outside that exact window -- this cron window is deliberately
+    # a bit wider just so we never miss the real open/close due to cron's
+    # documented few-minutes-of-drift under GitHub's load.
+    - cron: "*/10 3-11 * * 1-5"
+  workflow_dispatch: {}   # lets you trigger a manual test run from the Actions tab
+
+jobs:
+  keep_alive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5   # each visit should take well under a minute; this is just a safety cap
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Playwright
+        run: |
+          pip install playwright
+          playwright install --with-deps chromium
+
+      - name: Visit app (wakes it if asleep, triggers one live poll+save cycle)
+        env:
+          STREAMLIT_APP_URL: ${{ secrets.STREAMLIT_APP_URL }}
+        run: python keep_alive.py
