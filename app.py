@@ -670,7 +670,7 @@ if is_open:
         render_fetch_error(error)
     st.session_state.token_status = 'ok'
     st.session_state.previous_df = df.copy()
-    st.session_state.last_fetch = datetime.now()
+    st.session_state.last_fetch = datetime.now(IST)
     st.session_state.baseline_source = 'live'
     save_chain_snapshot(df, st.session_state.last_fetch, st.session_state.selected_expiry)
 
