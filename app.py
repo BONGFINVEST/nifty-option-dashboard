@@ -470,6 +470,58 @@ def master_signal(pcr, ce_vol_imbalance, choi_ce, choi_pe, ce_ltp, pe_ltp, t: di
 
 
 # ==========================================
+# SIGNAL PROGRESS — how close is each tier to firing?
+# ==========================================
+# Answers "why hasn't a signal fired" with the actual numbers, instead of a
+# silent 'wait for data confirmation'. This evaluates each of the 4 named
+# tiers from master_signal() against the SAME thresholds, condition by
+# condition, and reports a pass/fail + numeric gap for each. Deliberately
+# NOT framed as a 'ladder' toward Strong -- the mild and Strong tiers in
+# your original formula don't share a strict subset relationship (e.g. 'CE
+# writers strong' actually requires a MORE extreme PCR than 'Strong PE Buy'
+# does), so showing it as a staircase would misrepresent your own formula.
+# Instead each tier gets its own honest checklist.
+def evaluate_signal_tiers(pcr, ce_vol_imbalance, choi_ce, choi_pe, ce_ltp, pe_ltp, t: dict):
+    if pd.isna(pcr):
+        return {}
+
+    tier_defs = {
+        "Strong CE Buy": [
+            (f"PCR > {t['pcr_high']:.2f}", pcr > t['pcr_high'], pcr - t['pcr_high']),
+            (f"CE Vol Imbalance < -{t['vol_imbalance_strong']:.0f}",
+             ce_vol_imbalance < -t['vol_imbalance_strong'], (-t['vol_imbalance_strong']) - ce_vol_imbalance),
+            ("Choi_PE > Choi_CE", choi_pe > choi_ce, choi_pe - choi_ce),
+            ("CE LTP > PE LTP", ce_ltp > pe_ltp, ce_ltp - pe_ltp),
+        ],
+        "Strong PE Buy": [
+            (f"PCR < {t['pcr_low']:.2f}", pcr < t['pcr_low'], t['pcr_low'] - pcr),
+            (f"CE Vol Imbalance > {t['vol_imbalance_strong']:.0f}",
+             ce_vol_imbalance > t['vol_imbalance_strong'], ce_vol_imbalance - t['vol_imbalance_strong']),
+            ("Choi_PE < Choi_CE", choi_pe < choi_ce, choi_ce - choi_pe),
+            ("CE LTP < PE LTP", ce_ltp < pe_ltp, pe_ltp - ce_ltp),
+        ],
+        "PE writers strong": [
+            (f"PCR >= {t['pcr_high']:.2f}", pcr >= t['pcr_high'], pcr - t['pcr_high']),
+            ("Choi_PE > Choi_CE", choi_pe > choi_ce, choi_pe - choi_ce),
+            (f"CE Vol Imbalance < -{t['vol_imbalance_mild']:.0f}",
+             ce_vol_imbalance < -t['vol_imbalance_mild'], (-t['vol_imbalance_mild']) - ce_vol_imbalance),
+        ],
+        "CE writers strong": [
+            (f"PCR < {t['pcr_ce_writers']:.2f}", pcr < t['pcr_ce_writers'], t['pcr_ce_writers'] - pcr),
+            ("Choi_CE > Choi_PE", choi_ce > choi_pe, choi_ce - choi_pe),
+            (f"CE Vol Imbalance > {t['vol_imbalance_mild']:.0f}",
+             ce_vol_imbalance > t['vol_imbalance_mild'], ce_vol_imbalance - t['vol_imbalance_mild']),
+        ],
+    }
+
+    report = {}
+    for tier, conditions in tier_defs.items():
+        met = sum(1 for _, ok, _ in conditions if ok)
+        report[tier] = {'met': met, 'total': len(conditions), 'conditions': conditions}
+    return report
+
+
+# ==========================================
 # ACTION TAG — 'Dash Board'!L3 (ordered lookup, first match wins)
 # ==========================================
 ACTION_RULES = [
@@ -703,6 +755,8 @@ zb = zone_b_signal(df, atm_strike, zone_b_width, signal_thresholds)
 sig = master_signal(za['pcr'], zb['ce_vol_imbalance'], zb['choi_ce'], zb['choi_pe'],
                      zb['ce_ltp_avg'], zb['pe_ltp_avg'], DEFAULT_MASTER_THRESHOLDS)
 action = action_tag(za['classification'], zb['signal'])
+tier_report = evaluate_signal_tiers(za['pcr'], zb['ce_vol_imbalance'], zb['choi_ce'], zb['choi_pe'],
+                                     zb['ce_ltp_avg'], zb['pe_ltp_avg'], DEFAULT_MASTER_THRESHOLDS)
 
 # ==========================================
 # CONFLUENCE LAYER (new, additive — never overrides the core signal above)
@@ -779,6 +833,39 @@ c1.metric("Spot / ATM", f"{spot:.0f}" if spot else "—", f"ATM {atm_strike:.0f}
 c2.metric("Zone A PCR", f"{za['pcr']:.3f}" if pd.notna(za['pcr']) else "—")
 c3.metric("Choi_CE / Choi_PE", f"{zb['choi_ce']:.1f}% / {zb['choi_pe']:.1f}%")
 c4.metric("CE Vol Imbalance", f"{zb['ce_vol_imbalance']:.1f}")
+
+st.markdown("---")
+
+# ==========================================
+# SIGNAL PROGRESS PANEL
+# ==========================================
+st.subheader("📐 Signal Progress — what's met, what's still missing")
+if sig != "wait for data confirmation":
+    st.success(f"**{sig}** is currently active — all conditions for this tier are satisfied.")
+elif tier_report:
+    # Surface the tier with the most conditions already satisfied, so you can
+    # watch a setup building through the day instead of only seeing a flip.
+    closest_tier = max(tier_report.items(), key=lambda kv: kv[1]['met'] / kv[1]['total'])
+    tier_name, tier_data = closest_tier
+    st.info(f"Closest to firing: **{tier_name}** ({tier_data['met']}/{tier_data['total']} conditions met)")
+    cols = st.columns(tier_data['total'])
+    for col, (label, met, gap) in zip(cols, tier_data['conditions']):
+        with col:
+            icon = "✅" if met else "❌"
+            gap_label = f"margin +{gap:.2f}" if met else f"short by {abs(gap):.2f}"
+            st.markdown(f"{icon} **{label}**")
+            st.caption(gap_label)
+
+    with st.expander("Show all 4 tiers' full checklists"):
+        for tier_name, tier_data in tier_report.items():
+            st.markdown(f"**{tier_name}** — {tier_data['met']}/{tier_data['total']} met")
+            for label, met, gap in tier_data['conditions']:
+                icon = "✅" if met else "❌"
+                gap_label = f"margin +{gap:.2f}" if met else f"short by {abs(gap):.2f}"
+                st.caption(f"{icon} {label} — {gap_label}")
+            st.markdown("")
+else:
+    st.caption("Not enough data yet to evaluate tier progress.")
 
 st.markdown("---")
 
