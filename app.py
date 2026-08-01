@@ -1377,12 +1377,40 @@ margin:6px 0;'>
             fmt_table['ATM'] = np.where(fmt_table['Strike'] == atm_strike, '⬅ ATM', '')
             display_fp_cols = ['Strike', 'ATM', 'CE_IV', 'PE_IV', 'IV_Skew', 'CE_OI_chg', 'PE_OI_chg',
                                 'ChgPCR', 'CE_Volume', 'PE_Volume', 'Total_OI', 'Vol_OI']
-            st.dataframe(
-                fmt_table[display_fp_cols].style.format(precision=2).background_gradient(
-                    subset=['IV_Skew'], cmap='RdYlGn', vmin=-5, vmax=5
-                ).background_gradient(subset=['Vol_OI'], cmap='Blues', vmin=0, vmax=1),
-                use_container_width=True, height=360,
-            )
+
+            def _iv_skew_cell_color(val):
+                if pd.isna(val):
+                    return ''
+                if val <= footprint_thresholds['iv_skew_bearish']:
+                    return 'background-color: #f8d7da'   # red tint — Put buying
+                if val >= footprint_thresholds['iv_skew_bullish']:
+                    return 'background-color: #d4edda'   # green tint — Put writing
+                return ''
+
+            def _vol_oi_cell_color(val):
+                if pd.isna(val):
+                    return ''
+                if val >= footprint_thresholds['vol_oi_fresh']:
+                    return 'background-color: #cfe2ff'   # blue tint — fresh money
+                if val < footprint_thresholds['vol_oi_fakeout']:
+                    return 'background-color: #f8d7da'   # red tint — fakeout risk
+                return ''
+
+            # Manual CSS-based highlighting (no matplotlib dependency, unlike
+            # Styler.background_gradient which isn't installed on Streamlit
+            # Cloud by default). Wrapped so a styling hiccup never breaks the
+            # table -- it just falls back to plain formatting.
+            try:
+                styled = fmt_table[display_fp_cols].style.format(precision=2)
+                map_fn = styled.map if hasattr(styled, 'map') else styled.applymap
+                styled = map_fn(_iv_skew_cell_color, subset=['IV_Skew'])
+                map_fn2 = styled.map if hasattr(styled, 'map') else styled.applymap
+                styled = map_fn2(_vol_oi_cell_color, subset=['Vol_OI'])
+                st.dataframe(styled, use_container_width=True, height=360)
+            except Exception:
+                st.dataframe(fmt_table[display_fp_cols].style.format(precision=2),
+                              use_container_width=True, height=360)
+
             st.caption(
                 "IV_Skew = CE_IV − PE_IV · ChgPCR = today's PE_OI_chg / CE_OI_chg (today's flow, not the "
                 "standing PCR) · Vol/OI = (CE_Volume+PE_Volume) / (CE_OI+PE_OI), the 'fresh money' ratio."
