@@ -90,6 +90,8 @@ DEFAULT_FOOTPRINT_THRESHOLDS = {
     "vol_oi_fresh": 0.6,         # Vol/OI >= this -> fresh institutional money, regime is "real"
     "vol_oi_fakeout": 0.2,       # Vol/OI < this -> just intraday squaring off, ignore the breakout
     "trend_flat_band_pct": 0.1,  # spot within +-this% of today's open counts as "sideways", not rising/falling
+    "chgpcr_min_ce_chg_abs": 300,       # minimum |net CE OI change| (contracts) in the zone before trusting ChgPCR
+    "chgpcr_min_ce_chg_pct_of_oi": 0.3, # ...OR at least this % of the zone's total OI, whichever floor is higher
 }
 
 # ==========================================
@@ -729,14 +731,24 @@ def compute_footprint_table(df: pd.DataFrame, atm: float, width: int) -> pd.Data
     return zone[cols].reset_index(drop=True)
 
 
-def aggregate_footprint_metrics(footprint_df: pd.DataFrame) -> dict:
+def aggregate_footprint_metrics(footprint_df: pd.DataFrame, t: dict = None) -> dict:
     """Rolls the per-strike table up into the three 'cheat code' numbers.
     IV Skew is OI-weighted (so a thinly-traded far strike doesn't skew the
     read); ChgPCR and Vol/OI are sum-then-ratio across the zone (matches how
     Zone A/B already aggregate in this app), not an average-of-ratios, since
-    that's far less sensitive to one strike's near-zero-OI-change outlier."""
+    that's far less sensitive to one strike's near-zero-OI-change outlier.
+
+    ChgPCR is a ratio of two OI-change numbers, so when net CE OI change in
+    the zone is tiny (thin flow -- pre-market, first few minutes after open,
+    or a stale/closing snapshot), the ratio can blow up to a huge, meaningless
+    value even though nothing unusual actually happened. This guards against
+    that: ChgPCR is only reported when the zone's net CE OI change clears a
+    minimum floor (both an absolute contract count and a % of zone OI);
+    otherwise it's returned as unreliable so the UI can say so instead of
+    showing a number like -24 or +18 that looks like a strong signal but
+    is really just noise from a near-zero denominator."""
     if footprint_df.empty:
-        return {'iv_skew': np.nan, 'chg_pcr': np.nan, 'vol_oi': np.nan}
+        return {'iv_skew': np.nan, 'chg_pcr': np.nan, 'vol_oi': np.nan, 'chg_pcr_reliable': False}
 
     weights = footprint_df['Total_OI'].replace(0, np.nan)
     if weights.sum() > 0:
@@ -746,13 +758,22 @@ def aggregate_footprint_metrics(footprint_df: pd.DataFrame) -> dict:
 
     ce_chg_sum = footprint_df['CE_OI_chg'].sum()
     pe_chg_sum = footprint_df['PE_OI_chg'].sum()
-    chg_pcr = (pe_chg_sum / ce_chg_sum) if ce_chg_sum != 0 else np.nan
-
     oi_sum = footprint_df['Total_OI'].sum()
+
+    min_abs_floor = (t or {}).get('chgpcr_min_ce_chg_abs', 300)
+    min_pct_floor = (t or {}).get('chgpcr_min_ce_chg_pct_of_oi', 0.3)  # percent
+    floor = max(min_abs_floor, oi_sum * min_pct_floor / 100) if oi_sum > 0 else min_abs_floor
+    chg_pcr_reliable = abs(ce_chg_sum) >= floor
+    chg_pcr = (pe_chg_sum / ce_chg_sum) if (ce_chg_sum != 0 and chg_pcr_reliable) else np.nan
+
     vol_sum = footprint_df['CE_Volume'].sum() + footprint_df['PE_Volume'].sum()
     vol_oi = (vol_sum / oi_sum) if oi_sum > 0 else np.nan
 
-    return {'iv_skew': iv_skew, 'chg_pcr': chg_pcr, 'vol_oi': vol_oi}
+    return {
+        'iv_skew': iv_skew, 'chg_pcr': chg_pcr, 'vol_oi': vol_oi,
+        'chg_pcr_reliable': chg_pcr_reliable,
+        'ce_chg_sum': ce_chg_sum, 'pe_chg_sum': pe_chg_sum, 'oi_sum': oi_sum,
+    }
 
 
 def market_direction_today(spot, day_open, flat_band_pct: float) -> str:
@@ -770,7 +791,7 @@ def market_direction_today(spot, day_open, flat_band_pct: float) -> str:
     return "sideways"
 
 
-def institutional_footprint_signal(iv_skew, chg_pcr, vol_oi, market_direction, t: dict):
+def institutional_footprint_signal(iv_skew, chg_pcr, vol_oi, market_direction, t: dict, chg_pcr_reliable: bool = True):
     """Combines the three reads into one headline + explanation, exactly per
     the prop-desk playbook:
       1. IV Skew cheat code -> directional bias
@@ -797,7 +818,10 @@ def institutional_footprint_signal(iv_skew, chg_pcr, vol_oi, market_direction, t
 
     # -- 2. ChgPCR trap check (context-dependent on today's price direction) --
     trap_bias = None
-    if not pd.isna(chg_pcr):
+    if not chg_pcr_reliable:
+        lines.append("ChgPCR skipped — net CE OI change in this zone is too thin right now to trust the ratio "
+                      "(common right after open or on stale/closing data). Will resume once flow builds up.")
+    elif not pd.isna(chg_pcr):
         if market_direction == "falling" and chg_pcr > t['chgpcr_bear_trap']:
             trap_bias = "Bullish"
             lines.append(f"ChgPCR {chg_pcr:.2f} spiking while price FALLS → Bear Trap. Institutions are buying the dip.")
@@ -962,12 +986,21 @@ with st.sidebar:
             "Vol/OI ≥ this → fresh money confirmed", value=DEFAULT_FOOTPRINT_THRESHOLDS['vol_oi_fresh'], step=0.05)
         fp_vol_oi_fakeout = st.number_input(
             "Vol/OI < this → fakeout / just squaring off", value=DEFAULT_FOOTPRINT_THRESHOLDS['vol_oi_fakeout'], step=0.05)
+        fp_chgpcr_min_abs = st.number_input(
+            "ChgPCR min |net CE OI change| to trust (contracts)",
+            value=DEFAULT_FOOTPRINT_THRESHOLDS['chgpcr_min_ce_chg_abs'], step=50,
+            help="Below this, the zone's net CE OI change is too thin to trust the ChgPCR ratio — it gets "
+                 "skipped instead of showing a noisy, misleadingly large number.")
+        fp_chgpcr_min_pct = st.number_input(
+            "...OR min % of zone OI, whichever floor is higher",
+            value=DEFAULT_FOOTPRINT_THRESHOLDS['chgpcr_min_ce_chg_pct_of_oi'], step=0.1)
 
 footprint_thresholds = {
     "iv_skew_bearish": fp_iv_skew_bearish, "iv_skew_bullish": fp_iv_skew_bullish,
     "chgpcr_bear_trap": fp_chgpcr_bear_trap, "chgpcr_bull_trap": fp_chgpcr_bull_trap,
     "vol_oi_fresh": fp_vol_oi_fresh, "vol_oi_fakeout": fp_vol_oi_fakeout,
     "trend_flat_band_pct": DEFAULT_FOOTPRINT_THRESHOLDS['trend_flat_band_pct'],
+    "chgpcr_min_ce_chg_abs": fp_chgpcr_min_abs, "chgpcr_min_ce_chg_pct_of_oi": fp_chgpcr_min_pct,
 }
 
 pcr_thresholds = {"overbought": overbought_th, "bullish": bullish_th, "bearish": bearish_th}
@@ -1109,13 +1142,13 @@ top_pcr = top_pcr_strikes(df, top_n=2)
 # INSTITUTIONAL FOOTPRINT — independent third read (IV Skew / ChgPCR / Vol-OI)
 # ==========================================
 footprint_table = compute_footprint_table(df, atm_strike, footprint_width) if show_footprint_panel else pd.DataFrame()
-footprint_agg = aggregate_footprint_metrics(footprint_table) if not footprint_table.empty else {
-    'iv_skew': np.nan, 'chg_pcr': np.nan, 'vol_oi': np.nan}
+footprint_agg = aggregate_footprint_metrics(footprint_table, footprint_thresholds) if not footprint_table.empty else {
+    'iv_skew': np.nan, 'chg_pcr': np.nan, 'vol_oi': np.nan, 'chg_pcr_reliable': False}
 day_open = ohlc_df['open'].iloc[0] if (ohlc_df is not None and not ohlc_df.empty) else None
 footprint_market_dir = market_direction_today(spot, day_open, footprint_thresholds['trend_flat_band_pct'])
 footprint_headline, footprint_color_key, footprint_lines = institutional_footprint_signal(
     footprint_agg['iv_skew'], footprint_agg['chg_pcr'], footprint_agg['vol_oi'],
-    footprint_market_dir, footprint_thresholds
+    footprint_market_dir, footprint_thresholds, chg_pcr_reliable=footprint_agg.get('chg_pcr_reliable', True)
 ) if show_footprint_panel and not footprint_table.empty else (None, None, [])
 
 # Confluence agreement counter (informational only)
