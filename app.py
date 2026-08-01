@@ -18,6 +18,18 @@ CONFLUENCE panel (spot vs VWAP, Max Pain, bid/ask liquidity, days-to-expiry gamm
 that never overrides the core signal -- it just tells you how much independent support
 that signal has right now, so you can size conviction accordingly.
 
+It also adds a REAL-TIME CANDLESTICK CHART panel (spot OHLC + VWAP + Max Pain trend),
+built from Dhan's intraday-candle endpoint and your own session log -- purely visual,
+never feeds back into the Master Signal.
+
+On top of that, a VWAP TREND READ panel tracks the pattern you watch manually: while
+price keeps *closing* on one side of the running session VWAP, that bias has tended to
+persist for the next ~30-60 minutes. It surfaces the current streak (consecutive candles
+closed on one side), flags VWAP "touch-and-hold" retests (price dips into VWAP intrabar
+but still closes through in the trend direction), and confirms once the streak crosses a
+threshold you set. This is descriptive of what price has actually done, not a prediction,
+and it's entirely separate from the OI-based Master Signal above.
+
 Data source: Dhan API v2 Option Chain (see fetch_option_chain for schema notes).
 Sensibull's CSV had "CE OI change" as a pre-computed column; Dhan gives the same
 thing natively via `previous_oi` (oi - previous_oi = today's cumulative change),
@@ -60,6 +72,11 @@ DEFAULT_MASTER_THRESHOLDS = {                                                   
     "pcr_high": 1.0, "pcr_low": 0.8, "pcr_ce_writers": 0.7,
     "vol_imbalance_strong": 5, "vol_imbalance_mild": 1,
 }
+
+# Candlestick chart settings -- separate concern from the OI-based Master Signal above.
+# This is purely a visual overlay of spot price action + intraday VWAP + Max Pain trend.
+CANDLE_FETCH_THROTTLE_SECONDS = 30   # don't hammer Dhan's intraday-candle endpoint every 10s OI poll
+DEFAULT_CANDLE_INTERVAL = "5"        # minutes -- matches your M5 Fibonacci Pine Script granularity
 
 # ==========================================
 # PERSISTENCE (local disk + Google Sheets)
@@ -343,33 +360,120 @@ def render_fetch_error(error: str):
     st.stop()
 
 
-def fetch_vwap_bias():
-    """Best-effort intraday VWAP for NIFTY spot via Dhan's intraday-candle
-    endpoint. Dhan's exact segment/instrument code for the NIFTY *index*
-    (as opposed to equity/futures) isn't fully nailed down from public docs,
-    so this fails soft: any schema mismatch just disables the VWAP panel
-    rather than showing a wrong number. If it errors for you, check
-    https://dhanhq.co/docs/v2/historical-data/ for the exact index paylod
+def fetch_intraday_ohlc(interval: str = DEFAULT_CANDLE_INTERVAL):
+    """Pulls today's NIFTY spot INDEX intraday OHLCV candles from Dhan's
+    intraday-candle endpoint. This is the single source now used for both
+    the candlestick chart and the VWAP figure in the Confluence panel
+    (previously a second, separate call to this same endpoint just to
+    collapse it into one VWAP scalar -- consolidated here to halve the
+    API hits against this endpoint).
+
+    Dhan's exact segment/instrument code for the NIFTY *index* (as opposed
+    to equity/futures) isn't fully nailed down from public docs, so this
+    fails soft: any schema mismatch just disables the candle panel rather
+    than showing wrong data. If it errors for you, check
+    https://dhanhq.co/docs/v2/historical-data/ for the exact index payload
     shape and I'll patch the two lines below."""
     try:
         today_str = datetime.now(IST).strftime("%Y-%m-%d")
         payload = {
             "securityId": str(NIFTY_SCRIP), "exchangeSegment": "IDX_I", "instrument": "INDEX",
-            "interval": "5", "oi": False,
+            "interval": interval, "oi": False,
             "fromDate": f"{today_str} 09:15:00", "toDate": f"{today_str} 23:59:59",
         }
         r = requests.post("https://api.dhan.co/v2/charts/intraday", headers=DHAN_HEADERS, json=payload, timeout=15)
         if r.status_code != 200:
             return None
         data = r.json()
-        closes, highs, lows, vols = data.get('close'), data.get('high'), data.get('low'), data.get('volume')
-        if not closes or not vols or sum(vols) == 0:
+        opens, highs, lows, closes = data.get('open'), data.get('high'), data.get('low'), data.get('close')
+        vols, ts = data.get('volume'), data.get('timestamp')
+        if not opens or not ts:
             return None
-        typical = [(h + l + c) / 3 for h, l, c in zip(highs, lows, closes)]
-        vwap = sum(t * v for t, v in zip(typical, vols)) / sum(vols)
-        return vwap
+        out = pd.DataFrame({
+            'time': pd.to_datetime(ts, unit='s', utc=True).tz_convert(IST),
+            'open': opens, 'high': highs, 'low': lows, 'close': closes,
+            'volume': vols if vols else [0] * len(opens),
+        })
+        return out
     except Exception:
         return None
+
+
+def compute_cumulative_vwap(ohlc_df: pd.DataFrame) -> pd.DataFrame:
+    """Adds a 'vwap' column: a running (session-to-date) volume-weighted
+    typical-price average, matching how VWAP is conventionally plotted
+    intraday (each point = VWAP-so-far, not VWAP-of-that-single-candle).
+
+    Falls back to a cumulative simple average of typical price -- labelled
+    distinctly in the UI -- if the feed carries no real volume, since
+    Dhan's INDEX candle feed for NIFTY itself typically reports 0 volume
+    (the index has no traded volume; only its constituents/futures do)."""
+    out = ohlc_df.copy()
+    typical = (out['high'] + out['low'] + out['close']) / 3
+    if out['volume'].sum() > 0:
+        vol = out['volume'].replace(0, np.nan)
+        out['vwap'] = (typical * vol).cumsum() / vol.cumsum()
+    else:
+        out['vwap'] = typical.expanding().mean()
+    return out
+
+
+def analyze_vwap_trend(ohlc_df: pd.DataFrame, interval_minutes: int, confirm_candles: int = 3):
+    """Reads the VWAP-respect pattern: while price keeps *closing* on one side
+    of the running session VWAP, that directional bias has historically tended
+    to persist for the next ~30-60 minutes. This tracks the current streak of
+    consecutive candles closed on one side, and separately flags "touch-and-
+    hold" events -- candles where price dipped/spiked into VWAP intrabar
+    (low <= vwap <= high) but still closed on the streak's side, which is the
+    institutional retest-and-continue pattern that makes a hold more credible
+    than a streak with no retest at all.
+
+    A streak resets the moment a candle *closes* on the opposite side --
+    intrabar wicks through VWAP don't break it, only a close does. That
+    matches "respecting VWAP" as a level, not treating every wick as a flip.
+
+    Descriptive only: reports what price has actually done so far this
+    session. Does not guarantee continuation, and is entirely independent of
+    the OI-based Master Signal."""
+    out = ohlc_df.dropna(subset=['vwap']).copy()
+    if out.empty or len(out) < 2:
+        return None
+
+    out['side'] = np.where(out['close'] > out['vwap'], 'above', 'below')
+    out['touched_vwap'] = (out['low'] <= out['vwap']) & (out['high'] >= out['vwap'])
+
+    current_side = out['side'].iloc[-1]
+    streak = 0
+    streak_start_time = out['time'].iloc[-1]
+    for s, t in zip(out['side'].values[::-1], out['time'].values[::-1]):
+        if s == current_side:
+            streak += 1
+            streak_start_time = t
+        else:
+            break
+
+    streak_slice = out.iloc[-streak:]
+    touch_hold_events = streak_slice[streak_slice['touched_vwap']]
+
+    opposite_side = 'below' if current_side == 'above' else 'above'
+    breaks = out[out['side'] == opposite_side]
+    last_break_time = breaks['time'].iloc[-1] if not breaks.empty else None
+
+    last_close, last_vwap = out['close'].iloc[-1], out['vwap'].iloc[-1]
+    distance_pts = last_close - last_vwap
+    distance_pct = (distance_pts / last_vwap * 100) if last_vwap else None
+
+    return {
+        'side': current_side, 'streak_candles': streak,
+        'streak_minutes': streak * interval_minutes,
+        'streak_start_time': pd.to_datetime(streak_start_time),
+        'confirmed': streak >= confirm_candles,
+        'touch_hold_count': len(touch_hold_events),
+        'touch_hold_df': touch_hold_events[['time', 'vwap']].reset_index(drop=True),
+        'last_break_time': pd.to_datetime(last_break_time) if last_break_time is not None else None,
+        'distance_pts': distance_pts, 'distance_pct': distance_pct,
+        'touched_vwap_now': bool(out['touched_vwap'].iloc[-1]),
+    }
 
 
 # ==========================================
@@ -594,6 +698,7 @@ for key, default in [
     ('expiry_list_fetched_at', None), ('selected_expiry', None),
     ('baseline_source', None), ('last_gsheet_write', None),
     ('session_log', []), ('vwap_session_start', None), ('token_status', None),
+    ('ohlc_df', None), ('last_candle_fetch', None), ('vwap_confirmed_alert_side', None),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -681,6 +786,17 @@ with st.sidebar:
         use_liquidity = st.checkbox("Bid/Ask liquidity check", value=True)
         liquidity_spread_limit = st.number_input("Flag spread wider than (%)", value=5.0, step=0.5)
 
+    st.markdown("---")
+    with st.expander("🕯️ Live Candlestick Chart", expanded=True):
+        show_candle_chart = st.checkbox("Show real-time candlestick chart", value=True)
+        candle_interval = st.selectbox(
+            "Candle interval (minutes)", options=["1", "3", "5", "15"], index=2,
+            help="Matches Dhan's intraday-candle granularity. 5-min mirrors your M5 Fibonacci Pine Script.")
+        vwap_confirm_candles = st.number_input(
+            "VWAP trend confirm after N consecutive candles", min_value=1, max_value=10, value=3,
+            help="E.g. 3 candles at 5-min = 15 min of price closing on one side of VWAP before the trend "
+                 "is flagged 'Confirmed'.")
+
 pcr_thresholds = {"overbought": overbought_th, "bullish": bullish_th, "bearish": bearish_th}
 signal_thresholds = {"strong": strong_diff_th, "mild": mild_diff_th}
 
@@ -759,12 +875,49 @@ tier_report = evaluate_signal_tiers(za['pcr'], zb['ce_vol_imbalance'], zb['choi_
                                      zb['ce_ltp_avg'], zb['pe_ltp_avg'], DEFAULT_MASTER_THRESHOLDS)
 
 # ==========================================
+# INTRADAY CANDLES (spot OHLCV) — throttled separately from the 10s OI poll.
+# This is also now the single source for VWAP (previously a second, duplicate
+# call to the same Dhan endpoint just to get one scalar — consolidated here).
+# ==========================================
+need_candle_refresh = (
+    is_open and (show_candle_chart or use_vwap) and (
+        st.session_state.ohlc_df is None or st.session_state.last_candle_fetch is None
+        or (datetime.now() - st.session_state.last_candle_fetch).total_seconds() >= CANDLE_FETCH_THROTTLE_SECONDS
+    )
+)
+if need_candle_refresh:
+    fetched_ohlc = fetch_intraday_ohlc(candle_interval)
+    if fetched_ohlc is not None and not fetched_ohlc.empty:
+        st.session_state.ohlc_df = compute_cumulative_vwap(fetched_ohlc)
+        st.session_state.last_candle_fetch = datetime.now()
+
+ohlc_df = st.session_state.ohlc_df
+
+# ==========================================
 # CONFLUENCE LAYER (new, additive — never overrides the core signal above)
 # ==========================================
-vwap_val = fetch_vwap_bias() if (is_open and use_vwap) else None
+vwap_val = None
+if use_vwap and ohlc_df is not None and not ohlc_df.empty and not ohlc_df['vwap'].isna().all():
+    vwap_val = ohlc_df['vwap'].iloc[-1]
 spot_vs_vwap = None
 if vwap_val and spot:
     spot_vs_vwap = "Above VWAP (bullish bias)" if spot > vwap_val else "Below VWAP (bearish bias)"
+
+# VWAP trend read (streak + touch-and-hold) — see analyze_vwap_trend() docstring
+vwap_trend = None
+if ohlc_df is not None and not ohlc_df.empty and not ohlc_df['vwap'].isna().all():
+    vwap_trend = analyze_vwap_trend(ohlc_df, int(candle_interval), confirm_candles=vwap_confirm_candles)
+
+if vwap_trend and vwap_trend['confirmed']:
+    if st.session_state.vwap_confirmed_alert_side != vwap_trend['side']:
+        st.toast(
+            f"📍 VWAP trend confirmed: {vwap_trend['side'].upper()} — "
+            f"{vwap_trend['streak_candles']} candles / ~{vwap_trend['streak_minutes']} min",
+            icon="📍",
+        )
+        st.session_state.vwap_confirmed_alert_side = vwap_trend['side']
+elif vwap_trend and not vwap_trend['confirmed']:
+    st.session_state.vwap_confirmed_alert_side = None
 
 mp = max_pain(df) if use_max_pain else None
 
@@ -807,6 +960,9 @@ if is_open:
         'PE_LTP': round(zb['pe_ltp_avg'], 2) if pd.notna(zb['pe_ltp_avg']) else None,
         'Spot': spot, 'ATM': atm_strike, 'VWAP': round(vwap_val, 2) if vwap_val else None,
         'MaxPain': mp,
+        'VWAP_Trend_Side': vwap_trend['side'] if vwap_trend else None,
+        'VWAP_Trend_Streak_Candles': vwap_trend['streak_candles'] if vwap_trend else None,
+        'VWAP_Trend_Confirmed': vwap_trend['confirmed'] if vwap_trend else None,
     }
     st.session_state.session_log.append(log_row)
     append_log_row(log_row, today_str)
@@ -835,6 +991,110 @@ c3.metric("Choi_CE / Choi_PE", f"{zb['choi_ce']:.1f}% / {zb['choi_pe']:.1f}%")
 c4.metric("CE Vol Imbalance", f"{zb['ce_vol_imbalance']:.1f}")
 
 st.markdown("---")
+
+# ==========================================
+# REAL-TIME CANDLESTICK CHART — Spot price action + VWAP + Max Pain trend
+# ==========================================
+if show_candle_chart:
+    st.subheader("🕯️ Real-Time NIFTY Chart (Candlestick + VWAP + Max Pain)")
+    if ohlc_df is not None and not ohlc_df.empty:
+        chart_fig = go.Figure()
+        chart_fig.add_trace(go.Candlestick(
+            x=ohlc_df['time'], open=ohlc_df['open'], high=ohlc_df['high'],
+            low=ohlc_df['low'], close=ohlc_df['close'], name='NIFTY Spot',
+            increasing_line_color='#28a745', decreasing_line_color='#dc3545',
+        ))
+
+        has_true_volume = ohlc_df['volume'].sum() > 0
+        if not ohlc_df['vwap'].isna().all():
+            vwap_label = 'VWAP' if has_true_volume else 'Session Avg (proxy — see note below)'
+            chart_fig.add_trace(go.Scatter(
+                x=ohlc_df['time'], y=ohlc_df['vwap'], mode='lines', name=vwap_label,
+                line=dict(color='#ffa500', width=1.6),
+            ))
+
+        # Max Pain trend, sourced from your own session log (recomputed each OI poll)
+        log_df_for_chart = pd.DataFrame(st.session_state.session_log)
+        if not log_df_for_chart.empty and 'MaxPain' in log_df_for_chart.columns:
+            mp_series = log_df_for_chart.dropna(subset=['MaxPain'])
+            if not mp_series.empty:
+                mp_times = pd.to_datetime(today_str + ' ' + mp_series['Time'].astype(str)).dt.tz_localize(IST)
+                chart_fig.add_trace(go.Scatter(
+                    x=mp_times, y=mp_series['MaxPain'], mode='lines', name='Max Pain',
+                    line=dict(color='#7b2ff7', width=1.6, dash='dot'),
+                ))
+
+        # VWAP touch-and-hold markers — candles that dipped/spiked into VWAP
+        # intrabar but still closed on the same side (retest-and-continue)
+        if vwap_trend and not vwap_trend['touch_hold_df'].empty:
+            chart_fig.add_trace(go.Scatter(
+                x=vwap_trend['touch_hold_df']['time'], y=vwap_trend['touch_hold_df']['vwap'],
+                mode='markers', name='VWAP touch & hold',
+                marker=dict(color='#00c2ff', size=10, symbol='circle-open', line=dict(width=2)),
+            ))
+
+        chart_fig.update_layout(
+            height=480, xaxis_rangeslider_visible=False,
+            legend=dict(orientation="h", y=1.08),
+            margin=dict(l=10, r=10, t=10, b=10),
+            yaxis_title="Price",
+        )
+        st.plotly_chart(chart_fig, use_container_width=True)
+
+        if not has_true_volume:
+            st.caption(
+                "ℹ️ Dhan's intraday-candle feed reports 0 volume for the NIFTY *index* itself (only its "
+                "constituents/futures carry traded volume), so the orange line is a cumulative simple "
+                "average of typical price, not a true volume-weighted VWAP. It's a reasonable intraday "
+                "trend proxy, but treat it as directional rather than an exact VWAP level."
+            )
+        st.caption(
+            f"Candles: {candle_interval}-min · refreshed every {CANDLE_FETCH_THROTTLE_SECONDS}s while market is open "
+            f"· last candle fetch: {st.session_state.last_candle_fetch.strftime('%H:%M:%S') if st.session_state.last_candle_fetch else 'N/A'}"
+        )
+
+        # ----------------------------------------
+        # VWAP TREND READ — the streak/touch-and-hold pattern you track manually
+        # ----------------------------------------
+        st.markdown("##### 📍 VWAP Trend Read")
+        if vwap_trend:
+            vt1, vt2, vt3, vt4 = st.columns(4)
+            side_label = "🟢 Above VWAP" if vwap_trend['side'] == 'above' else "🔴 Below VWAP"
+            dist_label = (f"{vwap_trend['distance_pts']:+.1f} pts ({vwap_trend['distance_pct']:+.2f}%)"
+                          if vwap_trend['distance_pct'] is not None else "—")
+            vt1.metric("Current Side", side_label, dist_label)
+            vt2.metric("Streak", f"{vwap_trend['streak_candles']} candles", f"~{vwap_trend['streak_minutes']} min")
+            vt3.metric("VWAP Touch & Hold", f"{vwap_trend['touch_hold_count']}x this streak")
+            vt4.metric("Trend Status", "✅ Confirmed" if vwap_trend['confirmed'] else "⏳ Building")
+
+            if vwap_trend['confirmed']:
+                direction_word = "upside" if vwap_trend['side'] == 'above' else "downside"
+                hold_note = f", with {vwap_trend['touch_hold_count']} VWAP retest(s) held" if vwap_trend['touch_hold_count'] else ""
+                st.success(
+                    f"Price has **closed** on the **{vwap_trend['side']}** side of session VWAP for "
+                    f"**{vwap_trend['streak_candles']} consecutive {candle_interval}-min candles "
+                    f"(~{vwap_trend['streak_minutes']} min)**{hold_note}. This is the VWAP-respect pattern you "
+                    f"watch for — historically this kind of hold has room to extend another **30–60 min** on the "
+                    f"{direction_word} while VWAP keeps holding. Treat a candle **close** back through VWAP as the "
+                    f"invalidation signal, not just a wick touch."
+                )
+            else:
+                st.info(
+                    f"Streak building: **{vwap_trend['streak_candles']}/{vwap_confirm_candles} candles** on the "
+                    f"**{vwap_trend['side']}** side of VWAP — not yet confirmed as a VWAP-respecting trend."
+                )
+            if vwap_trend['last_break_time'] is not None:
+                st.caption(f"Last VWAP side flip (candle close through VWAP): "
+                           f"{vwap_trend['last_break_time'].strftime('%H:%M')}")
+        else:
+            st.caption("Not enough candle history yet this session to read a VWAP streak.")
+    else:
+        st.caption(
+            "Candlestick chart unavailable — either the market is closed with no cached candle data yet this "
+            "session, or Dhan's intraday-candle endpoint didn't return data (check your access token, same "
+            "as the option chain fetch above)."
+        )
+    st.markdown("---")
 
 # ==========================================
 # SIGNAL PROGRESS PANEL
