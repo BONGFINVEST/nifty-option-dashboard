@@ -29,7 +29,7 @@ from playwright.sync_api import sync_playwright
 
 IST = ZoneInfo("Asia/Kolkata")
 NSE_OPEN = dtime(9, 15)
-NSE_CLOSE = dtime(15, 30)
+NSE_CLOSE = dtime(15, 40)
 
 APP_URL = os.environ.get("STREAMLIT_APP_URL", "").strip()
 WAIT_FOR_POLL_CYCLE_MS = 25_000  # give the app time to fetch+save before we disconnect
