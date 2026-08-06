@@ -30,6 +30,12 @@ but still closes through in the trend direction), and confirms once the streak c
 threshold you set. This is descriptive of what price has actually done, not a prediction,
 and it's entirely separate from the OI-based Master Signal above.
 
+And directly below the chart, an IV vs PRICE RELATION panel implements the sentiment
+read you described: over a rolling lookback window it measures the change in spot
+against the change in ATM implied volatility and classifies the pair as Bullish /
+Bearish / Range Bound per your rules. Like the two panels above, it is descriptive
+and independent -- it never feeds back into the Master Signal.
+
 Data source: Dhan API v2 Option Chain (see fetch_option_chain for schema notes).
 Sensibull's CSV had "CE OI change" as a pre-computed column; Dhan gives the same
 thing natively via `previous_oi` (oi - previous_oi = today's cumulative change),
@@ -94,6 +100,29 @@ DEFAULT_FOOTPRINT_THRESHOLDS = {
     "chgpcr_min_ce_chg_pct_of_oi": 0.3, # ...OR at least this % of the zone's total OI, whichever floor is higher
 }
 
+# IV vs PRICE RELATION settings -- a FOURTH, independent read placed directly below the
+# candlestick chart. Compares the change in spot against the change in ATM implied
+# volatility over a rolling window and maps the pair onto your stated interpretation:
+#
+#     Price UP   + IV UP    -> Bullish
+#     Price UP   + IV FLAT  -> Range Bound        (no significant IV move)
+#     Price DOWN + IV FLAT  -> Range Bound        (no significant IV move)
+#     Price UP   + IV DOWN  -> Bearish
+#     Price DOWN + IV DOWN  -> Bearish
+#
+# Note: your four rules do not cover the fourth quadrant (price FALLING while IV is
+# RISING). Rather than silently inventing a verdict for it, the panel reports that
+# combination as an explicitly-flagged, unmapped state. There's a sidebar toggle to
+# treat it as Bearish (the conventional panic/fear-bid reading) if you want it folded
+# in -- it's off by default so the panel only ever asserts what you actually specified.
+DEFAULT_IV_PRICE_THRESHOLDS = {
+    "lookback_minutes": 15,      # rolling window over which the two changes are measured
+    "iv_significant_pct": 1.5,   # |IV change| below this % (relative) counts as "no significant IV move"
+    "price_significant_pct": 0.10,  # |spot change| below this % counts as "flat"
+    "min_samples": 4,            # need at least this many logged polls in the window before reading it
+    "atm_iv_width": 1,           # ATM IV = mean of CE+PE IV across ATM +- N strikes (N=1 -> ATM straddle-ish)
+}
+
 # ==========================================
 # PERSISTENCE (local disk + Google Sheets)
 # ==========================================
@@ -118,12 +147,25 @@ def save_chain_snapshot(df: pd.DataFrame, fetched_at: datetime, expiry: str):
 
 def append_log_row(row: dict, date_str: str):
     """Append one poll's summary row to today's local CSV log (the automated
-    replacement for manually pasting Dash Board!A3:N3 into a new row)."""
+    replacement for manually pasting Dash Board!A3:N3 into a new row).
+
+    Schema-change safe: if today's file was started by an older build of this app
+    (i.e. before the ATM_IV / IV_Price_Regime columns existed), a blind append
+    would silently shift every value one column to the left. So the header is
+    checked first -- same columns in a different order are just reordered, and a
+    genuinely different column set triggers a one-off rewrite with the union of
+    columns (old rows get blanks in the new fields). After that single rewrite,
+    appends go back to being cheap."""
     try:
         path = LOG_DIR / f"{date_str}.csv"
         row_df = pd.DataFrame([row])
         if path.exists():
-            row_df.to_csv(path, mode='a', header=False, index=False)
+            existing_cols = list(pd.read_csv(path, nrows=0).columns)
+            if set(existing_cols) == set(row.keys()):
+                row_df[existing_cols].to_csv(path, mode='a', header=False, index=False)
+            else:
+                old = pd.read_csv(path)
+                pd.concat([old, row_df], ignore_index=True).to_csv(path, index=False)
         else:
             row_df.to_csv(path, mode='w', header=True, index=False)
     except Exception as e:
@@ -179,14 +221,28 @@ def save_chain_snapshot_to_gsheet(df: pd.DataFrame, fetched_at: datetime, expiry
 
 
 def append_log_row_to_gsheet(row: dict):
+    """Same schema-safety concern as append_log_row(): an existing sheet started by
+    an older build won't have the new columns, so values are written positionally
+    against the sheet's actual header, and any genuinely new keys are appended to
+    the header row first (old rows simply stay blank in those columns)."""
     if not gsheets_configured():
         return
     try:
         ws = get_gsheet_worksheet(GSHEET_LOG_SHEET)
         existing = ws.get_all_values()
         if not existing:
-            ws.append_row(list(row.keys()))
-        ws.append_row([str(v) for v in row.values()])
+            header = list(row.keys())
+            ws.append_row(header)
+        else:
+            header = existing[0]
+            missing = [k for k in row.keys() if k not in header]
+            if missing:
+                header = header + missing
+                try:
+                    ws.update(values=[header], range_name='A1')
+                except TypeError:   # older gspread signature: update(range_name, values)
+                    ws.update('A1', [header])
+        ws.append_row([str(row.get(c, "")) for c in header])
     except Exception as e:
         st.sidebar.caption(f"⚠️ Google Sheet log append failed: {e}")
 
@@ -490,6 +546,158 @@ def analyze_vwap_trend(ohlc_df: pd.DataFrame, interval_minutes: int, confirm_can
         'distance_pts': distance_pts, 'distance_pct': distance_pct,
         'touched_vwap_now': bool(out['touched_vwap'].iloc[-1]),
     }
+
+
+# ==========================================
+# IV vs PRICE RELATION (new — fourth independent read, sits below the chart)
+# ==========================================
+def compute_atm_iv(df: pd.DataFrame, atm: float, width: int = 1):
+    """Single 'the market's IV right now' scalar: the mean of CE and PE implied
+    vol across ATM +- width strikes. Zero/blank IVs are dropped rather than
+    averaged in, because Dhan returns 0 for strikes it has no IV for and
+    including those would drag the average down and manufacture a fake
+    'IV falling' reading. Width 1 keeps it close to the ATM straddle, which is
+    the cleanest proxy for at-the-money vol and the least contaminated by wing
+    skew moving around."""
+    zone = df[(df['Strike'] >= atm - width * STRIKE_STEP) & (df['Strike'] <= atm + width * STRIKE_STEP)]
+    if zone.empty:
+        return np.nan
+    ivs = pd.to_numeric(pd.concat([zone['CE_IV'], zone['PE_IV']], ignore_index=True), errors='coerce')
+    ivs = ivs[ivs > 0]
+    return float(ivs.mean()) if len(ivs) else np.nan
+
+
+def _edge_means(values: np.ndarray, edge_n: int):
+    """Start/end levels of a window, averaged over a few samples at each end so
+    one jumpy 10-second poll can't flip the whole read."""
+    return float(np.mean(values[:edge_n])), float(np.mean(values[-edge_n:]))
+
+
+def analyze_iv_price_relation(log_records, date_str: str, t: dict,
+                              treat_fall_iv_up_as_bearish: bool = False):
+    """Implements your IV/price sentiment interpretation over a rolling window.
+
+    Both series come from THIS APP'S session log (spot + ATM IV recorded on the
+    same poll), deliberately -- not from the candle feed for price and the chain
+    for IV. Mixing two clocks would compare a price change measured over one
+    interval against an IV change measured over a slightly different one, which
+    is exactly the kind of small misalignment that flips a borderline
+    Bullish/Range-Bound call for no real reason.
+
+    'Significant' is relative, not absolute: IV is judged as a % change of the
+    IV level itself (so 0.3 vol points means something different at 9 IV than at
+    22 IV), and price as a % of spot. Both floors are tunable in the sidebar.
+
+    The mapping is exactly your stated ruleset. The one quadrant your rules
+    don't specify -- price FALLING while IV is RISING -- is returned as an
+    explicitly unmapped state (`covered=False`) unless you opt into reading it
+    as Bearish. Returns None when there isn't enough logged history yet."""
+    if not log_records:
+        return None
+    hist = pd.DataFrame(log_records)
+    if not {'Time', 'Spot', 'ATM_IV'}.issubset(hist.columns):
+        return None
+
+    hist = hist[['Time', 'Spot', 'ATM_IV']].copy()
+    hist['Spot'] = pd.to_numeric(hist['Spot'], errors='coerce')
+    hist['ATM_IV'] = pd.to_numeric(hist['ATM_IV'], errors='coerce')
+    hist = hist.dropna(subset=['Spot', 'ATM_IV'])
+    hist = hist[(hist['ATM_IV'] > 0) & (hist['Spot'] > 0)]
+    if hist.empty:
+        return None
+
+    hist['ts'] = pd.to_datetime(date_str + ' ' + hist['Time'].astype(str), errors='coerce')
+    hist = hist.dropna(subset=['ts']).sort_values('ts').reset_index(drop=True)
+    if hist.empty:
+        return None
+
+    end_ts = hist['ts'].iloc[-1]
+    window = hist[hist['ts'] >= end_ts - timedelta(minutes=t['lookback_minutes'])]
+    samples = len(window)
+    span_minutes = ((window['ts'].iloc[-1] - window['ts'].iloc[0]).total_seconds() / 60) if samples > 1 else 0.0
+
+    if samples < t['min_samples']:
+        return {'ready': False, 'samples': samples, 'needed': int(t['min_samples']),
+                'span_minutes': span_minutes, 'series': hist,
+                'window_start': window['ts'].iloc[0] if samples else None, 'window_end': end_ts}
+
+    edge = max(1, min(3, samples // 4))
+    p_start, p_end = _edge_means(window['Spot'].values, edge)
+    iv_start, iv_end = _edge_means(window['ATM_IV'].values, edge)
+
+    price_chg_pts = p_end - p_start
+    price_chg_pct = (price_chg_pts / p_start * 100) if p_start else np.nan
+    iv_chg_pts = iv_end - iv_start
+    iv_chg_pct = (iv_chg_pts / iv_start * 100) if iv_start else np.nan
+
+    p_th, iv_th = t['price_significant_pct'], t['iv_significant_pct']
+    price_dir = 'rising' if price_chg_pct > p_th else ('falling' if price_chg_pct < -p_th else 'flat')
+    iv_dir = 'rising' if iv_chg_pct > iv_th else ('falling' if iv_chg_pct < -iv_th else 'flat')
+
+    covered = True
+    if price_dir == 'rising' and iv_dir == 'rising':
+        regime, color_key = "🟢 BULLISH", "bullish"
+        rationale = ("Price and IV are both rising — fresh money is paying up for optionality as the market "
+                     "climbs, which is the bullish combination in your ruleset.")
+    elif price_dir == 'rising' and iv_dir == 'falling':
+        regime, color_key = "🔴 BEARISH", "bearish"
+        rationale = ("Price is rising while IV falls — the move up is not being backed by demand for options. "
+                     "Per your ruleset this reads as a bearish/complacent rally rather than a real trend.")
+    elif price_dir == 'falling' and iv_dir == 'falling':
+        regime, color_key = "🔴 BEARISH", "bearish"
+        rationale = ("Price and IV are both falling — a grind lower with no panic bid in vol. Bearish per "
+                     "your ruleset.")
+    elif price_dir in ('rising', 'falling') and iv_dir == 'flat':
+        regime, color_key = "⚪ RANGE BOUND", "neutral"
+        rationale = (f"Price is {price_dir} but IV hasn't moved significantly (|ΔIV| under {iv_th:.2f}%). "
+                     "Directionless vol means the move isn't being funded — range-bound per your ruleset.")
+    elif price_dir == 'falling' and iv_dir == 'rising':
+        covered = False
+        if treat_fall_iv_up_as_bearish:
+            regime, color_key = "🔴 BEARISH (conventional read)", "bearish"
+            rationale = ("Price falling with IV rising — the classic fear/protection bid. This quadrant isn't "
+                         "in your four rules; it's being reported as bearish because you enabled that toggle "
+                         "in the sidebar.")
+        else:
+            regime, color_key = "🟡 FALLING PRICE + RISING IV", "unmapped"
+            rationale = ("Price is falling while IV rises. Your four rules don't cover this combination, so no "
+                         "verdict is being asserted. Conventionally it's read as bearish (a fear/protection "
+                         "bid) — enable the sidebar toggle if you want it counted that way.")
+    else:   # price flat
+        regime, color_key = "⚪ RANGE BOUND", "neutral"
+        rationale = (f"Spot hasn't moved significantly over the window (|Δprice| under {p_th:.2f}%), so there's "
+                     "no directional read to pair the IV move with.")
+
+    return {
+        'ready': True, 'covered': covered,
+        'regime': regime, 'color_key': color_key, 'rationale': rationale,
+        'price_dir': price_dir, 'iv_dir': iv_dir,
+        'price_chg_pct': price_chg_pct, 'price_chg_pts': price_chg_pts,
+        'iv_chg_pct': iv_chg_pct, 'iv_chg_pts': iv_chg_pts,
+        'price_start': p_start, 'price_end': p_end,
+        'iv_start': iv_start, 'iv_end': iv_end,
+        'samples': samples, 'span_minutes': span_minutes, 'edge_n': edge,
+        'series': hist, 'window_start': window['ts'].iloc[0], 'window_end': end_ts,
+    }
+
+
+def build_iv_price_chart(series_df: pd.DataFrame, window_start=None, window_end=None):
+    """Dual-axis session view of spot (left) against ATM IV (right) — the visual
+    behind the verdict, so you can see whether the two lines are converging or
+    diverging rather than trusting a single label."""
+    f = make_subplots(specs=[[{"secondary_y": True}]])
+    f.add_trace(go.Scatter(x=series_df['ts'], y=series_df['Spot'], name='Spot',
+                           line=dict(color='#0d6efd', width=1.7)), secondary_y=False)
+    f.add_trace(go.Scatter(x=series_df['ts'], y=series_df['ATM_IV'], name='ATM IV',
+                           line=dict(color='#ffa500', width=1.7)), secondary_y=True)
+    if window_start is not None and window_end is not None and window_start != window_end:
+        f.add_vrect(x0=window_start, x1=window_end, fillcolor="#6c757d", opacity=0.12,
+                    line_width=0, annotation_text="read window", annotation_position="top left")
+    f.update_yaxes(title_text="Spot", secondary_y=False)
+    f.update_yaxes(title_text="ATM IV (%)", secondary_y=True)
+    f.update_layout(height=320, margin=dict(l=10, r=10, t=10, b=10),
+                    legend=dict(orientation="h", y=1.16))
+    return f
 
 
 # ==========================================
@@ -871,6 +1079,7 @@ for key, default in [
     ('baseline_source', None), ('last_gsheet_write', None),
     ('session_log', []), ('vwap_session_start', None), ('token_status', None),
     ('ohlc_df', None), ('last_candle_fetch', None), ('vwap_confirmed_alert_side', None),
+    ('iv_price_alert_regime', None),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -970,6 +1179,32 @@ with st.sidebar:
                  "is flagged 'Confirmed'.")
 
     st.markdown("---")
+    with st.expander("📊 IV vs Price Relation", expanded=True):
+        show_iv_price_panel = st.checkbox("Show IV vs Price sentiment read", value=True)
+        iv_price_lookback = st.number_input(
+            "Lookback window (minutes)", min_value=1, max_value=180,
+            value=DEFAULT_IV_PRICE_THRESHOLDS['lookback_minutes'],
+            help="Both the price change and the IV change are measured across this rolling window, "
+                 "using your own logged polls.")
+        iv_sig_pct = st.number_input(
+            "IV move is 'significant' at ± (%)", value=DEFAULT_IV_PRICE_THRESHOLDS['iv_significant_pct'], step=0.25,
+            help="Relative change in ATM IV. Below this the IV counts as flat → Range Bound.")
+        price_sig_pct = st.number_input(
+            "Price move is 'significant' at ± (%)", value=DEFAULT_IV_PRICE_THRESHOLDS['price_significant_pct'],
+            step=0.05, format="%.2f")
+        iv_price_atm_width = st.number_input(
+            "ATM IV band (ATM ± N strikes)", min_value=0, max_value=5,
+            value=DEFAULT_IV_PRICE_THRESHOLDS['atm_iv_width'])
+        iv_price_min_samples = st.number_input(
+            "Minimum logged polls in window", min_value=2, max_value=60,
+            value=DEFAULT_IV_PRICE_THRESHOLDS['min_samples'])
+        treat_fall_iv_up_as_bearish = st.checkbox(
+            "Also read falling price + rising IV as Bearish",
+            value=False,
+            help="This combination isn't in your four rules. Off by default the panel flags it as unmapped; "
+                 "on, it's reported as Bearish (the conventional fear/protection-bid reading).")
+
+    st.markdown("---")
     with st.expander("🕵️ Institutional Footprint", expanded=True):
         show_footprint_panel = st.checkbox("Show live Institutional Footprint signal", value=True)
         footprint_width = st.number_input(
@@ -1001,6 +1236,12 @@ footprint_thresholds = {
     "vol_oi_fresh": fp_vol_oi_fresh, "vol_oi_fakeout": fp_vol_oi_fakeout,
     "trend_flat_band_pct": DEFAULT_FOOTPRINT_THRESHOLDS['trend_flat_band_pct'],
     "chgpcr_min_ce_chg_abs": fp_chgpcr_min_abs, "chgpcr_min_ce_chg_pct_of_oi": fp_chgpcr_min_pct,
+}
+
+iv_price_thresholds = {
+    "lookback_minutes": iv_price_lookback, "iv_significant_pct": iv_sig_pct,
+    "price_significant_pct": price_sig_pct, "min_samples": iv_price_min_samples,
+    "atm_iv_width": iv_price_atm_width,
 }
 
 pcr_thresholds = {"overbought": overbought_th, "bullish": bullish_th, "bearish": bearish_th}
@@ -1151,6 +1392,28 @@ footprint_headline, footprint_color_key, footprint_lines = institutional_footpri
     footprint_market_dir, footprint_thresholds, chg_pcr_reliable=footprint_agg.get('chg_pcr_reliable', True)
 ) if show_footprint_panel and not footprint_table.empty else (None, None, [])
 
+# ==========================================
+# IV vs PRICE RELATION — fourth independent read (spot change vs ATM IV change)
+# ==========================================
+# Computed BEFORE the log append below, so this poll's own (Spot, ATM_IV) pair is
+# part of the window and the resulting regime can be written into the same log row
+# rather than lagging one poll behind.
+atm_iv = compute_atm_iv(df, atm_strike, int(iv_price_atm_width))
+current_iv_sample = [{
+    'Time': (st.session_state.last_fetch or now_ist).strftime('%H:%M:%S'),
+    'Spot': spot, 'ATM_IV': atm_iv,
+}] if is_open else []
+iv_price_read = analyze_iv_price_relation(
+    list(st.session_state.session_log) + current_iv_sample, today_str,
+    iv_price_thresholds, treat_fall_iv_up_as_bearish=treat_fall_iv_up_as_bearish,
+)
+
+# One-shot toast when the IV/price regime flips (not on every 10s poll)
+if iv_price_read and iv_price_read.get('ready'):
+    if st.session_state.iv_price_alert_regime != iv_price_read['regime']:
+        st.toast(f"📊 IV vs Price: {iv_price_read['regime']}", icon="📊")
+        st.session_state.iv_price_alert_regime = iv_price_read['regime']
+
 # Confluence agreement counter (informational only)
 bullish_signals = sig in ("Strong CE Buy", "PE writers strong") or zb['signal'] in ("Buy CE", "Write PE")
 bearish_signals = sig in ("Strong PE Buy", "CE writers strong") or zb['signal'] in ("Buy PE", "Write CE")
@@ -1186,6 +1449,9 @@ if is_open:
         'Footprint_ChgPCR': round(footprint_agg['chg_pcr'], 2) if pd.notna(footprint_agg.get('chg_pcr')) else None,
         'Footprint_Vol_OI': round(footprint_agg['vol_oi'], 2) if pd.notna(footprint_agg.get('vol_oi')) else None,
         'Footprint_Signal': footprint_headline,
+        # --- IV vs Price relation (appended at the end so older logs stay column-aligned) ---
+        'ATM_IV': round(atm_iv, 2) if pd.notna(atm_iv) else None,
+        'IV_Price_Regime': iv_price_read['regime'] if (iv_price_read and iv_price_read.get('ready')) else None,
     }
     st.session_state.session_log.append(log_row)
     append_log_row(log_row, today_str)
@@ -1317,6 +1583,92 @@ if show_candle_chart:
             "session, or Dhan's intraday-candle endpoint didn't return data (check your access token, same "
             "as the option chain fetch above)."
         )
+    st.markdown("---")
+
+# ==========================================
+# IV vs PRICE RELATION PANEL — sits directly below the NIFTY chart
+# (independent of the Master Signal, the VWAP Trend Read and the Footprint)
+# ==========================================
+if show_iv_price_panel:
+    st.subheader("📊 IV vs Price Relation (sentiment read)")
+
+    iv_price_colors = {"bullish": "#1e7e34", "bearish": "#c82333",
+                       "neutral": "#6c757d", "unmapped": "#8a6d0b"}
+
+    if iv_price_read is None:
+        st.caption(
+            "No usable Spot + ATM IV history logged yet today. This panel builds its two series from your own "
+            "polls, so it needs the app running during market hours for a couple of minutes before it can read "
+            "anything. (Logs written by an older build of this app won't have the ATM_IV column — those days "
+            "will stay blank here.)"
+        )
+    elif not iv_price_read.get('ready'):
+        st.info(
+            f"Building the read — **{iv_price_read['samples']}/{iv_price_read['needed']} polls** collected in the "
+            f"last {iv_price_lookback} minutes (~{iv_price_read['span_minutes']:.1f} min of history so far)."
+        )
+        if len(iv_price_read['series']) >= 2:
+            st.plotly_chart(build_iv_price_chart(iv_price_read['series']), use_container_width=True)
+    else:
+        arrow = {'rising': '↑', 'falling': '↓', 'flat': '→'}
+        st.markdown(f"""
+<div style='background-color:{iv_price_colors.get(iv_price_read['color_key'], "#6c757d")};padding:18px;
+border-radius:10px;margin:6px 0;'>
+    <h3 style='color:white;margin:0;'>{iv_price_read['regime']}</h3>
+    <p style='color:white;margin:6px 0 0 0;'>
+    Price <b>{iv_price_read['price_dir']} {arrow[iv_price_read['price_dir']]}</b>
+    ({iv_price_read['price_chg_pct']:+.2f}%, {iv_price_read['price_chg_pts']:+.0f} pts)
+    &nbsp;|&nbsp;
+    IV <b>{iv_price_read['iv_dir']} {arrow[iv_price_read['iv_dir']]}</b>
+    ({iv_price_read['iv_chg_pct']:+.2f}%, {iv_price_read['iv_chg_pts']:+.2f} vol pts)
+    &nbsp;|&nbsp; window ~{iv_price_read['span_minutes']:.0f} min</p>
+</div>""", unsafe_allow_html=True)
+
+        st.caption(f"• {iv_price_read['rationale']}")
+        if not iv_price_read['covered'] and not treat_fall_iv_up_as_bearish:
+            st.warning(
+                "This combination (price down, IV up) isn't one of the four rules you gave, so the panel is "
+                "reporting the state rather than asserting a verdict. Enable the sidebar toggle if you want it "
+                "treated as Bearish."
+            )
+
+        ip1, ip2, ip3, ip4 = st.columns(4)
+        ip1.metric("Spot", f"{iv_price_read['price_end']:.0f}",
+                   f"{iv_price_read['price_chg_pct']:+.2f}% over window")
+        ip2.metric("ATM IV", f"{iv_price_read['iv_end']:.2f}",
+                   f"{iv_price_read['iv_chg_pct']:+.2f}% over window")
+        ip3.metric("Significance floors", f"±{price_sig_pct:.2f}% / ±{iv_sig_pct:.2f}%",
+                   "price / IV")
+        ip4.metric("Samples in window", f"{iv_price_read['samples']}",
+                   f"~{iv_price_read['span_minutes']:.0f} min")
+
+        st.plotly_chart(
+            build_iv_price_chart(iv_price_read['series'],
+                                 iv_price_read['window_start'], iv_price_read['window_end']),
+            use_container_width=True,
+        )
+
+        with st.expander("How this read is built"):
+            st.markdown(
+                "**Your ruleset, as implemented:**\n\n"
+                "| Price | IV | Read |\n|---|---|---|\n"
+                "| ↑ Rising | ↑ Rising | 🟢 Bullish |\n"
+                "| ↑ Rising | → Flat | ⚪ Range Bound |\n"
+                "| ↓ Falling | → Flat | ⚪ Range Bound |\n"
+                "| ↑ Rising | ↓ Falling | 🔴 Bearish |\n"
+                "| ↓ Falling | ↓ Falling | 🔴 Bearish |\n"
+                "| ↓ Falling | ↑ Rising | 🟡 Not in your rules (optional Bearish via sidebar) |\n"
+            )
+            st.caption(
+                f"ATM IV = mean of CE and PE implied vol across ATM ± {int(iv_price_atm_width)} strike(s), "
+                f"zero/blank IVs excluded. Both changes are measured from the start to the end of the "
+                f"{iv_price_lookback}-minute window, each end averaged over {iv_price_read['edge_n']} sample(s) "
+                f"so a single jumpy poll can't flip the verdict. 'Significant' is relative: IV as a % of the IV "
+                f"level, price as a % of spot. Spot and IV are both taken from the same poll, so the two changes "
+                f"are measured over exactly the same interval. This panel is descriptive and independent — it "
+                f"never feeds into the Master Signal above."
+            )
+
     st.markdown("---")
 
 # ==========================================
