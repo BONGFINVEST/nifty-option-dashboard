@@ -654,10 +654,10 @@ def analyze_iv_price_relation(log_records, date_str: str, t: dict,
     elif price_dir == 'falling' and iv_dir == 'rising':
         covered = False
         if treat_fall_iv_up_as_bearish:
-            regime, color_key = "🔴 BEARISH (conventional read)", "bearish"
-            rationale = ("Price falling with IV rising — the classic fear/protection bid. This quadrant isn't "
-                         "in your four rules; it's being reported as bearish because you enabled that toggle "
-                         "in the sidebar.")
+            regime, color_key = "🔴 BEARISH (fear bid)", "bearish"
+            rationale = ("Price falling while IV rises — the classic fear/protection bid: puts are being paid "
+                         "up for on the way down. Note this is also the quadrant that marks capitulation lows, "
+                         "so a sharp IV spike here can be the end of the move rather than the middle of it.")
         else:
             regime, color_key = "🟡 FALLING PRICE + RISING IV", "unmapped"
             rationale = ("Price is falling while IV rises. Your four rules don't cover this combination, so no "
@@ -1199,10 +1199,10 @@ with st.sidebar:
             "Minimum logged polls in window", min_value=2, max_value=60,
             value=DEFAULT_IV_PRICE_THRESHOLDS['min_samples'])
         treat_fall_iv_up_as_bearish = st.checkbox(
-            "Also read falling price + rising IV as Bearish",
-            value=False,
-            help="This combination isn't in your four rules. Off by default the panel flags it as unmapped; "
-                 "on, it's reported as Bearish (the conventional fear/protection-bid reading).")
+            "Read falling price + rising IV as Bearish",
+            value=True,
+            help="The fear/protection-bid quadrant. On (default) it's reported as Bearish; turn it off to have "
+                 "the panel flag it as an unmapped state instead of asserting a verdict.")
 
     st.markdown("---")
     with st.expander("🕵️ Institutional Footprint", expanded=True):
@@ -1657,7 +1657,7 @@ border-radius:10px;margin:6px 0;'>
                 "| ↓ Falling | → Flat | ⚪ Range Bound |\n"
                 "| ↑ Rising | ↓ Falling | 🔴 Bearish |\n"
                 "| ↓ Falling | ↓ Falling | 🔴 Bearish |\n"
-                "| ↓ Falling | ↑ Rising | 🟡 Not in your rules (optional Bearish via sidebar) |\n"
+                "| ↓ Falling | ↑ Rising | 🔴 Bearish — fear bid (toggle off in sidebar to leave unmapped) |\n"
             )
             st.caption(
                 f"ATM IV = mean of CE and PE implied vol across ATM ± {int(iv_price_atm_width)} strike(s), "
