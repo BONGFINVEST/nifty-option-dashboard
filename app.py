@@ -84,6 +84,13 @@ DEFAULT_MASTER_THRESHOLDS = {                                                   
 CANDLE_FETCH_THROTTLE_SECONDS = 30   # don't hammer Dhan's intraday-candle endpoint every 10s OI poll
 DEFAULT_CANDLE_INTERVAL = "5"        # minutes -- matches your M5 Fibonacci Pine Script granularity
 
+# OI PROFILE overlay -- horizontal per-strike OI bars pinned to the right edge of the
+# candle chart, on the SAME price axis as the candles, so an OI wall lines up visually
+# with the price level it sits at. Read like a volume profile, but of open interest.
+OI_PROFILE_WIDTH = 8          # ATM +- N strikes included in the profile
+OI_PROFILE_FRAC = 0.25        # widest bar occupies this fraction of the chart width
+OI_PROFILE_PAD_STRIKES = 3    # headroom (in strikes) above/below the day's range when fitting Y to price
+
 # Institutional Footprint settings -- a THIRD, fully independent read (IV Skew,
 # ChgPCR momentum, Vol/OI conviction) layered alongside the Master Signal and the
 # VWAP Trend Read above. Never feeds into either of those; purely additive.
@@ -545,6 +552,40 @@ def analyze_vwap_trend(ohlc_df: pd.DataFrame, interval_minutes: int, confirm_can
         'last_break_time': pd.to_datetime(last_break_time) if last_break_time is not None else None,
         'distance_pts': distance_pts, 'distance_pct': distance_pct,
         'touched_vwap_now': bool(out['touched_vwap'].iloc[-1]),
+    }
+
+
+def build_oi_profile(df: pd.DataFrame, atm: float, width: int):
+    """Per-strike OI slice for the chart's right-edge profile, plus the two levels
+    that actually matter for a breakout read: the strike carrying the most CE OI
+    (the resistance wall / where call writers are defending) and the most PE OI
+    (the support floor).
+
+    Today's OI *change* at each of those strikes is carried along too, because the
+    standing OI alone can't tell you whether a wall is being defended or abandoned
+    -- and that distinction is the whole difference between a real breakout and a
+    false one."""
+    band = df[(df['Strike'] >= atm - width * STRIKE_STEP) &
+              (df['Strike'] <= atm + width * STRIKE_STEP)].copy()
+    if band.empty:
+        return None
+    band['Total_OI'] = band['CE_OI'] + band['PE_OI']
+
+    def _peak(col, chg_col):
+        if band[col].max() <= 0:
+            return None, None, None
+        row = band.loc[band[col].idxmax()]
+        return float(row['Strike']), float(row[col]), float(row[chg_col])
+
+    ce_strike, ce_oi, ce_chg = _peak('CE_OI', 'CE_OI_chg')
+    pe_strike, pe_oi, pe_chg = _peak('PE_OI', 'PE_OI_chg')
+
+    return {
+        'band': band,
+        'max_ce_strike': ce_strike, 'max_ce_oi': ce_oi, 'max_ce_chg': ce_chg,
+        'max_pe_strike': pe_strike, 'max_pe_oi': pe_oi, 'max_pe_chg': pe_chg,
+        'max_side_oi': float(max(band['CE_OI'].max(), band['PE_OI'].max())),
+        'max_total_oi': float(band['Total_OI'].max()),
     }
 
 
@@ -1178,6 +1219,28 @@ with st.sidebar:
             help="E.g. 3 candles at 5-min = 15 min of price closing on one side of VWAP before the trend "
                  "is flagged 'Confirmed'.")
 
+        st.markdown("**OI profile overlay**")
+        show_oi_profile = st.checkbox("Show OI bars on the right edge", value=True)
+        oi_profile_mode = st.radio(
+            "Bars", ["CE vs PE (split)", "Combined total OI"], index=0,
+            help="Split shows the call wall and put floor separately (better for a breakout read). "
+                 "Combined shows where total OI is concentrated (better for spotting pin levels).")
+        oi_profile_width = st.number_input(
+            "OI profile band (ATM ± N strikes)", min_value=1, max_value=30, value=OI_PROFILE_WIDTH)
+        oi_profile_frac = st.slider(
+            "Profile width (% of chart)", min_value=10, max_value=45, value=int(OI_PROFILE_FRAC * 100),
+            help="The time axis is padded by the same amount on the right, so the bars sit over empty "
+                 "space instead of covering the most recent candles.") / 100
+        fit_to_price = st.checkbox(
+            "Fit Y-axis to price action", value=True,
+            help="Off, the axis stretches to cover every strike in the band and squashes the candles flat.")
+        oi_pad_strikes = st.number_input(
+            "...with N strikes of headroom", min_value=0, max_value=20, value=OI_PROFILE_PAD_STRIKES)
+        show_oi_levels = st.checkbox("Draw support / resistance / max-pain level lines", value=True)
+        oi_bar_thickness = st.slider(
+            "OI bar block thickness (% of strike gap)", min_value=20, max_value=95, value=50,
+            help="Height of the CE+PE block at each strike, as a share of the 50-point strike spacing.") / 100
+
     st.markdown("---")
     with st.expander("📊 IV vs Price Relation", expanded=True):
         show_iv_price_panel = st.checkbox("Show IV vs Price sentiment read", value=True)
@@ -1487,7 +1550,38 @@ st.markdown("---")
 if show_candle_chart:
     st.subheader("🕯️ Real-Time NIFTY Chart (Candlestick + VWAP + Max Pain)")
     if ohlc_df is not None and not ohlc_df.empty:
+        oi_profile = build_oi_profile(df, atm_strike, int(oi_profile_width)) if show_oi_profile else None
+
         chart_fig = go.Figure()
+
+        # --- OI profile bars, plotted on a reversed overlay x-axis (x2) so they grow
+        # leftward from the right edge, on the same price (y) axis as the candles.
+        # Added FIRST so the candlesticks render on top of them.
+        profile_max_x = 0.0
+        if oi_profile:
+            b = oi_profile['band']
+            block = STRIKE_STEP * oi_bar_thickness      # total block height per strike
+            if oi_profile_mode.startswith("Combined"):
+                chart_fig.add_trace(go.Bar(
+                    y=b['Strike'], x=b['Total_OI'], orientation='h', name='Total OI (CE+PE)',
+                    marker_color='#8e7cc3', opacity=0.9, width=block, xaxis='x2',
+                    hovertemplate='Strike %{y:.0f}<br>Total OI %{x:,.0f}<extra></extra>'))
+                profile_max_x = oi_profile['max_total_oi']
+            else:
+                # One block per strike: CE (red) sitting directly on top of PE (green),
+                # edges touching at the strike itself. Explicit y-offsets rather than
+                # barmode='group', which behaves unpredictably alongside candlesticks.
+                bar_h = block / 2
+                chart_fig.add_trace(go.Bar(
+                    y=b['Strike'] + bar_h / 2, x=b['CE_OI'], orientation='h', name='CE OI (resistance)',
+                    marker_color='#f2827f', opacity=0.9, width=bar_h, xaxis='x2',
+                    hovertemplate='Strike %{y:.0f}<br>CE OI %{x:,.0f}<extra></extra>'))
+                chart_fig.add_trace(go.Bar(
+                    y=b['Strike'] - bar_h / 2, x=b['PE_OI'], orientation='h', name='PE OI (support)',
+                    marker_color='#5cbfa6', opacity=0.9, width=bar_h, xaxis='x2',
+                    hovertemplate='Strike %{y:.0f}<br>PE OI %{x:,.0f}<extra></extra>'))
+                profile_max_x = oi_profile['max_side_oi']
+
         chart_fig.add_trace(go.Candlestick(
             x=ohlc_df['time'], open=ohlc_df['open'], high=ohlc_df['high'],
             low=ohlc_df['low'], close=ohlc_df['close'], name='NIFTY Spot',
@@ -1527,8 +1621,88 @@ if show_candle_chart:
             legend=dict(orientation="h", y=1.08),
             margin=dict(l=10, r=10, t=10, b=10),
             yaxis_title="Price",
+            barmode='overlay',
         )
+
+        # --- OI profile axis + framing ---------------------------------------
+        if oi_profile and profile_max_x > 0:
+            # Reversed range: x=0 lands on the right edge, so bars based at 0 grow
+            # leftward and the widest one spans exactly `oi_profile_frac` of the chart.
+            chart_fig.update_layout(xaxis2=dict(
+                overlaying='x', side='top', range=[profile_max_x / oi_profile_frac, 0],
+                showgrid=False, showticklabels=False, zeroline=False, fixedrange=True))
+
+            # Pad the time axis on the right by the same fraction, so the bars sit over
+            # empty space rather than hiding the most recent candles. Set via update_layout
+            # and NOT update_xaxes -- the latter applies to every x-axis and would overwrite
+            # the OI overlay axis above with this datetime range.
+            t0, t1 = ohlc_df['time'].iloc[0], ohlc_df['time'].iloc[-1]
+            step = pd.Timedelta(minutes=int(candle_interval))
+            pad = max((t1 - t0) * (oi_profile_frac / (1 - oi_profile_frac)), step * 3)
+            chart_fig.update_layout(xaxis=dict(range=[t0 - step, t1 + pad]))
+
+            if show_oi_levels:
+                def _level_line(y, color, text, position, yshift=0):
+                    """Dotted level line with a filled tag on the left, matching the
+                    OI-profile overlay style."""
+                    chart_fig.add_hline(
+                        y=y, line_dash='dot', line_color=color, line_width=1.4,
+                        annotation_text=f" {text} ", annotation_position=position,
+                        annotation_bgcolor=color, annotation_font_color='white',
+                        annotation_font_size=11, annotation_yshift=yshift)
+
+                if oi_profile['max_ce_strike']:
+                    _level_line(oi_profile['max_ce_strike'], '#e05252',
+                                f"Resistance strike {oi_profile['max_ce_strike']:.0f}", 'top left')
+                if oi_profile['max_pe_strike']:
+                    _level_line(oi_profile['max_pe_strike'], '#3aa17e',
+                                f"Support strike {oi_profile['max_pe_strike']:.0f}", 'bottom left')
+                if mp is not None:
+                    # Nudged down so the tag stays readable on the days when Max Pain
+                    # lands on the same strike as the call wall or put floor.
+                    _level_line(mp, '#e8a33d', f"Max Pain {mp:.0f}", 'bottom left', yshift=-20)
+
+        if fit_to_price:
+            # Without this the Y axis stretches to cover every strike in the profile band
+            # and flattens the candles into a ribbon. Bars outside the range just clip.
+            pad_y = int(oi_pad_strikes) * STRIKE_STEP
+            chart_fig.update_yaxes(range=[ohlc_df['low'].min() - pad_y, ohlc_df['high'].max() + pad_y])
+
         st.plotly_chart(chart_fig, use_container_width=True)
+
+        # --- OI wall readout: level, size, and whether it's being defended -----
+        if oi_profile:
+            def _wall_note(strike, oi, chg, side):
+                if strike is None:
+                    return None
+                verb = "building" if chg > 0 else ("unwinding" if chg < 0 else "flat")
+                return (f"**{side} {strike:.0f}** — OI {oi:,.0f} ({chg:+,.0f} today, {verb})")
+
+            notes = [n for n in (
+                _wall_note(oi_profile['max_ce_strike'], oi_profile['max_ce_oi'], oi_profile['max_ce_chg'],
+                           "🔴 Call wall"),
+                _wall_note(oi_profile['max_pe_strike'], oi_profile['max_pe_oi'], oi_profile['max_pe_chg'],
+                           "🟢 Put floor"),
+            ) if n]
+            if notes:
+                st.markdown(" &nbsp;·&nbsp; ".join(notes))
+            if fit_to_price:
+                lo = ohlc_df['low'].min() - int(oi_pad_strikes) * STRIKE_STEP
+                hi = ohlc_df['high'].max() + int(oi_pad_strikes) * STRIKE_STEP
+                hidden = oi_profile['band'][(oi_profile['band']['Strike'] < lo) |
+                                            (oi_profile['band']['Strike'] > hi)]
+                if not hidden.empty:
+                    st.caption(
+                        f"ℹ️ {len(hidden)} strike(s) in the profile band sit outside the visible price range "
+                        f"and are clipped — raise the headroom setting to bring them into view."
+                    )
+            st.caption(
+                "Reading the walls: a candle **closing** through the call wall while CE OI at that strike is "
+                "**unwinding** is writers covering — the breakout has something behind it. Price poking through "
+                "while CE OI keeps **building** is writers defending, which is the classic false breakout. "
+                "Mirror it at the put floor for downside breaks. The bars are today's standing OI, so check the "
+                "±change above, not the bar height, for who's winning right now."
+            )
 
         if not has_true_volume:
             st.caption(
