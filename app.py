@@ -106,8 +106,16 @@ DEFAULT_FOOTPRINT_THRESHOLDS = {
     "iv_skew_bullish": 2.0,      # CE_IV - PE_IV >= this -> Put writers running -> look for short-covering rally
     "chgpcr_bear_trap": 1.5,     # ChgPCR spikes above this while price is FALLING -> Bear Trap (dip being bought)
     "chgpcr_bull_trap": 0.5,     # ChgPCR collapses below this while price is RISING -> Bull Trap (rally being sold into)
-    "vol_oi_fresh": 0.6,         # Vol/OI >= this -> fresh institutional money, regime is "real"
-    "vol_oi_fakeout": 0.2,       # Vol/OI < this -> just intraday squaring off, ignore the breakout
+    # CALIBRATION NOTE (from the 14-Aug-2026 live session, 635 polls): the original
+    # 0.6 / 0.2 thresholds were an order of magnitude below the Vol/OI this feed
+    # actually produces. Observed range was 0.47 to 21.9, median 8.3 -- so "fresh
+    # money confirmed" fired on 99.7% of polls and "fakeout risk" never fired once.
+    # The conviction tag was pinned to REAL all day and carried no information.
+    # These are today's 75th/25th percentiles, so the tag now actually discriminates.
+    # One day is thin calibration -- the panel shows where the live value sits in
+    # today's own distribution so you can retune these with a week of evidence.
+    "vol_oi_fresh": 13.0,        # Vol/OI >= this -> fresh institutional money, regime is "real"
+    "vol_oi_fakeout": 5.0,       # Vol/OI < this -> just intraday squaring off, ignore the breakout
     "trend_flat_band_pct": 0.1,  # spot within +-this% of today's open counts as "sideways", not rising/falling
     "chgpcr_min_ce_chg_abs": 300,       # minimum |net CE OI change| (contracts) in the zone before trusting ChgPCR
     "chgpcr_min_ce_chg_pct_of_oi": 0.3, # ...OR at least this % of the zone's total OI, whichever floor is higher
@@ -136,6 +144,17 @@ DEFAULT_IV_LENS_THRESHOLDS = {
     "atm_iv_width": 1,           # ATM IV = mean of CE+PE IV across ATM +- N strikes (N=1 -> ATM straddle-ish)
     "skew_fade_confirm": 0.0,    # weighted (CE_IV - PE_IV) below this, in the up/up quadrant, confirms the fade
     "skew_width": 3,             # ATM +- N strikes for the OI-weighted skew the lens consults
+    # ADAPTIVE FLOORS (opt-in, default off). A fixed % floor is calibrated to one
+    # volatility regime and silently changes meaning when the regime changes. On the
+    # 14-Aug session the 0.10% price floor was ~24 pts over 15 min, while the index's
+    # ENTIRE day range was 96 pts -- so price read "flat" on 606 of 623 polls and the
+    # lens was silent 97% of the day. Switched on, the floors are instead set to a
+    # percentile of the session's OWN realized moves over the same lookback, so the
+    # same setting behaves sensibly on a quiet day and a trending one.
+    "adaptive_floors": False,
+    "adaptive_pctile": 70,       # floor = this percentile of today's |move| per window
+    "adaptive_price_min": 0.02, "adaptive_price_max": 0.40,   # clamps, % of spot
+    "adaptive_iv_min": 0.30, "adaptive_iv_max": 6.00,         # clamps, % of IV level
 }
 
 # ==========================================
@@ -645,6 +664,31 @@ def _edge_means(values: np.ndarray, edge_n: int):
     return float(np.mean(values[:edge_n])), float(np.mean(values[-edge_n:]))
 
 
+def _session_move_floor(ts, values, lookback_minutes: int, pctile: float,
+                        lo: float, hi: float, min_windows: int = 6):
+    """Significance floor derived from the session's own realized moves rather
+    than a fixed constant.
+
+    The series is resampled into NON-OVERLAPPING buckets the same length as the
+    lookback window, and the floor is set to a percentile of those buckets'
+    absolute % changes. Non-overlapping matters: overlapping windows share most
+    of their samples, so their moves are heavily autocorrelated and a percentile
+    taken over them would be far too tight.
+
+    Returns (floor, n_windows), or (None, n) while there aren't enough completed
+    buckets yet to estimate anything -- the caller falls back to the fixed floor
+    during that warm-up rather than guessing from two data points."""
+    try:
+        s = pd.Series(np.asarray(values, dtype=float), index=pd.to_datetime(ts))
+        res = s.resample(f'{int(lookback_minutes)}min').last().dropna()
+        moves = res.pct_change().dropna().abs() * 100
+        if len(moves) < min_windows:
+            return None, len(moves)
+        return float(np.clip(np.percentile(moves, pctile), lo, hi)), len(moves)
+    except Exception:
+        return None, 0
+
+
 def measure_price_iv_window(log_records, date_str: str, t: dict):
     """Measures, without interpreting: the change in spot and the change in ATM
     IV over the rolling window, and which direction each of those counts as.
@@ -702,12 +746,30 @@ def measure_price_iv_window(log_records, date_str: str, t: dict):
     iv_chg_pct = (iv_chg_pts / iv_start * 100) if iv_start else np.nan
 
     p_th, iv_th = t['price_significant_pct'], t['iv_significant_pct']
+    floor_source, floor_windows = 'fixed', 0
+    if t.get('adaptive_floors'):
+        pf, floor_windows = _session_move_floor(
+            hist['ts'], hist['Spot'], t['lookback_minutes'], t['adaptive_pctile'],
+            t['adaptive_price_min'], t['adaptive_price_max'])
+        vf, _ = _session_move_floor(
+            hist['ts'], hist['ATM_IV'], t['lookback_minutes'], t['adaptive_pctile'],
+            t['adaptive_iv_min'], t['adaptive_iv_max'])
+        # Both floors switch together or neither does, so the two legs are always
+        # judged on the same basis -- a mixed pair would make the quadrant depend
+        # on which series happened to have enough history.
+        if pf is not None and vf is not None:
+            p_th, iv_th, floor_source = pf, vf, 'adaptive'
+        else:
+            floor_source = 'fixed (adaptive warming up)'
+
     price_dir = 'rising' if price_chg_pct > p_th else ('falling' if price_chg_pct < -p_th else 'flat')
     iv_dir = 'rising' if iv_chg_pct > iv_th else ('falling' if iv_chg_pct < -iv_th else 'flat')
 
     return {
         'ready': True,
         'price_dir': price_dir, 'iv_dir': iv_dir,
+        'price_floor': p_th, 'iv_floor': iv_th,
+        'floor_source': floor_source, 'floor_windows': floor_windows,
         'price_chg_pct': price_chg_pct, 'price_chg_pts': price_chg_pts,
         'iv_chg_pct': iv_chg_pct, 'iv_chg_pts': iv_chg_pts,
         'price_start': p_start, 'price_end': p_end,
@@ -738,6 +800,24 @@ def apply_iv_lens(measured, iv_skew, t: dict):
     p, v = measured['price_dir'], measured['iv_dir']
     skew_txt = f"{iv_skew:+.2f}" if pd.notna(iv_skew) else "n/a"
     notes = []
+
+    # Which leg (if any) is holding the lens silent, and by how much. Without this
+    # a silent lens is indistinguishable from a broken one -- on the 14-Aug session
+    # it read "NO LENS READ" on 97% of polls and there was no way to see from the
+    # panel that price was simply 16 points short of the floor.
+    p_floor = measured.get('price_floor', t['price_significant_pct'])
+    iv_floor = measured.get('iv_floor', t['iv_significant_pct'])
+    blockers = []
+    if p == 'flat':
+        short_pct = p_floor - abs(measured['price_chg_pct'])
+        short_pts = short_pct / 100 * measured['price_end'] if measured.get('price_end') else None
+        pts_txt = f" (~{short_pts:.0f} pts)" if short_pts is not None else ""
+        blockers.append(("price", f"moved {measured['price_chg_pct']:+.3f}% over the window, floor is "
+                                  f"±{p_floor:.3f}% — short by {short_pct:.3f}%{pts_txt}"))
+    if v == 'flat':
+        short_iv = iv_floor - abs(measured['iv_chg_pct'])
+        blockers.append(("IV", f"moved {measured['iv_chg_pct']:+.2f}% over the window, floor is "
+                               f"±{iv_floor:.2f}% — short by {short_iv:.2f}%"))
 
     if p == 'falling' and v == 'falling':
         stance, headline, color = 'shakeout', "🟢 SHAKEOUT — longable", "#1e7e34"
@@ -776,15 +856,16 @@ def apply_iv_lens(measured, iv_skew, t: dict):
         action = "Lens is silent"
         direction, veto, chase_block = 'neutral', False, False
         notes.append(f"Price is {p} and IV is {v}. The lens is defined only for the four up/down quadrants, so "
-                     "no verdict is being asserted — lower the significance floors in the sidebar if you want "
-                     "smaller moves to count as directional.")
+                     "no verdict is being asserted.")
+        for lbl, gap in blockers:
+            notes.append(f"Blocked by {lbl}: {gap}")
 
     fade_confirmed = bool(stance == 'fear_bid' and pd.notna(iv_skew) and iv_skew < t['skew_fade_confirm'])
 
     return {
         'stance': stance, 'headline': headline, 'action': action, 'color': color,
         'direction': direction, 'veto': veto, 'chase_block': chase_block,
-        'fade_confirmed': fade_confirmed, 'notes': notes,
+        'fade_confirmed': fade_confirmed, 'notes': notes, 'blockers': blockers,
         'price_dir': p, 'iv_dir': v, 'iv_skew': iv_skew,
     }
 
@@ -1338,6 +1419,17 @@ with st.sidebar:
             "Minimum logged polls in window", min_value=2, max_value=60,
             value=DEFAULT_IV_LENS_THRESHOLDS['min_samples'])
 
+        adaptive_floors = st.checkbox(
+            "Auto-calibrate floors to today's volatility", value=False,
+            help="Instead of the fixed % floors above, set them to a percentile of the session's own "
+                 "realized moves over the same window length. Keeps one setting workable across quiet "
+                 "and trending days. The fixed floors are still used while it warms up.")
+        adaptive_pctile = st.slider(
+            "...at which percentile of today's moves", min_value=40, max_value=90,
+            value=DEFAULT_IV_LENS_THRESHOLDS['adaptive_pctile'],
+            help="Higher = stricter = the lens speaks less often. ~70 gave roughly 9% of polls on the "
+                 "14-Aug session, versus 3% with the fixed 0.10% floor.")
+
         st.markdown("**Squeeze fade confirmation**")
         lens_skew_fade = st.number_input(
             "Skew below this confirms the fade", value=DEFAULT_IV_LENS_THRESHOLDS['skew_fade_confirm'], step=0.5,
@@ -1385,6 +1477,11 @@ iv_lens_thresholds = {
     "price_significant_pct": price_sig_pct, "min_samples": iv_price_min_samples,
     "atm_iv_width": iv_price_atm_width,
     "skew_fade_confirm": lens_skew_fade, "skew_width": int(lens_skew_width),
+    "adaptive_floors": adaptive_floors, "adaptive_pctile": adaptive_pctile,
+    "adaptive_price_min": DEFAULT_IV_LENS_THRESHOLDS['adaptive_price_min'],
+    "adaptive_price_max": DEFAULT_IV_LENS_THRESHOLDS['adaptive_price_max'],
+    "adaptive_iv_min": DEFAULT_IV_LENS_THRESHOLDS['adaptive_iv_min'],
+    "adaptive_iv_max": DEFAULT_IV_LENS_THRESHOLDS['adaptive_iv_max'],
 }
 
 pcr_thresholds = {"overbought": overbought_th, "bullish": bullish_th, "bearish": bearish_th}
@@ -1600,6 +1697,9 @@ if is_open:
         'IV_Lens_Headline': iv_lens['headline'] if iv_lens else None,
         'IV_Lens_Skew': round(lens_skew, 2) if pd.notna(lens_skew) else None,
         'IV_Lens_Veto': iv_lens['veto'] if iv_lens else None,
+        'IV_Lens_dPrice_pct': round(iv_measured['price_chg_pct'], 3) if (iv_measured and iv_measured.get('ready')) else None,
+        'IV_Lens_dIV_pct': round(iv_measured['iv_chg_pct'], 2) if (iv_measured and iv_measured.get('ready')) else None,
+        'IV_Lens_Price_Floor': round(iv_measured['price_floor'], 3) if (iv_measured and iv_measured.get('ready')) else None,
     }
     st.session_state.session_log.append(log_row)
     append_log_row(log_row, today_str)
@@ -1937,6 +2037,29 @@ if show_iv_lens:
         ip4.metric("Samples in window", f"{iv_measured['samples']}",
                    f"~{iv_measured['span_minutes']:.0f} min")
 
+        # --- Distance to the floors: the difference between "silent" and "broken" ---
+        p_floor, iv_floor = iv_measured['price_floor'], iv_measured['iv_floor']
+        p_pct_of_floor = min(abs(iv_measured['price_chg_pct']) / p_floor, 1.0) if p_floor else 0
+        iv_pct_of_floor = min(abs(iv_measured['iv_chg_pct']) / iv_floor, 1.0) if iv_floor else 0
+        floor_pts = p_floor / 100 * iv_measured['price_end']
+
+        fl1, fl2 = st.columns(2)
+        with fl1:
+            st.caption(f"**Price leg** — {abs(iv_measured['price_chg_pct']):.3f}% of the ±{p_floor:.3f}% "
+                       f"floor (±{floor_pts:.0f} pts) {'✅' if p_pct_of_floor >= 1 else '⏳'}")
+            st.progress(p_pct_of_floor)
+        with fl2:
+            st.caption(f"**IV leg** — {abs(iv_measured['iv_chg_pct']):.2f}% of the ±{iv_floor:.2f}% "
+                       f"floor {'✅' if iv_pct_of_floor >= 1 else '⏳'}")
+            st.progress(iv_pct_of_floor)
+
+        if iv_measured['floor_source'] == 'adaptive':
+            st.caption(f"Floors auto-calibrated to the {adaptive_pctile}th percentile of today's own "
+                       f"{iv_price_lookback}-min moves ({iv_measured['floor_windows']} completed windows so far).")
+        elif iv_measured['floor_source'].startswith('fixed ('):
+            st.caption("Auto-calibration is on but still warming up — needs ~6 completed windows. "
+                       "Using the fixed floors until then.")
+
         st.plotly_chart(
             build_iv_price_chart(iv_measured['series'],
                                  iv_measured['window_start'], iv_measured['window_end']),
@@ -2051,6 +2174,24 @@ margin:6px 0;'>
         fp1.metric("IV Skew (CE_IV − PE_IV)", f"{footprint_agg['iv_skew']:+.2f}" if pd.notna(footprint_agg['iv_skew']) else "—")
         fp2.metric("ChgPCR (today's flow)", f"{footprint_agg['chg_pcr']:.2f}" if pd.notna(footprint_agg['chg_pcr']) else "—")
         fp3.metric("Vol/OI (conviction)", f"{footprint_agg['vol_oi']:.2f}" if pd.notna(footprint_agg['vol_oi']) else "—")
+
+        # Threshold sanity check against the session's own distribution. A threshold
+        # that every poll clears (or none does) produces a constant tag that looks
+        # like a signal but carries no information -- which is exactly what the
+        # original 0.6 / 0.2 Vol/OI defaults did on the 14-Aug session.
+        _hist = pd.DataFrame(st.session_state.session_log)
+        if not _hist.empty and 'Footprint_Vol_OI' in _hist.columns:
+            _v = pd.to_numeric(_hist['Footprint_Vol_OI'], errors='coerce').dropna()
+            if len(_v) >= 20:
+                fresh_hit = (_v >= footprint_thresholds['vol_oi_fresh']).mean() * 100
+                fake_hit = (_v < footprint_thresholds['vol_oi_fakeout']).mean() * 100
+                warn = " ⚠️ this threshold isn't discriminating — retune it" if (
+                    fresh_hit > 95 or fresh_hit < 5) else ""
+                st.caption(
+                    f"Calibration check ({len(_v)} polls today): Vol/OI ranged {_v.min():.1f}–{_v.max():.1f} "
+                    f"(median {_v.median():.1f}). Your 'fresh' threshold fired on {fresh_hit:.0f}% of polls, "
+                    f"'fakeout' on {fake_hit:.0f}%.{warn}"
+                )
 
         with st.expander(f"📋 Institutional Footprint Table (ATM ± {footprint_width} strikes)"):
             fmt_table = footprint_table.copy()
