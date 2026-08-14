@@ -30,11 +30,17 @@ but still closes through in the trend direction), and confirms once the streak c
 threshold you set. This is descriptive of what price has actually done, not a prediction,
 and it's entirely separate from the OI-based Master Signal above.
 
-And directly below the chart, an IV vs PRICE RELATION panel implements the sentiment
-read you described: over a rolling lookback window it measures the change in spot
-against the change in ATM implied volatility and classifies the pair as Bullish /
-Bearish / Range Bound per your rules. Like the two panels above, it is descriptive
-and independent -- it never feeds back into the Master Signal.
+And directly below the chart, the IV LENS implements your trade-gating read of implied
+volatility against price:
+
+    Price DOWN + IV DOWN -> Shakeout            -> longable
+    Price DOWN + IV UP   -> Distribution        -> stand down, however good the OI looks
+    Price UP   + IV UP   -> Fear bid / squeeze  -> never chase; negative skew confirms the fade
+    Price UP   + IV DOWN -> Conviction          -> controlled accumulation (the smart-money grind)
+
+The lens is a GATE, not another opinion: the distribution quadrant vetoes the OI Master
+Signal outright, and the squeeze quadrant blocks chasing. A compact gate strip sits under
+the Master Signal banner (toggleable) with the full detail below the chart.
 
 Data source: Dhan API v2 Option Chain (see fetch_option_chain for schema notes).
 Sensibull's CSV had "CE OI change" as a pre-computed column; Dhan gives the same
@@ -107,27 +113,29 @@ DEFAULT_FOOTPRINT_THRESHOLDS = {
     "chgpcr_min_ce_chg_pct_of_oi": 0.3, # ...OR at least this % of the zone's total OI, whichever floor is higher
 }
 
-# IV vs PRICE RELATION settings -- a FOURTH, independent read placed directly below the
-# candlestick chart. Compares the change in spot against the change in ATM implied
-# volatility over a rolling window and maps the pair onto your stated interpretation:
+# IV LENS settings -- the trade gate that sits below the candlestick chart (and, if
+# enabled, as a compact strip directly under the Master Signal banner).
 #
-#     Price UP   + IV UP    -> Bullish
-#     Price UP   + IV FLAT  -> Range Bound        (no significant IV move)
-#     Price DOWN + IV FLAT  -> Range Bound        (no significant IV move)
-#     Price UP   + IV DOWN  -> Bearish
-#     Price DOWN + IV DOWN  -> Bearish
+# MEASUREMENT: over a rolling window, the change in spot is compared against the change
+# in ATM implied volatility, both taken from the SAME logged polls.
 #
-# Note: your four rules do not cover the fourth quadrant (price FALLING while IV is
-# RISING). Rather than silently inventing a verdict for it, the panel reports that
-# combination as an explicitly-flagged, unmapped state. There's a sidebar toggle to
-# treat it as Bearish (the conventional panic/fear-bid reading) if you want it folded
-# in -- it's off by default so the panel only ever asserts what you actually specified.
-DEFAULT_IV_PRICE_THRESHOLDS = {
+# RULESET:
+#     Price DOWN + IV DOWN -> Shakeout            -> longable
+#     Price DOWN + IV UP   -> Distribution        -> stand down (vetoes the OI Master Signal)
+#     Price UP   + IV UP   -> Fear bid / squeeze  -> never chase; skew flipping negative confirms the fade
+#     Price UP   + IV DOWN -> Conviction          -> controlled accumulation
+#
+# All four up/down quadrants are covered, so unlike the earlier four-rule panel this
+# replaced, there is no unmapped state to toggle. When either leg is FLAT the lens
+# stays silent rather than inventing a verdict -- flat is not one of the four quadrants.
+DEFAULT_IV_LENS_THRESHOLDS = {
     "lookback_minutes": 15,      # rolling window over which the two changes are measured
     "iv_significant_pct": 1.5,   # |IV change| below this % (relative) counts as "no significant IV move"
     "price_significant_pct": 0.10,  # |spot change| below this % counts as "flat"
     "min_samples": 4,            # need at least this many logged polls in the window before reading it
     "atm_iv_width": 1,           # ATM IV = mean of CE+PE IV across ATM +- N strikes (N=1 -> ATM straddle-ish)
+    "skew_fade_confirm": 0.0,    # weighted (CE_IV - PE_IV) below this, in the up/up quadrant, confirms the fade
+    "skew_width": 3,             # ATM +- N strikes for the OI-weighted skew the lens consults
 }
 
 # ==========================================
@@ -157,7 +165,7 @@ def append_log_row(row: dict, date_str: str):
     replacement for manually pasting Dash Board!A3:N3 into a new row).
 
     Schema-change safe: if today's file was started by an older build of this app
-    (i.e. before the ATM_IV / IV_Price_Regime columns existed), a blind append
+    (i.e. before the ATM_IV / IV_Lens_Stance columns existed), a blind append
     would silently shift every value one column to the left. So the header is
     checked first -- same columns in a different order are just reordered, and a
     genuinely different column set triggers a one-off rewrite with the union of
@@ -590,7 +598,7 @@ def build_oi_profile(df: pd.DataFrame, atm: float, width: int):
 
 
 # ==========================================
-# IV vs PRICE RELATION (new — fourth independent read, sits below the chart)
+# IV LENS — trade gate (replaces the earlier four-rule IV vs Price panel)
 # ==========================================
 def compute_atm_iv(df: pd.DataFrame, atm: float, width: int = 1):
     """Single 'the market's IV right now' scalar: the mean of CE and PE implied
@@ -608,31 +616,53 @@ def compute_atm_iv(df: pd.DataFrame, atm: float, width: int = 1):
     return float(ivs.mean()) if len(ivs) else np.nan
 
 
+def compute_lens_skew(df: pd.DataFrame, atm: float, width: int = 3):
+    """OI-weighted CE_IV - PE_IV across ATM +- width strikes, used by the lens
+    only in the price-up + IV-up quadrant to confirm a squeeze fade.
+
+    Computed standalone rather than reusing the Institutional Footprint's skew,
+    so the lens keeps working with the Footprint panel switched off and with its
+    own band width. Strikes with a zero/blank IV on either leg are dropped
+    instead of being treated as 0 vol, which would manufacture a large fake
+    negative skew and falsely 'confirm' a fade."""
+    zone = df[(df['Strike'] >= atm - width * STRIKE_STEP) &
+              (df['Strike'] <= atm + width * STRIKE_STEP)].copy()
+    if zone.empty:
+        return np.nan
+    ce = pd.to_numeric(zone['CE_IV'], errors='coerce')
+    pe = pd.to_numeric(zone['PE_IV'], errors='coerce')
+    w = pd.to_numeric(zone['CE_OI'] + zone['PE_OI'], errors='coerce')
+    skew = ce - pe
+    mask = skew.notna() & (ce > 0) & (pe > 0) & w.notna() & (w > 0)
+    if not mask.any():
+        return np.nan
+    return float((skew[mask] * w[mask]).sum() / w[mask].sum())
+
+
 def _edge_means(values: np.ndarray, edge_n: int):
     """Start/end levels of a window, averaged over a few samples at each end so
     one jumpy 10-second poll can't flip the whole read."""
     return float(np.mean(values[:edge_n])), float(np.mean(values[-edge_n:]))
 
 
-def analyze_iv_price_relation(log_records, date_str: str, t: dict,
-                              treat_fall_iv_up_as_bearish: bool = False):
-    """Implements your IV/price sentiment interpretation over a rolling window.
+def measure_price_iv_window(log_records, date_str: str, t: dict):
+    """Measures, without interpreting: the change in spot and the change in ATM
+    IV over the rolling window, and which direction each of those counts as.
 
     Both series come from THIS APP'S session log (spot + ATM IV recorded on the
     same poll), deliberately -- not from the candle feed for price and the chain
     for IV. Mixing two clocks would compare a price change measured over one
     interval against an IV change measured over a slightly different one, which
-    is exactly the kind of small misalignment that flips a borderline
-    Bullish/Range-Bound call for no real reason.
+    is exactly the kind of small misalignment that flips a borderline quadrant
+    call for no real reason -- and with a veto hanging off that call, a spurious
+    flip is expensive.
 
     'Significant' is relative, not absolute: IV is judged as a % change of the
     IV level itself (so 0.3 vol points means something different at 9 IV than at
     22 IV), and price as a % of spot. Both floors are tunable in the sidebar.
 
-    The mapping is exactly your stated ruleset. The one quadrant your rules
-    don't specify -- price FALLING while IV is RISING -- is returned as an
-    explicitly unmapped state (`covered=False`) unless you opt into reading it
-    as Bearish. Returns None when there isn't enough logged history yet."""
+    Returns None when there's no usable history, or a dict with ready=False
+    while the window is still filling up."""
     if not log_records:
         return None
     hist = pd.DataFrame(log_records)
@@ -675,43 +705,8 @@ def analyze_iv_price_relation(log_records, date_str: str, t: dict,
     price_dir = 'rising' if price_chg_pct > p_th else ('falling' if price_chg_pct < -p_th else 'flat')
     iv_dir = 'rising' if iv_chg_pct > iv_th else ('falling' if iv_chg_pct < -iv_th else 'flat')
 
-    covered = True
-    if price_dir == 'rising' and iv_dir == 'rising':
-        regime, color_key = "🟢 BULLISH", "bullish"
-        rationale = ("Price and IV are both rising — fresh money is paying up for optionality as the market "
-                     "climbs, which is the bullish combination in your ruleset.")
-    elif price_dir == 'rising' and iv_dir == 'falling':
-        regime, color_key = "🔴 BEARISH", "bearish"
-        rationale = ("Price is rising while IV falls — the move up is not being backed by demand for options. "
-                     "Per your ruleset this reads as a bearish/complacent rally rather than a real trend.")
-    elif price_dir == 'falling' and iv_dir == 'falling':
-        regime, color_key = "🔴 BEARISH", "bearish"
-        rationale = ("Price and IV are both falling — a grind lower with no panic bid in vol. Bearish per "
-                     "your ruleset.")
-    elif price_dir in ('rising', 'falling') and iv_dir == 'flat':
-        regime, color_key = "⚪ RANGE BOUND", "neutral"
-        rationale = (f"Price is {price_dir} but IV hasn't moved significantly (|ΔIV| under {iv_th:.2f}%). "
-                     "Directionless vol means the move isn't being funded — range-bound per your ruleset.")
-    elif price_dir == 'falling' and iv_dir == 'rising':
-        covered = False
-        if treat_fall_iv_up_as_bearish:
-            regime, color_key = "🔴 BEARISH (fear bid)", "bearish"
-            rationale = ("Price falling while IV rises — the classic fear/protection bid: puts are being paid "
-                         "up for on the way down. Note this is also the quadrant that marks capitulation lows, "
-                         "so a sharp IV spike here can be the end of the move rather than the middle of it.")
-        else:
-            regime, color_key = "🟡 FALLING PRICE + RISING IV", "unmapped"
-            rationale = ("Price is falling while IV rises. Your four rules don't cover this combination, so no "
-                         "verdict is being asserted. Conventionally it's read as bearish (a fear/protection "
-                         "bid) — enable the sidebar toggle if you want it counted that way.")
-    else:   # price flat
-        regime, color_key = "⚪ RANGE BOUND", "neutral"
-        rationale = (f"Spot hasn't moved significantly over the window (|Δprice| under {p_th:.2f}%), so there's "
-                     "no directional read to pair the IV move with.")
-
     return {
-        'ready': True, 'covered': covered,
-        'regime': regime, 'color_key': color_key, 'rationale': rationale,
+        'ready': True,
         'price_dir': price_dir, 'iv_dir': iv_dir,
         'price_chg_pct': price_chg_pct, 'price_chg_pts': price_chg_pts,
         'iv_chg_pct': iv_chg_pct, 'iv_chg_pts': iv_chg_pts,
@@ -722,10 +717,82 @@ def analyze_iv_price_relation(log_records, date_str: str, t: dict,
     }
 
 
+def apply_iv_lens(measured, iv_skew, t: dict):
+    """Maps the measured quadrant onto your lens ruleset.
+
+      Price DOWN + IV DOWN -> Shakeout      -> longable
+      Price DOWN + IV UP   -> Distribution  -> stand down, however good the OI looks
+      Price UP   + IV UP   -> Fear bid      -> never chase; negative skew confirms the fade
+      Price UP   + IV DOWN -> Conviction    -> controlled accumulation
+
+    Kept separate from measure_price_iv_window() on purpose: that function only
+    describes what happened, this one is the only place a verdict is asserted,
+    so retuning the rules never touches the measurement.
+
+    When either leg is FLAT the lens returns a no-read rather than guessing --
+    flat isn't one of the four quadrants, and a gate that vetoes trades should
+    stay silent instead of improvising. Returns None until the window is ready."""
+    if not measured or not measured.get('ready'):
+        return None
+
+    p, v = measured['price_dir'], measured['iv_dir']
+    skew_txt = f"{iv_skew:+.2f}" if pd.notna(iv_skew) else "n/a"
+    notes = []
+
+    if p == 'falling' and v == 'falling':
+        stance, headline, color = 'shakeout', "🟢 SHAKEOUT — longable", "#1e7e34"
+        action = "Longs permitted into weakness"
+        direction, veto, chase_block = 'bullish', False, False
+        notes.append("Price coming off while vol bleeds — nobody is paying up for protection on the way down. "
+                     "That's positioning being flushed, not risk being repriced. Dips here are the buyable kind.")
+    elif p == 'falling' and v == 'rising':
+        stance, headline, color = 'distribution', "⛔ DISTRIBUTION — stand down", "#c82333"
+        action = "No new positions — the OI read does not apply"
+        direction, veto, chase_block = 'bearish', True, False
+        notes.append("Price down with vol bid is genuine repricing, not a flush: protection is being paid for "
+                     "into the decline. Stand down regardless of how constructive the OI/Master Signal looks.")
+    elif p == 'rising' and v == 'rising':
+        stance, headline, color = 'fear_bid', "🟠 FEAR BID / SQUEEZE — do not chase", "#d97706"
+        action = "No chasing — wait for the fade or a pullback"
+        direction, veto, chase_block = 'bearish', False, True
+        notes.append("Price and vol rising together is a squeeze / fear bid, not accumulation — the move is "
+                     "being paid for in premium. Never chase strength in this quadrant.")
+        if pd.isna(iv_skew):
+            notes.append("Skew unavailable this poll, so the fade confirmation can't be checked.")
+        elif iv_skew < t['skew_fade_confirm']:
+            notes.append(f"Skew {skew_txt} has flipped negative (CE_IV below PE_IV) — **fade confirmed**: calls "
+                         "are being sold into the rip while puts stay bid.")
+        else:
+            notes.append(f"Skew {skew_txt} has not flipped negative yet — the squeeze may still have legs, so "
+                         "the fade is not confirmed. Still no chasing either way.")
+    elif p == 'rising' and v == 'falling':
+        stance, headline, color = 'accumulation', "🟢 CONVICTION — controlled accumulation", "#1e7e34"
+        action = "Trend longs — the smart-money grind"
+        direction, veto, chase_block = 'bullish', False, False
+        notes.append("Price grinding up while vol bleeds out: size is being absorbed without anyone paying up "
+                     "for protection. This is the accumulation regime, not a chase.")
+    else:
+        stance, headline, color = 'no_read', "⚪ NO LENS READ", "#6c757d"
+        action = "Lens is silent"
+        direction, veto, chase_block = 'neutral', False, False
+        notes.append(f"Price is {p} and IV is {v}. The lens is defined only for the four up/down quadrants, so "
+                     "no verdict is being asserted — lower the significance floors in the sidebar if you want "
+                     "smaller moves to count as directional.")
+
+    fade_confirmed = bool(stance == 'fear_bid' and pd.notna(iv_skew) and iv_skew < t['skew_fade_confirm'])
+
+    return {
+        'stance': stance, 'headline': headline, 'action': action, 'color': color,
+        'direction': direction, 'veto': veto, 'chase_block': chase_block,
+        'fade_confirmed': fade_confirmed, 'notes': notes,
+        'price_dir': p, 'iv_dir': v, 'iv_skew': iv_skew,
+    }
+
+
 def build_iv_price_chart(series_df: pd.DataFrame, window_start=None, window_end=None):
     """Dual-axis session view of spot (left) against ATM IV (right) — the visual
-    behind the verdict, so you can see whether the two lines are converging or
-    diverging rather than trusting a single label."""
+    behind the lens verdict, so you can see whether the two lines are converging
+    or diverging rather than trusting a single label."""
     f = make_subplots(specs=[[{"secondary_y": True}]])
     f.add_trace(go.Scatter(x=series_df['ts'], y=series_df['Spot'], name='Spot',
                            line=dict(color='#0d6efd', width=1.7)), secondary_y=False)
@@ -733,7 +800,7 @@ def build_iv_price_chart(series_df: pd.DataFrame, window_start=None, window_end=
                            line=dict(color='#ffa500', width=1.7)), secondary_y=True)
     if window_start is not None and window_end is not None and window_start != window_end:
         f.add_vrect(x0=window_start, x1=window_end, fillcolor="#6c757d", opacity=0.12,
-                    line_width=0, annotation_text="read window", annotation_position="top left")
+                    line_width=0, annotation_text="lens window", annotation_position="top left")
     f.update_yaxes(title_text="Spot", secondary_y=False)
     f.update_yaxes(title_text="ATM IV (%)", secondary_y=True)
     f.update_layout(height=320, margin=dict(l=10, r=10, t=10, b=10),
@@ -1120,7 +1187,7 @@ for key, default in [
     ('baseline_source', None), ('last_gsheet_write', None),
     ('session_log', []), ('vwap_session_start', None), ('token_status', None),
     ('ohlc_df', None), ('last_candle_fetch', None), ('vwap_confirmed_alert_side', None),
-    ('iv_price_alert_regime', None),
+    ('iv_lens_alert_stance', None),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -1242,30 +1309,42 @@ with st.sidebar:
             help="Height of the CE+PE block at each strike, as a share of the 50-point strike spacing.") / 100
 
     st.markdown("---")
-    with st.expander("📊 IV vs Price Relation", expanded=True):
-        show_iv_price_panel = st.checkbox("Show IV vs Price sentiment read", value=True)
+    with st.expander("🔬 IV Lens (trade gate)", expanded=True):
+        show_iv_lens = st.checkbox("Show IV Lens panel", value=True)
+        lens_at_top = st.checkbox(
+            "Pin the lens gate under the Master Signal", value=True,
+            help="The lens can veto the OI signal, so it's worth having it where you make the decision.")
+        lens_enforce_gate = st.checkbox(
+            "Enforce the veto / no-chase warnings on the Master Signal", value=True,
+            help="Off, the lens still reports its stance but stops flagging conflicts with the OI signal.")
+
+        st.markdown("**Measurement window**")
         iv_price_lookback = st.number_input(
             "Lookback window (minutes)", min_value=1, max_value=180,
-            value=DEFAULT_IV_PRICE_THRESHOLDS['lookback_minutes'],
+            value=DEFAULT_IV_LENS_THRESHOLDS['lookback_minutes'],
             help="Both the price change and the IV change are measured across this rolling window, "
                  "using your own logged polls.")
-        iv_sig_pct = st.number_input(
-            "IV move is 'significant' at ± (%)", value=DEFAULT_IV_PRICE_THRESHOLDS['iv_significant_pct'], step=0.25,
-            help="Relative change in ATM IV. Below this the IV counts as flat → Range Bound.")
         price_sig_pct = st.number_input(
-            "Price move is 'significant' at ± (%)", value=DEFAULT_IV_PRICE_THRESHOLDS['price_significant_pct'],
-            step=0.05, format="%.2f")
+            "Price move is 'significant' at ± (%)", value=DEFAULT_IV_LENS_THRESHOLDS['price_significant_pct'],
+            step=0.05, format="%.2f",
+            help="Below this, price counts as flat and the lens stays silent rather than picking a quadrant.")
+        iv_sig_pct = st.number_input(
+            "IV move is 'significant' at ± (%)", value=DEFAULT_IV_LENS_THRESHOLDS['iv_significant_pct'], step=0.25,
+            help="Relative change in ATM IV. Below this, IV counts as flat and the lens stays silent.")
         iv_price_atm_width = st.number_input(
             "ATM IV band (ATM ± N strikes)", min_value=0, max_value=5,
-            value=DEFAULT_IV_PRICE_THRESHOLDS['atm_iv_width'])
+            value=DEFAULT_IV_LENS_THRESHOLDS['atm_iv_width'])
         iv_price_min_samples = st.number_input(
             "Minimum logged polls in window", min_value=2, max_value=60,
-            value=DEFAULT_IV_PRICE_THRESHOLDS['min_samples'])
-        treat_fall_iv_up_as_bearish = st.checkbox(
-            "Read falling price + rising IV as Bearish",
-            value=True,
-            help="The fear/protection-bid quadrant. On (default) it's reported as Bearish; turn it off to have "
-                 "the panel flag it as an unmapped state instead of asserting a verdict.")
+            value=DEFAULT_IV_LENS_THRESHOLDS['min_samples'])
+
+        st.markdown("**Squeeze fade confirmation**")
+        lens_skew_fade = st.number_input(
+            "Skew below this confirms the fade", value=DEFAULT_IV_LENS_THRESHOLDS['skew_fade_confirm'], step=0.5,
+            help="Only consulted in the price-up + IV-up quadrant. Skew = OI-weighted CE_IV − PE_IV.")
+        lens_skew_width = st.number_input(
+            "Lens skew band (ATM ± N strikes)", min_value=1, max_value=15,
+            value=DEFAULT_IV_LENS_THRESHOLDS['skew_width'])
 
     st.markdown("---")
     with st.expander("🕵️ Institutional Footprint", expanded=True):
@@ -1301,10 +1380,11 @@ footprint_thresholds = {
     "chgpcr_min_ce_chg_abs": fp_chgpcr_min_abs, "chgpcr_min_ce_chg_pct_of_oi": fp_chgpcr_min_pct,
 }
 
-iv_price_thresholds = {
+iv_lens_thresholds = {
     "lookback_minutes": iv_price_lookback, "iv_significant_pct": iv_sig_pct,
     "price_significant_pct": price_sig_pct, "min_samples": iv_price_min_samples,
     "atm_iv_width": iv_price_atm_width,
+    "skew_fade_confirm": lens_skew_fade, "skew_width": int(lens_skew_width),
 }
 
 pcr_thresholds = {"overbought": overbought_th, "bullish": bullish_th, "bearish": bearish_th}
@@ -1456,26 +1536,28 @@ footprint_headline, footprint_color_key, footprint_lines = institutional_footpri
 ) if show_footprint_panel and not footprint_table.empty else (None, None, [])
 
 # ==========================================
-# IV vs PRICE RELATION — fourth independent read (spot change vs ATM IV change)
+# IV LENS — trade gate (spot change vs ATM IV change, + skew for fade confirmation)
 # ==========================================
 # Computed BEFORE the log append below, so this poll's own (Spot, ATM_IV) pair is
-# part of the window and the resulting regime can be written into the same log row
+# part of the window and the resulting stance can be written into the same log row
 # rather than lagging one poll behind.
 atm_iv = compute_atm_iv(df, atm_strike, int(iv_price_atm_width))
+lens_skew = compute_lens_skew(df, atm_strike, iv_lens_thresholds['skew_width'])
 current_iv_sample = [{
     'Time': (st.session_state.last_fetch or now_ist).strftime('%H:%M:%S'),
     'Spot': spot, 'ATM_IV': atm_iv,
 }] if is_open else []
-iv_price_read = analyze_iv_price_relation(
-    list(st.session_state.session_log) + current_iv_sample, today_str,
-    iv_price_thresholds, treat_fall_iv_up_as_bearish=treat_fall_iv_up_as_bearish,
-)
+iv_measured = measure_price_iv_window(
+    list(st.session_state.session_log) + current_iv_sample, today_str, iv_lens_thresholds)
+iv_lens = apply_iv_lens(iv_measured, lens_skew, iv_lens_thresholds)
 
-# One-shot toast when the IV/price regime flips (not on every 10s poll)
-if iv_price_read and iv_price_read.get('ready'):
-    if st.session_state.iv_price_alert_regime != iv_price_read['regime']:
-        st.toast(f"📊 IV vs Price: {iv_price_read['regime']}", icon="📊")
-        st.session_state.iv_price_alert_regime = iv_price_read['regime']
+# One-shot toast when the lens stance flips (not on every 10s poll)
+if iv_lens and iv_lens['stance'] != 'no_read':
+    if st.session_state.iv_lens_alert_stance != iv_lens['stance']:
+        st.toast(f"🔬 IV Lens: {iv_lens['headline']}", icon="🔬")
+        st.session_state.iv_lens_alert_stance = iv_lens['stance']
+else:
+    st.session_state.iv_lens_alert_stance = None
 
 # Confluence agreement counter (informational only)
 bullish_signals = sig in ("Strong CE Buy", "PE writers strong") or zb['signal'] in ("Buy CE", "Write PE")
@@ -1512,9 +1594,12 @@ if is_open:
         'Footprint_ChgPCR': round(footprint_agg['chg_pcr'], 2) if pd.notna(footprint_agg.get('chg_pcr')) else None,
         'Footprint_Vol_OI': round(footprint_agg['vol_oi'], 2) if pd.notna(footprint_agg.get('vol_oi')) else None,
         'Footprint_Signal': footprint_headline,
-        # --- IV vs Price relation (appended at the end so older logs stay column-aligned) ---
+        # --- IV Lens (appended at the end so older logs stay column-aligned) ---
         'ATM_IV': round(atm_iv, 2) if pd.notna(atm_iv) else None,
-        'IV_Price_Regime': iv_price_read['regime'] if (iv_price_read and iv_price_read.get('ready')) else None,
+        'IV_Lens_Stance': iv_lens['stance'] if iv_lens else None,
+        'IV_Lens_Headline': iv_lens['headline'] if iv_lens else None,
+        'IV_Lens_Skew': round(lens_skew, 2) if pd.notna(lens_skew) else None,
+        'IV_Lens_Veto': iv_lens['veto'] if iv_lens else None,
     }
     st.session_state.session_log.append(log_row)
     append_log_row(log_row, today_str)
@@ -1535,6 +1620,36 @@ text-align:center;margin:10px 0;'>
     <p style='color:white;margin:6px 0 0 0;'>Action: <b>{action or "—"}</b> &nbsp;|&nbsp;
     Zone B raw signal: <b>{zb['signal']}</b> &nbsp;|&nbsp; PCR regime: <b>{za['classification']}</b></p>
 </div>""", unsafe_allow_html=True)
+
+# --- IV LENS GATE STRIP (directly under the Master Signal, where the decision happens) ---
+if show_iv_lens and lens_at_top:
+    if iv_lens:
+        lens_skew_txt = f"{iv_lens['iv_skew']:+.2f}" if pd.notna(iv_lens['iv_skew']) else "n/a"
+        st.markdown(f"""
+<div style='background-color:{iv_lens['color']};padding:14px 18px;border-radius:10px;margin:0 0 10px 0;'>
+    <h4 style='color:white;margin:0;'>🔬 IV Lens — {iv_lens['headline']}</h4>
+    <p style='color:white;margin:6px 0 0 0;'>{iv_lens['action']} &nbsp;|&nbsp;
+    Price <b>{iv_lens['price_dir']}</b> · IV <b>{iv_lens['iv_dir']}</b> · Skew <b>{lens_skew_txt}</b>
+    {"· fade confirmed" if iv_lens['fade_confirmed'] else ""}</p>
+</div>""", unsafe_allow_html=True)
+
+        if lens_enforce_gate:
+            if iv_lens['veto'] and sig != "wait for data confirmation":
+                st.error(
+                    f"⛔ **Lens veto.** The OI Master Signal reads **{sig}**, but price is falling into rising IV "
+                    f"— that's distribution, not a dip. Stand down regardless of how good the OI looks."
+                )
+            elif iv_lens['veto']:
+                st.error("⛔ **Lens veto.** Distribution quadrant — no new positions while this holds.")
+            elif iv_lens['chase_block'] and sig in ("Strong CE Buy", "PE writers strong"):
+                fade_note = (" Skew has flipped negative, which confirms the fade."
+                             if iv_lens['fade_confirmed'] else "")
+                st.warning(
+                    f"🟠 The OI Master Signal reads **{sig}**, but this is the squeeze quadrant — take the entry "
+                    f"on a pullback, not by chasing strength.{fade_note}"
+                )
+    else:
+        st.caption("🔬 IV Lens — waiting on enough logged Spot + ATM IV history to read the window.")
 
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Spot / ATM", f"{spot:.0f}" if spot else "—", f"ATM {atm_strike:.0f}")
@@ -1760,87 +1875,93 @@ if show_candle_chart:
     st.markdown("---")
 
 # ==========================================
-# IV vs PRICE RELATION PANEL — sits directly below the NIFTY chart
-# (independent of the Master Signal, the VWAP Trend Read and the Footprint)
+# IV LENS PANEL — sits directly below the NIFTY chart
 # ==========================================
-if show_iv_price_panel:
-    st.subheader("📊 IV vs Price Relation (sentiment read)")
+if show_iv_lens:
+    st.subheader("🔬 IV Lens (trade gate)")
 
-    iv_price_colors = {"bullish": "#1e7e34", "bearish": "#c82333",
-                       "neutral": "#6c757d", "unmapped": "#8a6d0b"}
-
-    if iv_price_read is None:
+    if iv_measured is None:
         st.caption(
-            "No usable Spot + ATM IV history logged yet today. This panel builds its two series from your own "
+            "No usable Spot + ATM IV history logged yet today. The lens builds its two series from your own "
             "polls, so it needs the app running during market hours for a couple of minutes before it can read "
             "anything. (Logs written by an older build of this app won't have the ATM_IV column — those days "
             "will stay blank here.)"
         )
-    elif not iv_price_read.get('ready'):
+    elif not iv_measured.get('ready'):
         st.info(
-            f"Building the read — **{iv_price_read['samples']}/{iv_price_read['needed']} polls** collected in the "
-            f"last {iv_price_lookback} minutes (~{iv_price_read['span_minutes']:.1f} min of history so far)."
+            f"Building the read — **{iv_measured['samples']}/{iv_measured['needed']} polls** collected in the "
+            f"last {iv_price_lookback} minutes (~{iv_measured['span_minutes']:.1f} min of history so far)."
         )
-        if len(iv_price_read['series']) >= 2:
-            st.plotly_chart(build_iv_price_chart(iv_price_read['series']), use_container_width=True)
+        if len(iv_measured['series']) >= 2:
+            st.plotly_chart(build_iv_price_chart(iv_measured['series']), use_container_width=True)
     else:
         arrow = {'rising': '↑', 'falling': '↓', 'flat': '→'}
+        lens_skew_txt = f"{iv_lens['iv_skew']:+.2f}" if pd.notna(iv_lens['iv_skew']) else "n/a"
         st.markdown(f"""
-<div style='background-color:{iv_price_colors.get(iv_price_read['color_key'], "#6c757d")};padding:18px;
-border-radius:10px;margin:6px 0;'>
-    <h3 style='color:white;margin:0;'>{iv_price_read['regime']}</h3>
+<div style='background-color:{iv_lens['color']};padding:18px;border-radius:10px;margin:6px 0;'>
+    <h3 style='color:white;margin:0;'>{iv_lens['headline']}</h3>
+    <p style='color:white;margin:8px 0 0 0;'><b>{iv_lens['action']}</b></p>
     <p style='color:white;margin:6px 0 0 0;'>
-    Price <b>{iv_price_read['price_dir']} {arrow[iv_price_read['price_dir']]}</b>
-    ({iv_price_read['price_chg_pct']:+.2f}%, {iv_price_read['price_chg_pts']:+.0f} pts)
+    Price <b>{iv_measured['price_dir']} {arrow[iv_measured['price_dir']]}</b>
+    ({iv_measured['price_chg_pct']:+.2f}%, {iv_measured['price_chg_pts']:+.0f} pts)
     &nbsp;|&nbsp;
-    IV <b>{iv_price_read['iv_dir']} {arrow[iv_price_read['iv_dir']]}</b>
-    ({iv_price_read['iv_chg_pct']:+.2f}%, {iv_price_read['iv_chg_pts']:+.2f} vol pts)
-    &nbsp;|&nbsp; window ~{iv_price_read['span_minutes']:.0f} min</p>
+    IV <b>{iv_measured['iv_dir']} {arrow[iv_measured['iv_dir']]}</b>
+    ({iv_measured['iv_chg_pct']:+.2f}%, {iv_measured['iv_chg_pts']:+.2f} vol pts)
+    &nbsp;|&nbsp; Skew <b>{lens_skew_txt}</b>
+    &nbsp;|&nbsp; window ~{iv_measured['span_minutes']:.0f} min</p>
 </div>""", unsafe_allow_html=True)
 
-        st.caption(f"• {iv_price_read['rationale']}")
-        if not iv_price_read['covered'] and not treat_fall_iv_up_as_bearish:
+        for line in iv_lens['notes']:
+            st.caption(f"• {line}")
+
+        if iv_lens['veto']:
+            st.error(
+                "⛔ **Stand down.** This is the distribution quadrant — the lens overrides the OI read here by "
+                "design. No new positions while it holds, however constructive the Master Signal looks."
+            )
+        elif iv_lens['chase_block']:
             st.warning(
-                "This combination (price down, IV up) isn't one of the four rules you gave, so the panel is "
-                "reporting the state rather than asserting a verdict. Enable the sidebar toggle if you want it "
-                "treated as Bearish."
+                "🟠 **Do not chase.** Price and IV rising together is a squeeze, not accumulation. "
+                + ("Skew has flipped negative — the fade is confirmed."
+                   if iv_lens['fade_confirmed'] else
+                   "Skew hasn't flipped negative yet, so the fade isn't confirmed — but still no chasing.")
             )
 
         ip1, ip2, ip3, ip4 = st.columns(4)
-        ip1.metric("Spot", f"{iv_price_read['price_end']:.0f}",
-                   f"{iv_price_read['price_chg_pct']:+.2f}% over window")
-        ip2.metric("ATM IV", f"{iv_price_read['iv_end']:.2f}",
-                   f"{iv_price_read['iv_chg_pct']:+.2f}% over window")
-        ip3.metric("Significance floors", f"±{price_sig_pct:.2f}% / ±{iv_sig_pct:.2f}%",
-                   "price / IV")
-        ip4.metric("Samples in window", f"{iv_price_read['samples']}",
-                   f"~{iv_price_read['span_minutes']:.0f} min")
+        ip1.metric("Spot", f"{iv_measured['price_end']:.0f}",
+                   f"{iv_measured['price_chg_pct']:+.2f}% over window")
+        ip2.metric("ATM IV", f"{iv_measured['iv_end']:.2f}",
+                   f"{iv_measured['iv_chg_pct']:+.2f}% over window")
+        ip3.metric(f"Skew (ATM ± {iv_lens_thresholds['skew_width']})", lens_skew_txt,
+                   "fade confirmed" if iv_lens['fade_confirmed'] else "")
+        ip4.metric("Samples in window", f"{iv_measured['samples']}",
+                   f"~{iv_measured['span_minutes']:.0f} min")
 
         st.plotly_chart(
-            build_iv_price_chart(iv_price_read['series'],
-                                 iv_price_read['window_start'], iv_price_read['window_end']),
+            build_iv_price_chart(iv_measured['series'],
+                                 iv_measured['window_start'], iv_measured['window_end']),
             use_container_width=True,
         )
 
-        with st.expander("How this read is built"):
+        with st.expander("The lens ruleset"):
             st.markdown(
-                "**Your ruleset, as implemented:**\n\n"
-                "| Price | IV | Read |\n|---|---|---|\n"
-                "| ↑ Rising | ↑ Rising | 🟢 Bullish |\n"
-                "| ↑ Rising | → Flat | ⚪ Range Bound |\n"
-                "| ↓ Falling | → Flat | ⚪ Range Bound |\n"
-                "| ↑ Rising | ↓ Falling | 🔴 Bearish |\n"
-                "| ↓ Falling | ↓ Falling | 🔴 Bearish |\n"
-                "| ↓ Falling | ↑ Rising | 🔴 Bearish — fear bid (toggle off in sidebar to leave unmapped) |\n"
+                "| Price | IV | Read | Action |\n|---|---|---|---|\n"
+                "| ↓ Falling | ↓ Falling | Shakeout | 🟢 Longable — positioning flushed, not risk repriced |\n"
+                "| ↓ Falling | ↑ Rising | Distribution | ⛔ Stand down — **overrides the OI read** |\n"
+                "| ↑ Rising | ↑ Rising | Fear bid / squeeze | 🟠 Never chase; negative skew confirms the fade |\n"
+                "| ↑ Rising | ↓ Falling | Conviction | 🟢 Controlled accumulation — the smart-money grind |\n"
             )
             st.caption(
                 f"ATM IV = mean of CE and PE implied vol across ATM ± {int(iv_price_atm_width)} strike(s), "
                 f"zero/blank IVs excluded. Both changes are measured from the start to the end of the "
-                f"{iv_price_lookback}-minute window, each end averaged over {iv_price_read['edge_n']} sample(s) "
+                f"{iv_price_lookback}-minute window, each end averaged over {iv_measured['edge_n']} sample(s) "
                 f"so a single jumpy poll can't flip the verdict. 'Significant' is relative: IV as a % of the IV "
-                f"level, price as a % of spot. Spot and IV are both taken from the same poll, so the two changes "
-                f"are measured over exactly the same interval. This panel is descriptive and independent — it "
-                f"never feeds into the Master Signal above."
+                f"level, price as a % of spot — below those floors the leg counts as flat and the lens stays "
+                f"silent rather than picking a quadrant. Spot and IV both come from the same poll, so the two "
+                f"changes span exactly the same interval. Skew is the OI-weighted CE_IV − PE_IV across ATM ± "
+                f"{iv_lens_thresholds['skew_width']} strikes and is only consulted in the price-up + IV-up "
+                f"quadrant. The lens does not feed into the Master Signal, the VWAP Trend Read or the "
+                f"Institutional Footprint — it gates them."
             )
 
     st.markdown("---")
@@ -1909,7 +2030,7 @@ if total_checks:
 st.markdown("---")
 
 # ==========================================
-# INSTITUTIONAL FOOTPRINT SIGNAL (new — independent of Master Signal & VWAP Trend)
+# INSTITUTIONAL FOOTPRINT SIGNAL (independent of Master Signal, VWAP Trend & IV Lens)
 # ==========================================
 if show_footprint_panel:
     st.subheader("🕵️ Institutional Footprint Signal")
