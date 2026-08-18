@@ -157,9 +157,19 @@ DEFAULT_IV_LENS_THRESHOLDS = {
     "adaptive_iv_min": 0.30, "adaptive_iv_max": 6.00,         # clamps, % of IV level
 }
 
-# ==========================================
-# PERSISTENCE (local disk + Google Sheets)
-# ==========================================
+# CONFLUENCE SCENARIO settings -- the top-of-app decision card that combines the IV
+# Lens (environment) with Choi flow (trigger) and PCR (standing OI) into one of:
+#   A  Perfect CE Buy    -- lens bullish + flow bullish
+#   B  Perfect PE Buy    -- lens bearish + flow bearish
+#   C  Stay Away         -- lens and flow disagree (or a hard stand-down fires)
+#   WAIT                 -- no environment read, or flow not confirming either way
+DEFAULT_SCENARIO_THRESHOLDS = {
+    "choi_neutral_band": 5.0,        # |Choi_PE - Choi_CE| below this -> flow is neutral, no trigger
+    "level_proximity_strikes": 2,    # within N strikes of the wall counts as "at support/resistance"
+    "pcr_bullish": 1.0,              # PCR above this reads bullish on paper (the Scenario C tension)
+}
+
+
 SNAPSHOT_DIR = Path("nifty_oi_snapshots")
 SNAPSHOT_DIR.mkdir(exist_ok=True)
 LOG_DIR = Path("nifty_session_logs")
@@ -870,7 +880,127 @@ def apply_iv_lens(measured, iv_skew, t: dict):
     }
 
 
-def build_iv_price_chart(series_df: pd.DataFrame, window_start=None, window_end=None):
+def evaluate_confluence_scenario(iv_lens, choi_ce, choi_pe, pcr, spot,
+                                 support_strike, resistance_strike, t: dict,
+                                 distribution_hard_stop: bool = False):
+    """Combines the IV Lens (environment) with Choi flow (trigger) and PCR
+    (standing OI) into a single A / B / C / WAIT verdict.
+
+    The organising idea is AGREEMENT vs CONTRADICTION, not the lens state alone:
+    Scenario B and Scenario C both fire on a bearish lens, so the thing that
+    separates them has to be whether today's flow confirms the environment or
+    fights it. Flow confirming -> take the trade (B). Flow contradicting ->
+    stand aside (C). PCR is standing OI from yesterday's positions, so when it
+    disagrees with both the lens and today's flow it downgrades conviction
+    rather than blocking -- otherwise a stale number would veto a live one.
+
+    `distribution_hard_stop` restores the stricter original rule (price down +
+    IV up = stand down unconditionally, so B can only fire on Fear Bid).
+
+    Level context: Shakeout is only 'longable at support' and Fear Bid only
+    'shortable at resistance', per the spec. Those are reported as conviction
+    flags rather than hard gates, because the OI walls move intraday and a
+    hard gate on a shifting level would silently suppress valid setups.
+
+    Returns None when there's no lens object at all."""
+    if iv_lens is None:
+        return None
+
+    stance = iv_lens['stance']
+    lens_bias = {'shakeout': 'bullish', 'accumulation': 'bullish',
+                 'distribution': 'bearish', 'fear_bid': 'bearish'}.get(stance)
+
+    diff = choi_pe - choi_ce
+    band = t['choi_neutral_band']
+    flow_bias = 'bullish' if diff > band else ('bearish' if diff < -band else 'neutral')
+    flow_txt = f"Choi_PE {choi_pe:.1f}% vs Choi_CE {choi_ce:.1f}% (Δ {diff:+.1f})"
+
+    prox = t['level_proximity_strikes'] * STRIKE_STEP
+    at_support = bool(spot and support_strike and abs(spot - support_strike) <= prox)
+    at_resistance = bool(spot and resistance_strike and abs(spot - resistance_strike) <= prox)
+
+    checks, warnings = [], []
+    checks.append(("IV Lens environment",
+                   iv_lens['headline'].split(" — ")[0] if lens_bias else "no read",
+                   lens_bias is not None))
+    checks.append(("Choi flow trigger",
+                   {'bullish': 'Put writers defending', 'bearish': 'Call writers attacking',
+                    'neutral': 'no clear side'}[flow_bias] + f" — {flow_txt}",
+                   flow_bias != 'neutral'))
+
+    # --- resolve ---------------------------------------------------------
+    if lens_bias is None:
+        scen, side, color = "WAIT", None, "#6c757d"
+        headline = "⏸️ WAIT — no environment read"
+        action = "No trade. The IV Lens is silent, so there's nothing to confirm."
+        warnings.append("The lens is the environment half of this setup. Without it, Choi flow alone "
+                        "is a trigger with nothing to trigger against.")
+    elif distribution_hard_stop and stance == 'distribution':
+        scen, side, color = "C", None, "#c82333"
+        headline = "⛔ SCENARIO C — STAND DOWN (distribution)"
+        action = "No trade. Distribution is set as an absolute stand-down."
+        warnings.append("Price falling into rising IV. The hard-stop toggle is on, so this blocks shorts "
+                        "as well as longs — switch it off in the sidebar to allow a flow-confirmed PE buy here.")
+    elif flow_bias == 'neutral':
+        scen, side, color = "WAIT", None, "#6c757d"
+        headline = "⏸️ WAIT — environment set, flow not confirming"
+        action = f"No trade yet. Environment is {lens_bias}, but Choi is inside the ±{band:.0f} neutral band."
+        warnings.append("This is the half-setup: the environment is in place but nobody has committed yet. "
+                        "Watch for Choi to separate.")
+    elif lens_bias != flow_bias:
+        scen, side, color = "C", None, "#c82333"
+        headline = "⛔ SCENARIO C — STAY AWAY (lens vs flow conflict)"
+        action = "DO NOT TRADE. The environment and the live flow are pointing opposite ways."
+        warnings.append(f"IV Lens reads **{lens_bias}** while Choi flow reads **{flow_bias}**. This is the "
+                        f"exact trap the scenario is built to catch — one of the two is wrong and there's no "
+                        f"way to know which in advance.")
+    elif lens_bias == 'bullish':
+        scen, side, color = "A", "CE", "#1e7e34"
+        headline = "🟢 SCENARIO A — CE BUY (long)"
+        action = "Execute the CE Buy. Environment favourable, flow confirming."
+    else:
+        scen, side, color = "B", "PE", "#c82333"
+        headline = "🔴 SCENARIO B — PE BUY (short)"
+        action = "Execute the PE Buy. Environment fearful, flow confirming the breakdown."
+
+    # --- conviction qualifiers (never flip the verdict, only grade it) ----
+    if scen in ("A", "B"):
+        if stance == 'shakeout':
+            checks.append(("At support (required for Shakeout)",
+                           f"put floor {support_strike:.0f}" if support_strike else "no put floor found",
+                           at_support))
+            if not at_support:
+                warnings.append("Shakeout is only longable **at support** — spot isn't near the put floor, "
+                                "so this is a weaker version of Scenario A.")
+        if stance == 'fear_bid':
+            checks.append(("At resistance (required for Fear Bid)",
+                           f"call wall {resistance_strike:.0f}" if resistance_strike else "no call wall found",
+                           at_resistance))
+            if not at_resistance:
+                warnings.append("Fear Bid is only shortable **at resistance** — spot isn't near the call wall, "
+                                "so this is a weaker version of Scenario B.")
+        if stance == 'fear_bid' and not iv_lens['fade_confirmed']:
+            warnings.append("Skew hasn't flipped negative, so the squeeze fade isn't confirmed. The short is "
+                            "the earlier, riskier version of this setup.")
+
+        pcr_agrees = (pcr > t['pcr_bullish']) if side == 'CE' else (pcr <= t['pcr_bullish'])
+        checks.append(("Standing OI (PCR) agrees", f"PCR {pcr:.2f}" if pd.notna(pcr) else "n/a", bool(pcr_agrees)))
+        if not pcr_agrees:
+            warnings.append(f"PCR {pcr:.2f} points the other way. That's yesterday's standing OI against today's "
+                            f"live IV and flow — it doesn't block the trade, but it's the Scenario C tension "
+                            f"showing up, so size down.")
+
+    met = sum(1 for _, _, ok in checks if ok)
+    return {
+        'scenario': scen, 'side': side, 'headline': headline, 'action': action, 'color': color,
+        'lens_bias': lens_bias, 'flow_bias': flow_bias, 'checks': checks, 'warnings': warnings,
+        'conviction': met, 'conviction_total': len(checks),
+        'at_support': at_support, 'at_resistance': at_resistance,
+        'support_strike': support_strike, 'resistance_strike': resistance_strike,
+    }
+
+
+
     """Dual-axis session view of spot (left) against ATM IV (right) — the visual
     behind the lens verdict, so you can see whether the two lines are converging
     or diverging rather than trusting a single label."""
@@ -1268,7 +1398,7 @@ for key, default in [
     ('baseline_source', None), ('last_gsheet_write', None),
     ('session_log', []), ('vwap_session_start', None), ('token_status', None),
     ('ohlc_df', None), ('last_candle_fetch', None), ('vwap_confirmed_alert_side', None),
-    ('iv_lens_alert_stance', None),
+    ('iv_lens_alert_stance', None), ('scenario_alert', None),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -1439,6 +1569,25 @@ with st.sidebar:
             value=DEFAULT_IV_LENS_THRESHOLDS['skew_width'])
 
     st.markdown("---")
+    with st.expander("🎯 Confluence Scenario (top card)", expanded=True):
+        show_scenario_card = st.checkbox("Show the A/B/C decision card at the top", value=True)
+        scen_choi_band = st.number_input(
+            "Choi neutral band (±%)", value=DEFAULT_SCENARIO_THRESHOLDS['choi_neutral_band'], step=1.0,
+            help="|Choi_PE − Choi_CE| inside this band counts as no trigger, so the card waits instead of "
+                 "acting on a coin-flip flow reading.")
+        scen_level_prox = st.number_input(
+            "'At support/resistance' means within N strikes", min_value=1, max_value=8,
+            value=DEFAULT_SCENARIO_THRESHOLDS['level_proximity_strikes'])
+        scen_wall_width = st.number_input(
+            "Wall search band (ATM ± N strikes)", min_value=2, max_value=20, value=OI_PROFILE_WIDTH,
+            help="Where to look for the max-CE-OI call wall and max-PE-OI put floor.")
+        distribution_hard_stop = st.checkbox(
+            "Distribution is an absolute stand-down (blocks Scenario B too)", value=False,
+            help="Off (default): a Distribution environment with confirming bearish flow fires Scenario B. "
+                 "On: restores your original rule — price down + IV up means no trade at all, in either "
+                 "direction, however good the flow looks.")
+
+    st.markdown("---")
     with st.expander("🕵️ Institutional Footprint", expanded=True):
         show_footprint_panel = st.checkbox("Show live Institutional Footprint signal", value=True)
         footprint_width = st.number_input(
@@ -1482,6 +1631,12 @@ iv_lens_thresholds = {
     "adaptive_price_max": DEFAULT_IV_LENS_THRESHOLDS['adaptive_price_max'],
     "adaptive_iv_min": DEFAULT_IV_LENS_THRESHOLDS['adaptive_iv_min'],
     "adaptive_iv_max": DEFAULT_IV_LENS_THRESHOLDS['adaptive_iv_max'],
+}
+
+scenario_thresholds = {
+    "choi_neutral_band": scen_choi_band,
+    "level_proximity_strikes": int(scen_level_prox),
+    "pcr_bullish": DEFAULT_SCENARIO_THRESHOLDS['pcr_bullish'],
 }
 
 pcr_thresholds = {"overbought": overbought_th, "bullish": bullish_th, "bearish": bearish_th}
@@ -1656,6 +1811,26 @@ if iv_lens and iv_lens['stance'] != 'no_read':
 else:
     st.session_state.iv_lens_alert_stance = None
 
+# ==========================================
+# CONFLUENCE SCENARIO — IV Lens (environment) + Choi (trigger) + PCR (standing OI)
+# ==========================================
+# Walls are computed independently of the chart's OI-profile overlay so the card
+# keeps working with the candlestick panel switched off.
+_scen_walls = build_oi_profile(df, atm_strike, int(scen_wall_width))
+scenario = evaluate_confluence_scenario(
+    iv_lens, zb['choi_ce'], zb['choi_pe'], za['pcr'], spot,
+    _scen_walls['max_pe_strike'] if _scen_walls else None,
+    _scen_walls['max_ce_strike'] if _scen_walls else None,
+    scenario_thresholds, distribution_hard_stop=distribution_hard_stop,
+)
+
+if scenario and scenario['scenario'] in ('A', 'B'):
+    if st.session_state.scenario_alert != scenario['scenario']:
+        st.toast(f"🎯 {scenario['headline']}", icon="🎯")
+        st.session_state.scenario_alert = scenario['scenario']
+elif scenario is None or scenario['scenario'] not in ('A', 'B'):
+    st.session_state.scenario_alert = None
+
 # Confluence agreement counter (informational only)
 bullish_signals = sig in ("Strong CE Buy", "PE writers strong") or zb['signal'] in ("Buy CE", "Write PE")
 bearish_signals = sig in ("Strong PE Buy", "CE writers strong") or zb['signal'] in ("Buy PE", "Write CE")
@@ -1700,6 +1875,10 @@ if is_open:
         'IV_Lens_dPrice_pct': round(iv_measured['price_chg_pct'], 3) if (iv_measured and iv_measured.get('ready')) else None,
         'IV_Lens_dIV_pct': round(iv_measured['iv_chg_pct'], 2) if (iv_measured and iv_measured.get('ready')) else None,
         'IV_Lens_Price_Floor': round(iv_measured['price_floor'], 3) if (iv_measured and iv_measured.get('ready')) else None,
+        # --- Confluence Scenario ---
+        'Scenario': scenario['scenario'] if scenario else None,
+        'Scenario_Side': scenario['side'] if scenario else None,
+        'Scenario_Conviction': f"{scenario['conviction']}/{scenario['conviction_total']}" if scenario else None,
     }
     st.session_state.session_log.append(log_row)
     append_log_row(log_row, today_str)
@@ -1713,6 +1892,67 @@ signal_colors = {
     "Strong PE Buy": "#c82333", "CE writers strong": "#dc3545",
     "wait for data confirmation": "#6c757d",
 }
+
+# ==========================================
+# UI — CONFLUENCE SCENARIO CARD (top of app: the decision)
+# ==========================================
+if show_scenario_card:
+    if scenario is None:
+        st.markdown("""
+<div style='background-color:#6c757d;padding:20px;border-radius:10px;margin:10px 0;'>
+    <h3 style='color:white;margin:0;'>🎯 Confluence Scenario — waiting for data</h3>
+    <p style='color:white;margin:6px 0 0 0;'>The IV Lens needs a few minutes of logged Spot + ATM IV
+    before the environment half of the setup exists.</p>
+</div>""", unsafe_allow_html=True)
+    else:
+        side_txt = f" &nbsp;|&nbsp; Side: <b>{scenario['side']}</b>" if scenario['side'] else ""
+        st.markdown(f"""
+<div style='background-color:{scenario['color']};padding:22px;border-radius:10px;margin:10px 0;'>
+    <h2 style='color:white;margin:0;'>{scenario['headline']}</h2>
+    <p style='color:white;margin:10px 0 0 0;font-size:1.05em;'>{scenario['action']}</p>
+    <p style='color:white;margin:8px 0 0 0;'>Environment: <b>{scenario['lens_bias'] or 'no read'}</b>
+    &nbsp;|&nbsp; Flow: <b>{scenario['flow_bias']}</b>{side_txt}
+    &nbsp;|&nbsp; Confirmations: <b>{scenario['conviction']}/{scenario['conviction_total']}</b></p>
+</div>""", unsafe_allow_html=True)
+
+        sc_cols = st.columns(len(scenario['checks']))
+        for col, (label, detail, ok) in zip(sc_cols, scenario['checks']):
+            with col:
+                st.markdown(f"{'✅' if ok else '❌'} **{label}**")
+                st.caption(detail)
+
+        for w in scenario['warnings']:
+            if scenario['scenario'] == 'C':
+                st.error(w)
+            elif scenario['scenario'] == 'WAIT':
+                st.info(w)
+            else:
+                st.warning(w)
+
+        with st.expander("How this card decides"):
+            st.markdown(
+                "| Environment (IV Lens) | Flow (Choi) | Verdict |\n|---|---|---|\n"
+                "| Shakeout / Conviction | Choi_PE > Choi_CE | 🟢 **A — CE Buy** |\n"
+                "| Distribution / Fear Bid | Choi_CE > Choi_PE | 🔴 **B — PE Buy** |\n"
+                "| Either | flow points the **other** way | ⛔ **C — Stay Away** |\n"
+                "| Either | flow inside the neutral band | ⏸️ **WAIT** |\n"
+                "| No lens read | anything | ⏸️ **WAIT** |\n"
+            )
+            st.caption(
+                f"Scenarios B and C both key off a bearish environment, so what separates them is whether "
+                f"today's flow **confirms** it (B, trade) or **contradicts** it (C, stand aside). PCR is "
+                f"standing OI carried from yesterday, so when it disagrees it downgrades conviction rather "
+                f"than blocking — a stale number shouldn't veto a live one. Shakeout additionally wants spot "
+                f"near the put floor and Fear Bid near the call wall (within "
+                f"{scenario_thresholds['level_proximity_strikes']} strikes); missing that is flagged as a "
+                f"weaker setup, not a block, because the walls move intraday. "
+                + ("Distribution is currently set as an absolute stand-down, so Scenario B can only fire on "
+                   "Fear Bid." if distribution_hard_stop else
+                   "Distribution currently permits a flow-confirmed Scenario B short; the sidebar toggle "
+                   "restores the absolute stand-down.")
+            )
+    st.markdown("---")
+
 st.markdown(f"""
 <div style='background-color:{signal_colors.get(sig, "#6c757d")};padding:24px;border-radius:10px;
 text-align:center;margin:10px 0;'>
