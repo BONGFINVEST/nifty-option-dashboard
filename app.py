@@ -1000,7 +1000,7 @@ def evaluate_confluence_scenario(iv_lens, choi_ce, choi_pe, pcr, spot,
     }
 
 
-
+def build_iv_price_chart(series_df: pd.DataFrame, window_start=None, window_end=None):
     """Dual-axis session view of spot (left) against ATM IV (right) — the visual
     behind the lens verdict, so you can see whether the two lines are converging
     or diverging rather than trusting a single label."""
