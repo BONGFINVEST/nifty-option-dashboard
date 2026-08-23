@@ -1041,18 +1041,26 @@ def build_iv_price_chart(series_df: pd.DataFrame, window_start=None, window_end=
 # BUILDUP DETECTION (new — Option Chain visual: long/short buildup,
 # short covering, long unwinding, per option leg)
 # ==========================================
-# Raw quadrant label -> (emoji label, cell tint, what it implies for NIFTY).
-# The underlying-bias column is the part that isn't obvious: a call being
-# WRITTEN and a put being BOUGHT are different labels but the same bearish
-# message, so the table spells that out rather than making you translate.
+# Raw quadrant label -> (glyph label, bar pattern). Note the glyphs are
+# deliberately DIRECTION-NEUTRAL (▲▼↺↘ describe the position action, not a
+# market view) and the tints live in BUILDUP_BIAS_TINT instead. Colouring by
+# buildup type was actively misleading: PE Short Buildup is put writing, which
+# is bullish support, but it rendered in the same red as CE Short Buildup.
+# Throughout this section colour now means DIRECTION FOR NIFTY, and the type
+# is carried by the glyph, the bar pattern and the label text.
 BUILDUP_STYLES = {
-    "Long Buildup":    {"label": "🟢 Long Buildup",   "tint": "#d4edda"},
-    "Short Buildup":   {"label": "🔴 Short Buildup",  "tint": "#f8d7da"},
-    "Short Covering":  {"label": "🔵 Short Covering", "tint": "#cfe2ff"},
-    "Long Unwinding":  {"label": "🟠 Long Unwinding", "tint": "#ffe5d0"},
-    "Flat":            {"label": "⚪ Flat",           "tint": ""},
-    "No data":         {"label": "— No data",        "tint": ""},
+    "Long Buildup":    {"label": "▲ Long Buildup",    "pattern": ""},
+    "Short Buildup":   {"label": "▼ Short Buildup",   "pattern": "/"},
+    "Short Covering":  {"label": "↺ Short Covering",  "pattern": "x"},
+    "Long Unwinding":  {"label": "↘ Long Unwinding",  "pattern": "."},
+    "Flat":            {"label": "· Flat",            "pattern": ""},
+    "No data":         {"label": "— No data",         "pattern": ""},
 }
+
+# The only colour axis in this section: what it means for the underlying.
+BUILDUP_BIAS_COLOR = {"bullish": "#28a745", "bearish": "#dc3545", "": "#adb5bd"}
+BUILDUP_BIAS_TINT = {"bullish": "background-color: #d4edda",
+                     "bearish": "background-color: #f8d7da", "": ""}
 
 # leg -> raw buildup -> bias for the UNDERLYING (not for the option itself)
 BUILDUP_BIAS = {
@@ -2703,9 +2711,6 @@ if show_buildup:
         bt = buildup_table
         legs = {"Both legs": ('CE', 'PE'), "CE only": ('CE',), "PE only": ('PE',)}[buildup_view]
         bfig = go.Figure()
-        bar_colors = {"Long Buildup": "#28a745", "Short Buildup": "#dc3545",
-                      "Short Covering": "#0d6efd", "Long Unwinding": "#fd7e14",
-                      "Flat": "#adb5bd", "No data": "#e9ecef"}
         for leg in legs:
             # CE plotted upward, PE downward, so the two sides read as a
             # diverging profile against the strike ladder instead of overlapping.
@@ -2714,12 +2719,17 @@ if show_buildup:
                 sl = bt[bt[f'{leg}_Buildup'] == label]
                 if sl.empty:
                     continue
+                bias = BUILDUP_BIAS[leg].get(label, "")
+                bias_txt = f" — {bias}" if bias else ""
                 bfig.add_trace(go.Bar(
                     x=sl['Strike'], y=sl[f'{leg}_OI_chg'] * sign,
-                    name=f"{leg} {label}", marker_color=bar_colors[label],
-                    opacity=0.55 if label == "Flat" else 0.95,
-                    legendgroup=label,
-                    hovertemplate=(f"{leg} %{{x:.0f}}<br>{label}"
+                    name=f"{leg} {label}{bias_txt}",
+                    marker=dict(color=BUILDUP_BIAS_COLOR[bias],
+                                pattern_shape=BUILDUP_STYLES[label]['pattern'],
+                                pattern_fgcolor="rgba(255,255,255,0.75)", pattern_size=5,
+                                line=dict(width=0)),
+                    opacity=0.5 if label == "Flat" else 0.95,
+                    hovertemplate=(f"{leg} %{{x:.0f}}<br>{label}{bias_txt}"
                                    "<br>ΔOI %{customdata[0]:,.0f} (%{customdata[1]:+.1f}%)"
                                    "<br>ΔLTP %{customdata[2]:+.1f}%<extra></extra>"),
                     customdata=np.stack([sl[f'{leg}_OI_chg'], sl[f'{leg}_OI_chg_pct'].fillna(0),
@@ -2735,7 +2745,11 @@ if show_buildup:
             yaxis_title="ΔOI  (CE plotted up · PE plotted down)")
         st.plotly_chart(bfig, use_container_width=True)
         st.caption("CE bars point up, PE bars down, so each strike shows both legs without overlapping. "
-                   "Bar height is today's OI change; colour is the buildup type.")
+                   "**Colour = direction for NIFTY** (green bullish, red bearish), bar height = today's OI "
+                   "change, fill pattern = buildup type: solid ▲ Long Buildup, diagonal ▼ Short Buildup, "
+                   "cross ↺ Short Covering, dotted ↘ Long Unwinding. So a large red bar pointing down is "
+                   "put *buying*, while a large green bar pointing down is put *writing* — both are PE, "
+                   "opposite messages.")
 
         # --- Colour-coded per-strike table ------------------------------------
         show_cols = ['Strike', 'CE_LTP_chg_pct', 'CE_OI_chg', 'CE_Buildup', 'CE_Bias',
@@ -2746,15 +2760,20 @@ if show_buildup:
         for c in ('CE_Buildup', 'PE_Buildup'):
             disp[c] = disp[c].map(lambda b: BUILDUP_STYLES.get(b, {}).get('label', b))
 
-        def _buildup_cell(val):
-            for raw, sty in BUILDUP_STYLES.items():
-                if sty['label'] == val and sty['tint']:
-                    return f"background-color: {sty['tint']}"
-            return ''
-
         def _bias_cell(val):
-            return ('background-color: #d4edda' if val == 'bullish'
-                    else 'background-color: #f8d7da' if val == 'bearish' else '')
+            return BUILDUP_BIAS_TINT.get(val, '')
+
+        def _buildup_cell_by_bias(col):
+            """Tint the Buildup cell using its OWN leg's bias, so the label and
+            the colour on a single row can never disagree — a PE Short Buildup
+            row is green because put writing is bullish, even though 'Short'
+            reads bearish at a glance."""
+            leg = 'CE' if col.name.startswith('CE') else 'PE'
+            out = []
+            for v in col:
+                raw = next((k for k, s in BUILDUP_STYLES.items() if s['label'] == v), None)
+                out.append(BUILDUP_BIAS_TINT.get(BUILDUP_BIAS[leg].get(raw, ''), ''))
+            return out
 
         # Same manual-CSS approach as the Footprint table (no matplotlib on
         # Streamlit Cloud), wrapped so a styling hiccup degrades to a plain table.
@@ -2762,25 +2781,25 @@ if show_buildup:
             sty = disp.style.format({'CE_LTP_chg_pct': '{:+.1f}%', 'PE_LTP_chg_pct': '{:+.1f}%',
                                      'CE_OI_chg': '{:+,.0f}', 'PE_OI_chg': '{:+,.0f}',
                                      'Strike': '{:.0f}'}, na_rep='—')
+            sty = sty.apply(_buildup_cell_by_bias, subset=['CE_Buildup', 'PE_Buildup'])
             mf = sty.map if hasattr(sty, 'map') else sty.applymap
-            sty = mf(_buildup_cell, subset=['CE_Buildup', 'PE_Buildup'])
-            mf2 = sty.map if hasattr(sty, 'map') else sty.applymap
-            sty = mf2(_bias_cell, subset=['CE_Bias', 'PE_Bias'])
+            sty = mf(_bias_cell, subset=['CE_Bias', 'PE_Bias'])
             st.dataframe(sty, use_container_width=True, height=420)
         except Exception:
             st.dataframe(disp, use_container_width=True, height=420)
 
         with st.expander("How to read this"):
             st.markdown(
-                "| Option price | Open interest | Label | What it means |\n|---|---|---|---|\n"
-                "| ↑ Up | ↑ Up | 🟢 **Long Buildup** | Fresh buyers taking that leg on |\n"
-                "| ↓ Down | ↑ Up | 🔴 **Short Buildup** | Fresh writers selling that leg |\n"
-                "| ↑ Up | ↓ Down | 🔵 **Short Covering** | Writers buying back — often the sharpest moves |\n"
-                "| ↓ Down | ↓ Down | 🟠 **Long Unwinding** | Buyers giving up and exiting |\n\n"
-                "**The bias column is the translation step.** A call being *written* and a put being "
-                "*bought* carry the same bearish message for NIFTY under different labels — and vice versa. "
-                "So CE Short Buildup and PE Long Buildup both read bearish; PE Short Buildup and CE Long "
-                "Buildup both read bullish."
+                "| Option price | Open interest | Label | On a CALL | On a PUT |\n|---|---|---|---|---|\n"
+                "| ↑ Up | ↑ Up | ▲ **Long Buildup** | 🟢 Bullish — call buying | 🔴 Bearish — put buying |\n"
+                "| ↓ Down | ↑ Up | ▼ **Short Buildup** | 🔴 Bearish — call writing | 🟢 Bullish — put writing |\n"
+                "| ↑ Up | ↓ Down | ↺ **Short Covering** | 🟢 Bullish — call writers buying back | 🔴 Bearish — put writers buying back |\n"
+                "| ↓ Down | ↓ Down | ↘ **Long Unwinding** | 🔴 Bearish — call buyers exiting | 🟢 Bullish — put buyers exiting |\n\n"
+                "**The same label flips meaning between the legs**, which is why colour here always means "
+                "direction for NIFTY rather than buildup type. Short Buildup on a call is writers capping "
+                "upside; Short Buildup on a put is writers defending a floor. Identical label, opposite "
+                "message — so the bars are green or red by what it does to the index, and the glyph and "
+                "fill pattern tell you which of the four types produced it."
             )
             st.caption(
                 f"Both legs are measured over the same interval — option LTP vs its previous close, OI vs "
