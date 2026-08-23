@@ -1156,8 +1156,24 @@ def summarize_buildup(bt: pd.DataFrame, spot):
     else:
         verdict, color = "⚪ Mixed / two-way buildup", "#6c757d"
 
+    # Complete 2x4 matrix, zeros included. Absent categories previously just
+    # disappeared, which reads as a broken feature rather than as "no CE Long
+    # Buildup happened today" -- a real and fairly common state, e.g. when both
+    # legs are bleeding to IV crush and nothing anywhere is being bought.
+    matrix = {}
+    for leg in ('CE', 'PE'):
+        for lab in ("Long Buildup", "Short Buildup", "Short Covering", "Long Unwinding"):
+            sub = a[(a['leg'] == leg) & (a['buildup'] == lab)]
+            matrix[(leg, lab)] = {
+                'weight': float(sub['weight'].sum()),
+                'strikes': int(len(sub)),
+                'bias': BUILDUP_BIAS[leg][lab],
+                'top_strike': float(sub.loc[sub['weight'].idxmax(), 'strike']) if not sub.empty else None,
+            }
+
     return {'bull_weight': bull, 'bear_weight': bear, 'net_pct': net_pct,
             'verdict': verdict, 'color': color, 'counts': counts, 'detail': a,
+            'matrix': matrix,
             'top_leg': top['leg'], 'top_strike': top['strike'],
             'top_buildup': top['buildup'], 'top_weight': top['weight'], 'top_side': side}
 
@@ -2707,6 +2723,29 @@ if show_buildup:
         bc3.metric("Net", f"{bsum['net_pct']:+.0f}%",
                    "OI-change weighted, not a strike count")
 
+        # --- Complete 2x4 breakdown, zeros shown explicitly -------------------
+        st.markdown("**All four buildup types, both legs** — a zero here means that "
+                    "combination genuinely didn't occur in the band, not that it's missing.")
+        grid_rows = []
+        for lab in ("Long Buildup", "Short Buildup", "Short Covering", "Long Unwinding"):
+            row = {'Buildup type': BUILDUP_STYLES[lab]['label']}
+            for leg in ('CE', 'PE'):
+                m = bsum['matrix'][(leg, lab)]
+                mark = "🟢" if m['bias'] == 'bullish' else "🔴"
+                row[f'{leg} ({mark} {m["bias"]})'] = (
+                    "—" if m['strikes'] == 0
+                    else f"{m['weight']:,.0f}  ·  {m['strikes']} strike(s)  ·  top {m['top_strike']:.0f}")
+            grid_rows.append(row)
+        st.dataframe(pd.DataFrame(grid_rows), use_container_width=True, hide_index=True)
+
+        absent = [f"{leg} {lab}" for (leg, lab), m in bsum['matrix'].items() if m['strikes'] == 0]
+        if absent:
+            st.caption(
+                f"Not present in this band right now: {', '.join(absent)}. That's common — e.g. on a day "
+                f"where both legs are bleeding to IV crush or theta, nothing is being *bought* anywhere, so "
+                f"neither leg shows Long Buildup and you only see writing and unwinding."
+            )
+
         # --- Per-strike buildup chart: OI change, coloured by buildup type -----
         bt = buildup_table
         legs = {"Both legs": ('CE', 'PE'), "CE only": ('CE',), "PE only": ('PE',)}[buildup_view]
@@ -2717,23 +2756,31 @@ if show_buildup:
             sign = 1 if leg == 'CE' else -1
             for label in ["Long Buildup", "Short Buildup", "Short Covering", "Long Unwinding", "Flat"]:
                 sl = bt[bt[f'{leg}_Buildup'] == label]
-                if sl.empty:
-                    continue
                 bias = BUILDUP_BIAS[leg].get(label, "")
                 bias_txt = f" — {bias}" if bias else ""
+                # Empty categories are still added, so the legend always shows all
+                # four types per leg. Dropping them silently made a genuinely absent
+                # category look like a missing feature.
+                pattern = dict(shape=BUILDUP_STYLES[label]['pattern'],
+                               # fillmode MUST be 'overlay'. The Plotly default is
+                               # 'replace', under which marker.color becomes the
+                               # PATTERN colour rather than the fill -- with a white
+                               # fgcolor that renders the bars white on transparent,
+                               # i.e. completely invisible.
+                               fillmode='overlay',
+                               fgcolor="rgba(255,255,255,0.55)", size=7, solidity=0.30)
                 bfig.add_trace(go.Bar(
                     x=sl['Strike'], y=sl[f'{leg}_OI_chg'] * sign,
                     name=f"{leg} {label}{bias_txt}",
-                    marker=dict(color=BUILDUP_BIAS_COLOR[bias],
-                                pattern_shape=BUILDUP_STYLES[label]['pattern'],
-                                pattern_fgcolor="rgba(255,255,255,0.75)", pattern_size=5,
-                                line=dict(width=0)),
+                    marker=dict(color=BUILDUP_BIAS_COLOR[bias], pattern=pattern,
+                                line=dict(width=0.5, color='rgba(0,0,0,0.25)')),
                     opacity=0.5 if label == "Flat" else 0.95,
                     hovertemplate=(f"{leg} %{{x:.0f}}<br>{label}{bias_txt}"
                                    "<br>ΔOI %{customdata[0]:,.0f} (%{customdata[1]:+.1f}%)"
                                    "<br>ΔLTP %{customdata[2]:+.1f}%<extra></extra>"),
-                    customdata=np.stack([sl[f'{leg}_OI_chg'], sl[f'{leg}_OI_chg_pct'].fillna(0),
-                                         sl[f'{leg}_LTP_chg_pct'].fillna(0)], axis=-1),
+                    customdata=(np.stack([sl[f'{leg}_OI_chg'], sl[f'{leg}_OI_chg_pct'].fillna(0),
+                                          sl[f'{leg}_LTP_chg_pct'].fillna(0)], axis=-1)
+                                if not sl.empty else np.empty((0, 3))),
                 ))
         if spot:
             bfig.add_vline(x=spot, line_dash="dash", line_color="#6c757d", line_width=1.4,
