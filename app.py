@@ -2724,19 +2724,26 @@ if show_buildup:
                    "OI-change weighted, not a strike count")
 
         # --- Complete 2x4 breakdown, zeros shown explicitly -------------------
-        st.markdown("**All four buildup types, both legs** — a zero here means that "
+        st.markdown("**All four buildup types, both legs** — a dash here means that "
                     "combination genuinely didn't occur in the band, not that it's missing.")
         grid_rows = []
         for lab in ("Long Buildup", "Short Buildup", "Short Covering", "Long Unwinding"):
+            # Column names are FIXED at 'CE'/'PE'. Naming them by bias instead
+            # silently split the grid into four columns, because bias flips
+            # between rows for the same leg (CE Long is bullish, CE Short is
+            # bearish), so each row produced different column keys and pandas
+            # unioned them with None-filled gaps.
             row = {'Buildup type': BUILDUP_STYLES[lab]['label']}
             for leg in ('CE', 'PE'):
                 m = bsum['matrix'][(leg, lab)]
                 mark = "🟢" if m['bias'] == 'bullish' else "🔴"
-                row[f'{leg} ({mark} {m["bias"]})'] = (
-                    "—" if m['strikes'] == 0
-                    else f"{m['weight']:,.0f}  ·  {m['strikes']} strike(s)  ·  top {m['top_strike']:.0f}")
+                row[f'{leg} leg'] = (
+                    f"{mark} {m['bias']} · —" if m['strikes'] == 0
+                    else f"{mark} {m['bias']} · {m['weight']:,.0f} · "
+                         f"{m['strikes']} strike(s) · top {m['top_strike']:.0f}")
             grid_rows.append(row)
-        st.dataframe(pd.DataFrame(grid_rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(grid_rows, columns=['Buildup type', 'CE leg', 'PE leg']),
+                     use_container_width=True, hide_index=True)
 
         absent = [f"{leg} {lab}" for (leg, lab), m in bsum['matrix'].items() if m['strikes'] == 0]
         if absent:
