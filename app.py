@@ -157,7 +157,25 @@ DEFAULT_IV_LENS_THRESHOLDS = {
     "adaptive_iv_min": 0.30, "adaptive_iv_max": 6.00,         # clamps, % of IV level
 }
 
-# CONFLUENCE SCENARIO settings -- the top-of-app decision card that combines the IV
+# BUILDUP DETECTION settings -- the classic price-vs-OI quadrant read, applied
+# per option leg in the Option Chain table:
+#
+#     Price UP   + OI UP    -> Long Buildup     (fresh buyers)
+#     Price DOWN + OI UP    -> Short Buildup    (fresh writers)
+#     Price UP   + OI DOWN  -> Short Covering   (writers buying back)
+#     Price DOWN + OI DOWN  -> Long Unwinding   (buyers exiting)
+#
+# Both legs of the comparison are measured over the SAME interval -- option LTP
+# vs its previous close, OI vs its previous OI -- so this is a whole-session
+# read, not an intraday-fresh one. It won't flip quickly through the day, which
+# is correct for this indicator but worth knowing before watching it tick.
+DEFAULT_BUILDUP_THRESHOLDS = {
+    "price_min_pct": 2.0,   # |LTP change| below this % counts as flat -> unclassified
+    "oi_min_pct": 1.0,      # |OI change| below this % of previous OI counts as flat
+    "width": 10,            # ATM +- N strikes shown in the buildup view
+}
+
+
 # Lens (environment) with Choi flow (trigger) and PCR (standing OI) into one of:
 #   A  Perfect CE Buy    -- lens bullish + flow bullish
 #   B  Perfect PE Buy    -- lens bearish + flow bearish
@@ -1020,6 +1038,123 @@ def build_iv_price_chart(series_df: pd.DataFrame, window_start=None, window_end=
 
 
 # ==========================================
+# BUILDUP DETECTION (new — Option Chain visual: long/short buildup,
+# short covering, long unwinding, per option leg)
+# ==========================================
+# Raw quadrant label -> (emoji label, cell tint, what it implies for NIFTY).
+# The underlying-bias column is the part that isn't obvious: a call being
+# WRITTEN and a put being BOUGHT are different labels but the same bearish
+# message, so the table spells that out rather than making you translate.
+BUILDUP_STYLES = {
+    "Long Buildup":    {"label": "🟢 Long Buildup",   "tint": "#d4edda"},
+    "Short Buildup":   {"label": "🔴 Short Buildup",  "tint": "#f8d7da"},
+    "Short Covering":  {"label": "🔵 Short Covering", "tint": "#cfe2ff"},
+    "Long Unwinding":  {"label": "🟠 Long Unwinding", "tint": "#ffe5d0"},
+    "Flat":            {"label": "⚪ Flat",           "tint": ""},
+    "No data":         {"label": "— No data",        "tint": ""},
+}
+
+# leg -> raw buildup -> bias for the UNDERLYING (not for the option itself)
+BUILDUP_BIAS = {
+    'CE': {"Long Buildup": "bullish", "Short Buildup": "bearish",
+           "Short Covering": "bullish", "Long Unwinding": "bearish"},
+    'PE': {"Long Buildup": "bearish", "Short Buildup": "bullish",
+           "Short Covering": "bearish", "Long Unwinding": "bullish"},
+}
+
+
+def classify_buildup(price_chg_pct, oi_chg_pct, t: dict) -> str:
+    """The four-quadrant label, with a neutral band on both axes.
+
+    Anything inside the band is 'Flat' rather than being forced into a
+    quadrant -- near-zero moves would otherwise flip label on noise and
+    make the whole column look busy when nothing is happening.
+
+    Returns 'No data' when the previous close or previous OI is missing,
+    which Dhan does return as 0 for illiquid strikes. Treating a 0 previous
+    close as a 100% price rise would paint fake Long Buildup across the
+    wings, so those are excluded rather than guessed at."""
+    if price_chg_pct is None or oi_chg_pct is None or pd.isna(price_chg_pct) or pd.isna(oi_chg_pct):
+        return "No data"
+    if abs(price_chg_pct) < t['price_min_pct'] or abs(oi_chg_pct) < t['oi_min_pct']:
+        return "Flat"
+    if price_chg_pct > 0 and oi_chg_pct > 0:
+        return "Long Buildup"
+    if price_chg_pct < 0 and oi_chg_pct > 0:
+        return "Short Buildup"
+    if price_chg_pct > 0 and oi_chg_pct < 0:
+        return "Short Covering"
+    return "Long Unwinding"
+
+
+def compute_buildup_table(df: pd.DataFrame, atm: float, width: int, t: dict) -> pd.DataFrame:
+    """Per-strike buildup for both legs across ATM +- width strikes."""
+    z = df[(df['Strike'] >= atm - width * STRIKE_STEP) &
+           (df['Strike'] <= atm + width * STRIKE_STEP)].copy()
+    if z.empty:
+        return z
+
+    for leg in ('CE', 'PE'):
+        prev_ltp = pd.to_numeric(z.get(f'{leg}_prevClose'), errors='coerce')
+        prev_oi = pd.to_numeric(z.get(f'{leg}_OI_prev'), errors='coerce')
+        ltp = pd.to_numeric(z[f'{leg}_LTP'], errors='coerce')
+        oi_chg = pd.to_numeric(z[f'{leg}_OI_chg'], errors='coerce')
+
+        z[f'{leg}_LTP_chg_pct'] = np.where(prev_ltp > 0, (ltp - prev_ltp) / prev_ltp * 100, np.nan)
+        z[f'{leg}_OI_chg_pct'] = np.where(prev_oi > 0, oi_chg / prev_oi * 100, np.nan)
+        z[f'{leg}_Buildup'] = [
+            classify_buildup(p, o, t)
+            for p, o in zip(z[f'{leg}_LTP_chg_pct'], z[f'{leg}_OI_chg_pct'])
+        ]
+        z[f'{leg}_Bias'] = [BUILDUP_BIAS[leg].get(b, "") for b in z[f'{leg}_Buildup']]
+    return z.reset_index(drop=True)
+
+
+def summarize_buildup(bt: pd.DataFrame, spot):
+    """Rolls the per-strike labels into a directional tally.
+
+    Strikes are weighted by the SIZE of the OI change, not counted equally:
+    one strike where 6M contracts were written matters more than four wing
+    strikes that moved a few thousand each, and an unweighted count would
+    let the thin wings outvote the money."""
+    if bt.empty:
+        return None
+    rows = []
+    for leg in ('CE', 'PE'):
+        for _, r in bt.iterrows():
+            b = r[f'{leg}_Buildup']
+            if b in ("Flat", "No data"):
+                continue
+            rows.append({'leg': leg, 'strike': r['Strike'], 'buildup': b,
+                         'bias': r[f'{leg}_Bias'], 'weight': abs(r[f'{leg}_OI_chg'])})
+    if not rows:
+        return None
+    a = pd.DataFrame(rows)
+    bull = a.loc[a['bias'] == 'bullish', 'weight'].sum()
+    bear = a.loc[a['bias'] == 'bearish', 'weight'].sum()
+    total = bull + bear
+    net_pct = ((bull - bear) / total * 100) if total else 0.0
+    counts = a.groupby(['leg', 'buildup'])['weight'].sum().unstack(fill_value=0)
+
+    # Where the biggest single commitment sits, and on which side of spot.
+    top = a.loc[a['weight'].idxmax()]
+    side = ("above spot" if spot and top['strike'] > spot else
+            "below spot" if spot and top['strike'] < spot else "at spot")
+
+    if net_pct > 20:
+        verdict, color = "🟢 Net BULLISH buildup", "#1e7e34"
+    elif net_pct < -20:
+        verdict, color = "🔴 Net BEARISH buildup", "#c82333"
+    else:
+        verdict, color = "⚪ Mixed / two-way buildup", "#6c757d"
+
+    return {'bull_weight': bull, 'bear_weight': bear, 'net_pct': net_pct,
+            'verdict': verdict, 'color': color, 'counts': counts, 'detail': a,
+            'top_leg': top['leg'], 'top_strike': top['strike'],
+            'top_buildup': top['buildup'], 'top_weight': top['weight'], 'top_side': side}
+
+
+# ==========================================
 # ZONE A — PCR REGIME CLASSIFICATION (Analysis!A2:E16)
 # ==========================================
 # NOTE ON A FINDING IN YOUR ORIGINAL WORKBOOK:
@@ -1569,6 +1704,20 @@ with st.sidebar:
             value=DEFAULT_IV_LENS_THRESHOLDS['skew_width'])
 
     st.markdown("---")
+    with st.expander("🔥 Buildup Detection (option chain)", expanded=True):
+        show_buildup = st.checkbox("Show buildup columns & chart in the chain", value=True)
+        buildup_width = st.number_input(
+            "Chain band (ATM ± N strikes)", min_value=3, max_value=25,
+            value=DEFAULT_BUILDUP_THRESHOLDS['width'])
+        buildup_price_min = st.number_input(
+            "Min |LTP change| to classify (%)", value=DEFAULT_BUILDUP_THRESHOLDS['price_min_pct'], step=0.5,
+            help="Below this the strike is left unclassified rather than forced into a quadrant.")
+        buildup_oi_min = st.number_input(
+            "Min |OI change| to classify (% of prev OI)", value=DEFAULT_BUILDUP_THRESHOLDS['oi_min_pct'], step=0.5)
+        buildup_view = st.radio(
+            "Chart", ["Both legs", "CE only", "PE only"], index=0, horizontal=True)
+
+    st.markdown("---")
     with st.expander("🎯 Confluence Scenario (top card)", expanded=True):
         show_scenario_card = st.checkbox("Show the A/B/C decision card at the top", value=True)
         scen_choi_band = st.number_input(
@@ -1631,6 +1780,10 @@ iv_lens_thresholds = {
     "adaptive_price_max": DEFAULT_IV_LENS_THRESHOLDS['adaptive_price_max'],
     "adaptive_iv_min": DEFAULT_IV_LENS_THRESHOLDS['adaptive_iv_min'],
     "adaptive_iv_max": DEFAULT_IV_LENS_THRESHOLDS['adaptive_iv_max'],
+}
+
+buildup_thresholds = {
+    "price_min_pct": buildup_price_min, "oi_min_pct": buildup_oi_min, "width": int(buildup_width),
 }
 
 scenario_thresholds = {
@@ -2516,6 +2669,128 @@ display_cols = ['CE_Delta', 'CE_IV', 'CE_Volume', 'CE_OI_chg', 'CE_OI', 'CE_LTP'
                  'Strike', 'PCR',
                  'PE_LTP', 'PE_OI', 'PE_OI_chg', 'PE_Volume', 'PE_IV', 'PE_Delta']
 st.dataframe(band[display_cols].style.format(precision=2), use_container_width=True, height=420)
+
+# ==========================================
+# BUILDUP DETECTION VIEW (new — additive; the plain chain above is unchanged)
+# ==========================================
+if show_buildup:
+    st.markdown("### 🔥 Buildup Detection")
+    buildup_table = compute_buildup_table(df, atm_strike, int(buildup_width), buildup_thresholds)
+    bsum = summarize_buildup(buildup_table, spot) if not buildup_table.empty else None
+
+    if bsum is None:
+        st.caption(
+            "No strike in the band cleared the classification thresholds yet — usually means previous-close "
+            "or previous-OI values haven't populated (common right after open, or on a stale snapshot). "
+            "Lower the minimums in the sidebar if you want smaller moves classified."
+        )
+    else:
+        st.markdown(f"""
+<div style='background-color:{bsum['color']};padding:16px;border-radius:10px;margin:6px 0;'>
+    <h4 style='color:white;margin:0;'>{bsum['verdict']}</h4>
+    <p style='color:white;margin:6px 0 0 0;'>Net bias <b>{bsum['net_pct']:+.0f}%</b> (OI-change weighted)
+    &nbsp;|&nbsp; Heaviest commitment: <b>{bsum['top_leg']} {bsum['top_buildup']}</b> at
+    <b>{bsum['top_strike']:.0f}</b> ({bsum['top_side']}, {bsum['top_weight']:,.0f} contracts)</p>
+</div>""", unsafe_allow_html=True)
+
+        bc1, bc2, bc3 = st.columns(3)
+        bc1.metric("Bullish buildup weight", f"{bsum['bull_weight']:,.0f}")
+        bc2.metric("Bearish buildup weight", f"{bsum['bear_weight']:,.0f}")
+        bc3.metric("Net", f"{bsum['net_pct']:+.0f}%",
+                   "OI-change weighted, not a strike count")
+
+        # --- Per-strike buildup chart: OI change, coloured by buildup type -----
+        bt = buildup_table
+        legs = {"Both legs": ('CE', 'PE'), "CE only": ('CE',), "PE only": ('PE',)}[buildup_view]
+        bfig = go.Figure()
+        bar_colors = {"Long Buildup": "#28a745", "Short Buildup": "#dc3545",
+                      "Short Covering": "#0d6efd", "Long Unwinding": "#fd7e14",
+                      "Flat": "#adb5bd", "No data": "#e9ecef"}
+        for leg in legs:
+            # CE plotted upward, PE downward, so the two sides read as a
+            # diverging profile against the strike ladder instead of overlapping.
+            sign = 1 if leg == 'CE' else -1
+            for label in ["Long Buildup", "Short Buildup", "Short Covering", "Long Unwinding", "Flat"]:
+                sl = bt[bt[f'{leg}_Buildup'] == label]
+                if sl.empty:
+                    continue
+                bfig.add_trace(go.Bar(
+                    x=sl['Strike'], y=sl[f'{leg}_OI_chg'] * sign,
+                    name=f"{leg} {label}", marker_color=bar_colors[label],
+                    opacity=0.55 if label == "Flat" else 0.95,
+                    legendgroup=label,
+                    hovertemplate=(f"{leg} %{{x:.0f}}<br>{label}"
+                                   "<br>ΔOI %{customdata[0]:,.0f} (%{customdata[1]:+.1f}%)"
+                                   "<br>ΔLTP %{customdata[2]:+.1f}%<extra></extra>"),
+                    customdata=np.stack([sl[f'{leg}_OI_chg'], sl[f'{leg}_OI_chg_pct'].fillna(0),
+                                         sl[f'{leg}_LTP_chg_pct'].fillna(0)], axis=-1),
+                ))
+        if spot:
+            bfig.add_vline(x=spot, line_dash="dash", line_color="#6c757d", line_width=1.4,
+                           annotation_text=" spot ", annotation_position="top")
+        bfig.add_hline(y=0, line_color="gray", line_width=1)
+        bfig.update_layout(
+            barmode='relative', height=430, margin=dict(l=10, r=10, t=10, b=10),
+            legend=dict(orientation="h", y=1.12), xaxis_title="Strike",
+            yaxis_title="ΔOI  (CE plotted up · PE plotted down)")
+        st.plotly_chart(bfig, use_container_width=True)
+        st.caption("CE bars point up, PE bars down, so each strike shows both legs without overlapping. "
+                   "Bar height is today's OI change; colour is the buildup type.")
+
+        # --- Colour-coded per-strike table ------------------------------------
+        show_cols = ['Strike', 'CE_LTP_chg_pct', 'CE_OI_chg', 'CE_Buildup', 'CE_Bias',
+                     'PE_Buildup', 'PE_Bias', 'PE_OI_chg', 'PE_LTP_chg_pct']
+        disp = bt[show_cols].copy()
+        disp['ATM'] = np.where(disp['Strike'] == atm_strike, '⬅', '')
+        disp = disp[['Strike', 'ATM'] + [c for c in show_cols if c != 'Strike']]
+        for c in ('CE_Buildup', 'PE_Buildup'):
+            disp[c] = disp[c].map(lambda b: BUILDUP_STYLES.get(b, {}).get('label', b))
+
+        def _buildup_cell(val):
+            for raw, sty in BUILDUP_STYLES.items():
+                if sty['label'] == val and sty['tint']:
+                    return f"background-color: {sty['tint']}"
+            return ''
+
+        def _bias_cell(val):
+            return ('background-color: #d4edda' if val == 'bullish'
+                    else 'background-color: #f8d7da' if val == 'bearish' else '')
+
+        # Same manual-CSS approach as the Footprint table (no matplotlib on
+        # Streamlit Cloud), wrapped so a styling hiccup degrades to a plain table.
+        try:
+            sty = disp.style.format({'CE_LTP_chg_pct': '{:+.1f}%', 'PE_LTP_chg_pct': '{:+.1f}%',
+                                     'CE_OI_chg': '{:+,.0f}', 'PE_OI_chg': '{:+,.0f}',
+                                     'Strike': '{:.0f}'}, na_rep='—')
+            mf = sty.map if hasattr(sty, 'map') else sty.applymap
+            sty = mf(_buildup_cell, subset=['CE_Buildup', 'PE_Buildup'])
+            mf2 = sty.map if hasattr(sty, 'map') else sty.applymap
+            sty = mf2(_bias_cell, subset=['CE_Bias', 'PE_Bias'])
+            st.dataframe(sty, use_container_width=True, height=420)
+        except Exception:
+            st.dataframe(disp, use_container_width=True, height=420)
+
+        with st.expander("How to read this"):
+            st.markdown(
+                "| Option price | Open interest | Label | What it means |\n|---|---|---|---|\n"
+                "| ↑ Up | ↑ Up | 🟢 **Long Buildup** | Fresh buyers taking that leg on |\n"
+                "| ↓ Down | ↑ Up | 🔴 **Short Buildup** | Fresh writers selling that leg |\n"
+                "| ↑ Up | ↓ Down | 🔵 **Short Covering** | Writers buying back — often the sharpest moves |\n"
+                "| ↓ Down | ↓ Down | 🟠 **Long Unwinding** | Buyers giving up and exiting |\n\n"
+                "**The bias column is the translation step.** A call being *written* and a put being "
+                "*bought* carry the same bearish message for NIFTY under different labels — and vice versa. "
+                "So CE Short Buildup and PE Long Buildup both read bearish; PE Short Buildup and CE Long "
+                "Buildup both read bullish."
+            )
+            st.caption(
+                f"Both legs are measured over the same interval — option LTP vs its previous close, OI vs "
+                f"its previous OI — so this is a whole-session read and won't flip quickly intraday. "
+                f"Strikes below ±{buildup_price_min:.1f}% price or ±{buildup_oi_min:.1f}% OI change are left "
+                f"unclassified. One caveat worth holding: option prices move on IV and theta as well as "
+                f"direction, so a call can lose value on a flat-to-up day purely from vol collapse and get "
+                f"labelled Short Buildup. Cross-check against the Footprint and the walls before acting on a "
+                f"single strike — the aggregate net bias above is far more robust than any one row."
+            )
 
 st.markdown("---")
 
