@@ -46,6 +46,14 @@ Data source: Dhan API v2 Option Chain (see fetch_option_chain for schema notes).
 Sensibull's CSV had "CE OI change" as a pre-computed column; Dhan gives the same
 thing natively via `previous_oi` (oi - previous_oi = today's cumulative change),
 so no manual VLOOKUP/diffing is needed anymore.
+
+MOBILE READABILITY FIX (this build): every cell tint in the Buildup Detection and
+Institutional Footprint tables now sets an explicit BLACK font colour alongside its
+background. Previously the tints set only a background, so the text kept whatever
+colour it inherited from the active Streamlit theme -- dark on desktop light mode
+(readable), near-white on the mobile app's dark theme (effectively invisible on a
+pale green/pink/blue cell). Setting the foreground explicitly makes those columns
+render identically in both themes.
 """
 
 import streamlit as st
@@ -1059,8 +1067,22 @@ BUILDUP_STYLES = {
 
 # The only colour axis in this section: what it means for the underlying.
 BUILDUP_BIAS_COLOR = {"bullish": "#28a745", "bearish": "#dc3545", "": "#adb5bd"}
-BUILDUP_BIAS_TINT = {"bullish": "background-color: #d4edda",
-                     "bearish": "background-color: #f8d7da", "": ""}
+
+# MOBILE FIX: these tints MUST set an explicit foreground colour, not just a
+# background. A background-only rule leaves the text at whatever colour the
+# active Streamlit theme inherits -- dark on desktop light mode (readable on
+# #d4edda / #f8d7da), near-white on the mobile app's dark theme, which renders
+# CE_Buildup / PE_Buildup / CE_Bias / PE_Bias as white-on-pastel and effectively
+# invisible. Pinning colour to black makes those four columns read identically
+# in light and dark mode. Rows with no bias ("Flat" / "No data") deliberately
+# get NO rule at all, so they keep the theme's own text colour and stay legible
+# on a dark background rather than turning into black-on-black.
+BUILDUP_TEXT_COLOR = "#000000"
+BUILDUP_BIAS_TINT = {
+    "bullish": f"background-color: #d4edda; color: {BUILDUP_TEXT_COLOR}; font-weight: 600",
+    "bearish": f"background-color: #f8d7da; color: {BUILDUP_TEXT_COLOR}; font-weight: 600",
+    "": "",
+}
 
 # leg -> raw buildup -> bias for the UNDERLYING (not for the option itself)
 BUILDUP_BIAS = {
@@ -1740,6 +1762,11 @@ with st.sidebar:
             "Min |OI change| to classify (% of prev OI)", value=DEFAULT_BUILDUP_THRESHOLDS['oi_min_pct'], step=0.5)
         buildup_view = st.radio(
             "Chart", ["Both legs", "CE only", "PE only"], index=0, horizontal=True)
+        buildup_high_contrast = st.checkbox(
+            "High-contrast table text (mobile)", value=True,
+            help="Forces black, semi-bold text on the tinted Buildup/Bias cells. Leave this on if you read "
+                 "the app on the mobile app or in dark mode — without it those cells inherit the theme's "
+                 "near-white font and vanish against the pale green/pink tint.")
 
     st.markdown("---")
     with st.expander("🎯 Confluence Scenario (top card)", expanded=True):
@@ -1785,6 +1812,23 @@ with st.sidebar:
         fp_chgpcr_min_pct = st.number_input(
             "...OR min % of zone OI, whichever floor is higher",
             value=DEFAULT_FOOTPRINT_THRESHOLDS['chgpcr_min_ce_chg_pct_of_oi'], step=0.1)
+
+# MOBILE FIX (part 2): the same background-only problem applies to the tinted
+# IV_Skew / Vol_OI cells in the Footprint table, so those tints are built here
+# with an explicit black foreground too, driven by the same toggle.
+_TINT_FG = f"; color: {BUILDUP_TEXT_COLOR}; font-weight: 600" if buildup_high_contrast else ""
+FOOTPRINT_TINTS = {
+    'bearish': f"background-color: #f8d7da{_TINT_FG}",   # red tint — Put buying
+    'bullish': f"background-color: #d4edda{_TINT_FG}",   # green tint — Put writing
+    'fresh':   f"background-color: #cfe2ff{_TINT_FG}",   # blue tint — fresh money
+    'fakeout': f"background-color: #f8d7da{_TINT_FG}",   # red tint — fakeout risk
+}
+
+# Buildup tints follow the same toggle, so switching high-contrast off returns
+# to the original background-only behaviour rather than being baked in.
+ACTIVE_BUILDUP_TINT = BUILDUP_BIAS_TINT if buildup_high_contrast else {
+    "bullish": "background-color: #d4edda", "bearish": "background-color: #f8d7da", "": "",
+}
 
 footprint_thresholds = {
     "iv_skew_bearish": fp_iv_skew_bearish, "iv_skew_bullish": fp_iv_skew_bullish,
@@ -2616,22 +2660,26 @@ margin:6px 0;'>
             display_fp_cols = ['Strike', 'ATM', 'CE_IV', 'PE_IV', 'IV_Skew', 'CE_OI_chg', 'PE_OI_chg',
                                 'ChgPCR', 'CE_Volume', 'PE_Volume', 'Total_OI', 'Vol_OI']
 
+            # MOBILE FIX: these return FOOTPRINT_TINTS entries, which pair each
+            # background with an explicit black foreground. Returning a bare
+            # background-color left the text at the theme's inherited colour --
+            # invisible in the mobile app's dark mode.
             def _iv_skew_cell_color(val):
                 if pd.isna(val):
                     return ''
                 if val <= footprint_thresholds['iv_skew_bearish']:
-                    return 'background-color: #f8d7da'   # red tint — Put buying
+                    return FOOTPRINT_TINTS['bearish']   # Put buying
                 if val >= footprint_thresholds['iv_skew_bullish']:
-                    return 'background-color: #d4edda'   # green tint — Put writing
+                    return FOOTPRINT_TINTS['bullish']   # Put writing
                 return ''
 
             def _vol_oi_cell_color(val):
                 if pd.isna(val):
                     return ''
                 if val >= footprint_thresholds['vol_oi_fresh']:
-                    return 'background-color: #cfe2ff'   # blue tint — fresh money
+                    return FOOTPRINT_TINTS['fresh']     # fresh money
                 if val < footprint_thresholds['vol_oi_fakeout']:
-                    return 'background-color: #f8d7da'   # red tint — fakeout risk
+                    return FOOTPRINT_TINTS['fakeout']   # fakeout risk
                 return ''
 
             # Manual CSS-based highlighting (no matplotlib dependency, unlike
@@ -2814,8 +2862,13 @@ if show_buildup:
         for c in ('CE_Buildup', 'PE_Buildup'):
             disp[c] = disp[c].map(lambda b: BUILDUP_STYLES.get(b, {}).get('label', b))
 
+        # MOBILE FIX: ACTIVE_BUILDUP_TINT carries "color: #000000" alongside the
+        # background, so CE_Bias / PE_Bias / CE_Buildup / PE_Buildup stay black-on-
+        # pastel in the mobile app's dark theme instead of inheriting near-white
+        # text. Untinted cells (Flat / No data) are left alone so they keep the
+        # theme's own readable colour.
         def _bias_cell(val):
-            return BUILDUP_BIAS_TINT.get(val, '')
+            return ACTIVE_BUILDUP_TINT.get(val, '')
 
         def _buildup_cell_by_bias(col):
             """Tint the Buildup cell using its OWN leg's bias, so the label and
@@ -2826,7 +2879,7 @@ if show_buildup:
             out = []
             for v in col:
                 raw = next((k for k, s in BUILDUP_STYLES.items() if s['label'] == v), None)
-                out.append(BUILDUP_BIAS_TINT.get(BUILDUP_BIAS[leg].get(raw, ''), ''))
+                out.append(ACTIVE_BUILDUP_TINT.get(BUILDUP_BIAS[leg].get(raw, ''), ''))
             return out
 
         # Same manual-CSS approach as the Footprint table (no matplotlib on
@@ -2841,6 +2894,13 @@ if show_buildup:
             st.dataframe(sty, use_container_width=True, height=420)
         except Exception:
             st.dataframe(disp, use_container_width=True, height=420)
+
+        if buildup_high_contrast:
+            st.caption(
+                "ℹ️ Tinted cells are forced to black text so they stay readable in the mobile app's dark "
+                "theme — without that they inherit a near-white font and disappear against the pale tint. "
+                "Turn off *High-contrast table text* in the sidebar to revert to theme-default text."
+            )
 
         with st.expander("How to read this"):
             st.markdown(
