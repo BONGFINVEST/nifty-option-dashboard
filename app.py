@@ -2681,6 +2681,95 @@ def institutional_footprint_signal(iv_skew, chg_pcr, vol_oi, market_direction, t
 
 
 # ==========================================
+# READ CONFLICT — the highest-probability no-trade condition
+# ==========================================
+# Footprint and Buildup are two INDEPENDENT directional reads built from different
+# inputs. Footprint reads the vol surface and the flow ratio (IV skew, ChgPCR,
+# Vol/OI); Buildup reads price-vs-OI on every strike in the band. They are not
+# derived from one another, which is exactly why their disagreement carries
+# information that neither carries alone.
+#
+# When two independent reads of the same tape point opposite ways, the honest
+# conclusion is that positioning and flow are not aligned — not that one of them is
+# right and needs picking. Those are the sessions where a directional trade gets
+# stopped out in both directions before the market chooses, and the edge in flagging
+# it is entirely in NOT trading.
+#
+# This is deliberately advisory. It never touches the Master Signal, the Scenario
+# card or the IV Lens gate — same rule as every other read added to this app.
+def detect_read_conflict(footprint_color_key, footprint_agg, bsum,
+                         footprint_market_dir=None):
+    """Compares the two independent directional reads and returns a verdict dict,
+    or None when there is nothing to compare.
+
+    Three outcomes: CONFLICT (they point opposite ways), ALIGNED (same direction,
+    which is genuine corroboration since the inputs don't overlap), and INCONCLUSIVE
+    (at least one is neutral or mixed, which is not a conflict — it is one read
+    declining to have an opinion)."""
+    if not footprint_color_key or bsum is None:
+        return None
+
+    fp_dir = {'bullish': 1, 'bearish': -1}.get(footprint_color_key, 0)
+    net_pct = float(bsum.get('net_pct', 0.0))
+    bu_dir = 1 if net_pct > 20 else (-1 if net_pct < -20 else 0)
+
+    fp_label = {1: "BULLISH", -1: "BEARISH", 0: "NEUTRAL"}[fp_dir]
+    bu_label = {1: "BULLISH", -1: "BEARISH", 0: "MIXED"}[bu_dir]
+
+    # A Footprint read taken with unknown price direction rests on IV skew alone —
+    # its ChgPCR trap logic is switched off entirely without a direction to trap
+    # against. That is a materially weaker read and the caller deserves to know.
+    fp_weak = footprint_market_dir in (None, 'unknown')
+    chg_pcr = footprint_agg.get('chg_pcr') if footprint_agg else None
+    chg_pcr_agrees_with_buildup = None
+    if chg_pcr is not None and np.isfinite(chg_pcr) and bu_dir != 0:
+        # ChgPCR < 1 means call OI is growing faster than put OI: call writing,
+        # which leans bearish. It is a component of the Footprint but it can side
+        # with the Buildup against the Footprint's own headline.
+        chg_pcr_dir = 1 if chg_pcr > 1.0 else -1
+        chg_pcr_agrees_with_buildup = (chg_pcr_dir == bu_dir)
+
+    if fp_dir != 0 and bu_dir != 0 and fp_dir != bu_dir:
+        state, color = 'conflict', "#c82333"
+        headline = f"⚠️ READ CONFLICT — Footprint {fp_label} vs Buildup {bu_label}"
+        detail = (
+            "Two independent reads of the same tape are pointing opposite ways. Footprint is built "
+            "from the vol surface and the flow ratio; Buildup is built from price-vs-OI at every "
+            "strike. They share no inputs, so this is not one indicator contradicting itself — it is "
+            "positioning and flow genuinely out of alignment.")
+        action = ("Historically your highest-probability no-trade condition. If you take anything "
+                  "here, take it at reduced size with a wider stop, and require a live OI Velocity "
+                  "burst on your side as the tiebreak — standing OI has already proven it cannot "
+                  "settle the question.")
+    elif fp_dir != 0 and fp_dir == bu_dir:
+        state, color = 'aligned', "#1e7e34"
+        headline = f"✅ READS ALIGNED — Footprint and Buildup both {fp_label}"
+        detail = ("Two independent reads agree. Because they share no inputs, agreement is real "
+                  "corroboration rather than the same number counted twice.")
+        action = ("This is the environment for full size, subject to the gamma regime and the IV "
+                  "Lens gate below.")
+    else:
+        state, color = 'inconclusive', "#6c757d"
+        headline = f"◽ READS INCONCLUSIVE — Footprint {fp_label}, Buildup {bu_label}"
+        detail = ("At least one of the two reads has no opinion. That is not a conflict — it is a "
+                  "read declining to call a direction, which usually means the thresholds haven't "
+                  "been cleared rather than that the tape is balanced.")
+        action = "Treat direction as unconfirmed and lean on the gates below rather than on these two."
+
+    return {
+        'state': state, 'headline': headline, 'detail': detail, 'action': action,
+        'color': color, 'fp_dir': fp_dir, 'bu_dir': bu_dir,
+        'fp_label': fp_label, 'bu_label': bu_label,
+        'net_pct': net_pct, 'fp_weak': fp_weak,
+        'chg_pcr': chg_pcr, 'chg_pcr_agrees_with_buildup': chg_pcr_agrees_with_buildup,
+        'iv_skew': footprint_agg.get('iv_skew') if footprint_agg else None,
+        'vol_oi': footprint_agg.get('vol_oi') if footprint_agg else None,
+        'top_commitment': (f"{bsum.get('top_leg')} {bsum.get('top_buildup')} at "
+                           f"{bsum.get('top_strike'):.0f}") if bsum.get('top_strike') else None,
+    }
+
+
+# ==========================================
 # SESSION STATE INIT
 # ==========================================
 for key, default in [
@@ -3396,6 +3485,20 @@ footprint_headline, footprint_color_key, footprint_lines = institutional_footpri
 ) if show_footprint_panel and not footprint_table.empty else (None, None, [])
 
 # ==========================================
+# BUILDUP — computed here, not in its panel
+# ==========================================
+# This used to be calculated inside the `if show_buildup:` render block near the
+# bottom of the page. The conflict flag at the top of the app needs it, and in
+# Streamlit a value computed further down the script simply does not exist yet when
+# an earlier line runs. Computation moves up; only rendering stays down there.
+buildup_table = compute_buildup_table(df, atm_strike, int(buildup_width), buildup_thresholds) \
+    if show_buildup else pd.DataFrame()
+bsum = summarize_buildup(buildup_table, spot) if (show_buildup and not buildup_table.empty) else None
+
+# The conflict flag itself: two independent directional reads, compared.
+read_conflict = detect_read_conflict(footprint_color_key, footprint_agg, bsum, footprint_market_dir)
+
+# ==========================================
 # IV LENS — trade gate (spot change vs ATM IV change, + skew for fade confirmation)
 # ==========================================
 # Computed BEFORE the log append below, so this poll's own (Spot, ATM_IV) pair is
@@ -3598,10 +3701,99 @@ if is_open:
         'Card_Mode': decision['mode']['key'] if decision else None,
         'Card_Blocked': (", ".join(r[1] for r in decision['blocked'])
                          if (decision and decision['blocked']) else None),
+        # Logged so the tracker can eventually test the premise directly: filter the
+        # log by Read_Conflict and re-grade the directional signals inside each
+        # subset. If signals fired on 'conflict' polls grade materially worse than
+        # the same signals on 'aligned' polls, the no-trade rule is earning its keep.
+        'Read_Conflict': read_conflict['state'] if read_conflict else None,
+        'Buildup_Net_Pct': round(bsum['net_pct'], 1) if bsum else None,
     }
     st.session_state.session_log.append(log_row)
     append_log_row(log_row, today_str)
     append_log_row_to_gsheet(log_row)
+
+# ==========================================
+# UI — READ CONFLICT FLAG (very top: the no-trade check comes before the signal)
+# ==========================================
+# Placed above the Master Signal deliberately. A conflict between two independent
+# reads is a statement about whether to trade at all, and that question logically
+# precedes the question of which way. Rendering it underneath the signal would mean
+# reading a direction first and only then discovering it shouldn't be acted on.
+#
+# Both panels' key numbers are inlined here so a conflict can be assessed without
+# scrolling to the Footprint and Buildup sections further down the page.
+if read_conflict:
+    rc = read_conflict
+    if rc['state'] == 'conflict':
+        st.markdown(f"""
+<div style='background-color:{rc['color']};padding:20px;border-radius:10px;margin:4px 0 10px 0;
+border:3px solid #7d1420;'>
+    <h3 style='color:white;margin:0;'>{rc['headline']}</h3>
+    <p style='color:white;margin:10px 0 0 0;'>{rc['detail']}</p>
+    <p style='color:white;margin:10px 0 0 0;'><b>{rc['action']}</b></p>
+</div>""", unsafe_allow_html=True)
+    else:
+        st.markdown(f"""
+<div style='background-color:{rc['color']};padding:14px 18px;border-radius:10px;margin:4px 0 10px 0;'>
+    <h4 style='color:white;margin:0;'>{rc['headline']}</h4>
+    <p style='color:white;margin:6px 0 0 0;'>{rc['detail']}</p>
+</div>""", unsafe_allow_html=True)
+
+    rcc1, rcc2, rcc3, rcc4 = st.columns(4)
+    rcc1.metric("Footprint read", rc['fp_label'],
+                f"IV skew {rc['iv_skew']:+.2f}" if rc['iv_skew'] is not None and np.isfinite(rc['iv_skew']) else "")
+    rcc2.metric("Buildup read", rc['bu_label'], f"net bias {rc['net_pct']:+.0f}%")
+    rcc3.metric("ChgPCR", f"{rc['chg_pcr']:.2f}" if rc['chg_pcr'] is not None and np.isfinite(rc['chg_pcr']) else "—",
+                ("agrees with Buildup" if rc['chg_pcr_agrees_with_buildup']
+                 else "agrees with Footprint") if rc['chg_pcr_agrees_with_buildup'] is not None else "")
+    rcc4.metric("Vol/OI conviction", f"{rc['vol_oi']:.2f}" if rc['vol_oi'] is not None and np.isfinite(rc['vol_oi']) else "—",
+                "flow is real either way")
+
+    if rc['state'] == 'conflict':
+        _notes = []
+        if rc['chg_pcr_agrees_with_buildup']:
+            _notes.append(
+                f"**The conflict is less even than it looks.** ChgPCR ({rc['chg_pcr']:.2f}) is itself a "
+                f"Footprint component, and on this poll it sides with the Buildup rather than with the "
+                f"Footprint's own headline — which leaves the Footprint read resting mostly on IV skew.")
+        if rc['fp_weak']:
+            _notes.append(
+                "**The Footprint read is running on one leg.** With today's price direction unknown, its "
+                "ChgPCR trap logic is switched off entirely, so the headline is driven by IV skew alone. "
+                "That is its weakest configuration and it should not be weighted equally against a "
+                "Buildup read that has full inputs.")
+        if rc['top_commitment']:
+            _notes.append(f"**Heaviest single commitment:** {rc['top_commitment']}.")
+        if rc['vol_oi'] is not None and np.isfinite(rc['vol_oi']) and rc['vol_oi'] > 5:
+            _notes.append(
+                f"**Vol/OI at {rc['vol_oi']:.2f} does not break the tie** — it says the flow is genuine, "
+                f"not which direction it favours. High conviction on a conflicted read means both sides "
+                f"are committing real money, which is what makes the session dangerous rather than "
+                f"what resolves it.")
+        for n in _notes:
+            st.caption(n)
+
+        with st.expander("Why a disagreement is more useful than either read alone"):
+            st.markdown(
+                "These two reads share **no inputs**:\n\n"
+                "| | Footprint | Buildup |\n|---|---|---|\n"
+                "| Built from | IV skew, ChgPCR, Vol/OI | price vs previous close, OI vs previous OI |\n"
+                "| Measures | the vol surface and the flow ratio | strike-by-strike commitment |\n"
+                "| Window | today's flow | whole session, day-over-day |\n\n"
+                "So when they agree it is genuine corroboration rather than one number counted twice — "
+                "and when they disagree, neither is malfunctioning. Positioning and flow are actually "
+                "pointing different ways.\n\n"
+                "The reason this is a stand-aside rather than a puzzle to solve: on these sessions the "
+                "market has not decided either, and price tends to run stops in both directions before "
+                "it picks. Sizing down does not help much when the stop is what gets hit; not trading "
+                "does.\n\n"
+                "**Two known false-conflict cases** worth checking before trusting the flag. On a "
+                "vol-crush day, calls get labelled Short Buildup purely from IV decay rather than "
+                "direction, which manufactures a bearish Buildup read out of nothing. And on a stale or "
+                "weekend snapshot the Buildup is describing the *last* trading session, not now — the "
+                "Footprint is closer to live, so the two are measuring different days."
+            )
+    st.markdown("---")
 
 # ==========================================
 # UI — MASTER SIGNAL BANNER
@@ -3719,10 +3911,10 @@ c4.metric("CE Vol Imbalance", f"{zb['ce_vol_imbalance']:.1f}")
 st.markdown("---")
 
 # ==========================================
-# REAL-TIME CANDLESTICK CHART — Spot price action + VWAP + Max Pain trend
+# REAL-TIME CANDLESTICK CHART — step 1: what price is actually doing
 # ==========================================
 if show_candle_chart:
-    st.subheader("🕯️ Real-Time NIFTY Chart (Candlestick + VWAP + Max Pain)")
+    st.subheader("1️⃣ 🕯️ Real-Time NIFTY Chart (Candlestick + VWAP + Max Pain)")
     if ohlc_df is not None and not ohlc_df.empty:
         oi_profile = build_oi_profile(df, atm_strike, int(oi_profile_width)) if show_oi_profile else None
 
@@ -3934,10 +4126,10 @@ if show_candle_chart:
     st.markdown("---")
 
 # ==========================================
-# GAMMA EXPOSURE PANEL — the regime question every other panel assumes an answer to
+# GAMMA EXPOSURE PANEL — step 2: regime (which KIND of setup fits today's tape)
 # ==========================================
 if show_gex_panel:
-    st.subheader("⚡ Gamma Exposure (GEX) — dealer positioning & regime")
+    st.subheader("2️⃣ ⚡ Gamma Exposure (GEX) — regime: which kind of setup fits today")
     if gex is None:
         st.caption(
             "GEX unavailable this poll — needs a live spot price and non-zero gammas in the chain. "
@@ -4155,635 +4347,12 @@ if show_gex_panel:
     st.markdown("---")
 
 # ==========================================
-# OI VELOCITY PANEL — cumulative OI change turned into a rate
-# ==========================================
-if show_velocity_panel:
-    st.subheader("💥 Intraday OI Velocity (burst detector)")
-    if oi_vel is None or vel_class is None:
-        st.caption(
-            "Velocity needs two consecutive live polls to diff. It appears a few seconds after the "
-            "first live fetch of the session, stays blank while the market is closed (there is no "
-            "second poll to difference against), and is skipped on the rerun that follows a sidebar "
-            "change — that rerun refetches milliseconds after the last poll, which is not a real "
-            "interval to measure a rate over."
-        )
-    else:
-        st.markdown(f"""
-<div style='background-color:{vel_class['color']};padding:16px;border-radius:10px;margin:6px 0;'>
-    <h4 style='color:white;margin:0;'>{vel_class['headline']}</h4>
-    <p style='color:white;margin:6px 0 0 0;'>{vel_class['detail']}</p>
-</div>""", unsafe_allow_html=True)
-
-        v1, v2, v3, v4 = st.columns(4)
-        v1.metric("CE OI flow", f"{oi_vel['net_ce']:+,.0f}",
-                  f"{oi_vel['net_ce_per_min']:+,.0f}/min")
-        v2.metric("PE OI flow", f"{oi_vel['net_pe']:+,.0f}",
-                  f"{oi_vel['net_pe_per_min']:+,.0f}/min")
-        v3.metric("Net bias (PE − CE)", f"{oi_vel['net_bias']:+,.0f}",
-                  "put writing leads" if oi_vel['net_bias'] > 0 else "call writing leads")
-        v4.metric("Flow intensity", f"{oi_vel['intensity_per_min']:,.0f}/min",
-                  (f"{vel_class['rank']:.0f}th pctile of today" if vel_class['rank'] is not None
-                   else f"calibrating ({vel_class['samples']}/20 polls)"))
-
-        st.caption(
-            f"Measured across the last **{oi_vel['elapsed_s']:.0f}s** between polls, ATM ± "
-            f"{oi_vel['width']} strikes. Biggest single-strike moves this interval: "
-            f"**CE {oi_vel['ce_burst']:+,.0f}** at {oi_vel['ce_burst_strike']:.0f}, "
-            f"**PE {oi_vel['pe_burst']:+,.0f}** at {oi_vel['pe_burst_strike']:.0f}."
-        )
-
-        vfig = go.Figure()
-        vfig.add_trace(go.Bar(x=oi_vel['table']['Strike'], y=oi_vel['table']['dCE_OI'],
-                              name="ΔCE OI (this interval)", marker_color='#dc3545'))
-        vfig.add_trace(go.Bar(x=oi_vel['table']['Strike'], y=oi_vel['table']['dPE_OI'],
-                              name="ΔPE OI (this interval)", marker_color='#28a745'))
-        vfig.add_hline(y=0, line_color="gray", line_width=1)
-        if spot:
-            vfig.add_vline(x=spot, line_dash="dash", line_color="#6c757d",
-                           annotation_text=" spot ", annotation_position="top")
-        vfig.update_layout(barmode='group', height=320, margin=dict(l=10, r=10, t=30, b=10),
-                           legend=dict(orientation="h", y=1.18), xaxis_title="Strike",
-                           yaxis_title="ΔOI since last poll")
-        st.plotly_chart(vfig, use_container_width=True)
-
-        with st.expander("Why this is different from the OI change everywhere else in this app"):
-            st.markdown(
-                "Every other OI-change number here is `oi − previous_oi`: **cumulative since the open**. "
-                "That column cannot distinguish 400k contracts of put writing that arrived steadily over "
-                "four hours from the same 400k that landed in the last twenty seconds — and those are "
-                "opposite pieces of information. The first is background positioning; the second is "
-                "someone with size acting *now*.\n\n"
-                "This panel differences consecutive chain snapshots instead, so it reads the **rate**. "
-                "A burst here that agrees with the Master Signal is that signal being acted on in real "
-                "time; a burst that contradicts it is the more important of the two, because standing OI "
-                "reflects yesterday and this reflects the last ten seconds."
-            )
-            st.caption(
-                f"'Burst' = flow intensity above the {vel_class['pctile']:.0f}th percentile of today's own "
-                f"polls **and** above the {vel_class['floor']:,.0f}/min absolute floor. Both conditions are "
-                f"needed: the percentile alone would call the quietest hour of a dead day a burst, since "
-                f"something is always in the top 15% of a distribution. "
-                + (f"Today's threshold is {vel_class['threshold']:,.0f}/min across {vel_class['samples']} polls."
-                   if vel_class['threshold'] else
-                   "Still calibrating — needs 20 polls before the percentile means anything.")
-            )
-    st.markdown("---")
-
-# ==========================================
-# EXPECTED MOVE PANEL — the market's own definition of "significant"
-# ==========================================
-if show_em_panel:
-    st.subheader("🎯 Expected Move (ATM straddle)")
-    if expected_move is None:
-        st.caption("Expected move needs a priced ATM straddle — unavailable on this poll.")
-    else:
-        em = expected_move
-        e1, e2, e3, e4 = st.columns(4)
-        e1.metric("ATM straddle", f"{em['straddle']:.1f}",
-                  f"{em['ce']:.1f} CE + {em['pe']:.1f} PE")
-        e2.metric("1SD move — today", f"±{em['em_today_pts']:.0f}" if em['em_today_pts'] else "—",
-                  f"±{em['em_today_pct']:.2f}% of spot" if em['em_today_pct'] else "")
-        e3.metric("1SD move — to expiry", f"±{em['em_expiry_pts']:.0f}",
-                  f"{em['sd_factor']:.2f} × straddle")
-        e4.metric("Range used today",
-                  f"{em['range_used_pct']:.0f}%" if em['range_used_pct'] is not None else "—",
-                  f"{em['day_range']:.0f} pts of ±{em['em_today_pts']:.0f}" if (em['day_range'] and em['em_today_pts']) else "")
-
-        if em['verdict']:
-            st.markdown(f"""
-<div style='background-color:{em['verdict_color']};padding:14px 18px;border-radius:10px;margin:6px 0;'>
-    <p style='color:white;margin:0;'>{em['verdict']}</p>
-</div>""", unsafe_allow_html=True)
-
-        lvl1, lvl2 = st.columns(2)
-        with lvl1:
-            st.markdown("**Today's 1SD envelope**")
-            if em['expected_high'] and em['expected_low']:
-                st.caption(f"Upper `{em['expected_high']:.0f}` · Lower `{em['expected_low']:.0f}` — "
-                           f"roughly a 68% chance the session closes inside this band. A target beyond it "
-                           f"is a bet against the option market's own pricing, which is fine, but it should "
-                           f"be a deliberate one.")
-        with lvl2:
-            st.markdown("**Straddle breakevens (to expiry)**")
-            st.caption(f"Upper `{em['upper_be']:.0f}` · Lower `{em['lower_be']:.0f}` — beyond these a "
-                       f"long straddle bought at ATM makes money. Inside them, premium sellers do. "
-                       f"They are also where a directional option buyer stops fighting theta.")
-
-        if em_settings['drive_lens_floor']:
-            st.info(
-                f"🔗 The IV Lens is currently taking its price floor from this straddle: "
-                f"**±{iv_lens_thresholds['price_significant_pct']:.3f}%** over its "
-                f"{iv_lens_thresholds['lookback_minutes']}-minute window "
-                f"(today's 1SD scaled by √(window ÷ session)). That replaces both the fixed floor and "
-                f"the adaptive-percentile one while it's switched on."
-            )
-        else:
-            _suggest = straddle_implied_price_floor(em, spot, iv_lens_thresholds['lookback_minutes'])
-            if _suggest:
-                st.caption(
-                    f"For reference, the straddle implies a typical "
-                    f"{iv_lens_thresholds['lookback_minutes']}-minute move of about "
-                    f"**±{_suggest:.3f}%** of spot, against the lens's current "
-                    f"{lens_floor_source} floor of ±{iv_lens_thresholds['price_significant_pct']:.3f}%. "
-                    f"If those are far apart, the lens is either silent all day or firing on noise — "
-                    f"the sidebar toggle hands the floor to the straddle."
-                )
-
-        with st.expander("What the straddle is actually telling you"):
-            st.markdown(
-                "The ATM call plus the ATM put is what the market charges for the move it expects. It "
-                "reprices every tick, which makes it the only threshold in this dashboard that is "
-                "calibrated to *today* rather than to whichever regime happened to be running when a "
-                "constant was hard-coded.\n\n"
-                "Two horizons, because they answer different questions:\n"
-                "- **To expiry** — `0.8 × straddle`. On a weekly with days left, this covers several "
-                "sessions, not this one.\n"
-                "- **Today** — `spot × IV × √(1/252)`, the one-session 1SD. This is the number to "
-                "compare an intraday target against.\n\n"
-                "The two converge on expiry day, which doubles as a sanity check on the feed: if they "
-                "are far apart with DTE at zero, the IV or the straddle price is stale."
-            )
-    st.markdown("---")
-
-# ==========================================
-# IV LENS PANEL — sits directly below the NIFTY chart
-# ==========================================
-if show_iv_lens:
-    st.subheader("🔬 IV Lens (trade gate)")
-
-    if iv_measured is None:
-        st.caption(
-            "No usable Spot + ATM IV history logged yet today. The lens builds its two series from your own "
-            "polls, so it needs the app running during market hours for a couple of minutes before it can read "
-            "anything. (Logs written by an older build of this app won't have the ATM_IV column — those days "
-            "will stay blank here.)"
-        )
-    elif not iv_measured.get('ready'):
-        st.info(
-            f"Building the read — **{iv_measured['samples']}/{iv_measured['needed']} polls** collected in the "
-            f"last {iv_price_lookback} minutes (~{iv_measured['span_minutes']:.1f} min of history so far)."
-        )
-        if len(iv_measured['series']) >= 2:
-            st.plotly_chart(build_iv_price_chart(iv_measured['series']), use_container_width=True)
-    else:
-        arrow = {'rising': '↑', 'falling': '↓', 'flat': '→'}
-        lens_skew_txt = f"{iv_lens['iv_skew']:+.2f}" if pd.notna(iv_lens['iv_skew']) else "n/a"
-        st.markdown(f"""
-<div style='background-color:{iv_lens['color']};padding:18px;border-radius:10px;margin:6px 0;'>
-    <h3 style='color:white;margin:0;'>{iv_lens['headline']}</h3>
-    <p style='color:white;margin:8px 0 0 0;'><b>{iv_lens['action']}</b></p>
-    <p style='color:white;margin:6px 0 0 0;'>
-    Price <b>{iv_measured['price_dir']} {arrow[iv_measured['price_dir']]}</b>
-    ({iv_measured['price_chg_pct']:+.2f}%, {iv_measured['price_chg_pts']:+.0f} pts)
-    &nbsp;|&nbsp;
-    IV <b>{iv_measured['iv_dir']} {arrow[iv_measured['iv_dir']]}</b>
-    ({iv_measured['iv_chg_pct']:+.2f}%, {iv_measured['iv_chg_pts']:+.2f} vol pts)
-    &nbsp;|&nbsp; Skew <b>{lens_skew_txt}</b>
-    &nbsp;|&nbsp; window ~{iv_measured['span_minutes']:.0f} min</p>
-</div>""", unsafe_allow_html=True)
-
-        for line in iv_lens['notes']:
-            st.caption(f"• {line}")
-
-        if iv_lens['veto']:
-            st.error(
-                "⛔ **Stand down.** This is the distribution quadrant — the lens overrides the OI read here by "
-                "design. No new positions while it holds, however constructive the Master Signal looks."
-            )
-        elif iv_lens['chase_block']:
-            st.warning(
-                "🟠 **Do not chase.** Price and IV rising together is a squeeze, not accumulation. "
-                + ("Skew has flipped negative — the fade is confirmed."
-                   if iv_lens['fade_confirmed'] else
-                   "Skew hasn't flipped negative yet, so the fade isn't confirmed — but still no chasing.")
-            )
-
-        ip1, ip2, ip3, ip4 = st.columns(4)
-        ip1.metric("Spot", f"{iv_measured['price_end']:.0f}",
-                   f"{iv_measured['price_chg_pct']:+.2f}% over window")
-        ip2.metric("ATM IV", f"{iv_measured['iv_end']:.2f}",
-                   f"{iv_measured['iv_chg_pct']:+.2f}% over window")
-        ip3.metric(f"Skew (ATM ± {iv_lens_thresholds['skew_width']})", lens_skew_txt,
-                   "fade confirmed" if iv_lens['fade_confirmed'] else "")
-        ip4.metric("Samples in window", f"{iv_measured['samples']}",
-                   f"~{iv_measured['span_minutes']:.0f} min")
-
-        # --- Distance to the floors: the difference between "silent" and "broken" ---
-        p_floor, iv_floor = iv_measured['price_floor'], iv_measured['iv_floor']
-        p_pct_of_floor = min(abs(iv_measured['price_chg_pct']) / p_floor, 1.0) if p_floor else 0
-        iv_pct_of_floor = min(abs(iv_measured['iv_chg_pct']) / iv_floor, 1.0) if iv_floor else 0
-        floor_pts = p_floor / 100 * iv_measured['price_end']
-
-        fl1, fl2 = st.columns(2)
-        with fl1:
-            st.caption(f"**Price leg** — {abs(iv_measured['price_chg_pct']):.3f}% of the ±{p_floor:.3f}% "
-                       f"floor (±{floor_pts:.0f} pts) {'✅' if p_pct_of_floor >= 1 else '⏳'}")
-            st.progress(p_pct_of_floor)
-        with fl2:
-            st.caption(f"**IV leg** — {abs(iv_measured['iv_chg_pct']):.2f}% of the ±{iv_floor:.2f}% "
-                       f"floor {'✅' if iv_pct_of_floor >= 1 else '⏳'}")
-            st.progress(iv_pct_of_floor)
-
-        if iv_measured['floor_source'] == 'adaptive':
-            st.caption(f"Floors auto-calibrated to the {adaptive_pctile}th percentile of today's own "
-                       f"{iv_price_lookback}-min moves ({iv_measured['floor_windows']} completed windows so far).")
-        elif iv_measured['floor_source'].startswith('fixed ('):
-            st.caption("Auto-calibration is on but still warming up — needs ~6 completed windows. "
-                       "Using the fixed floors until then.")
-
-        st.plotly_chart(
-            build_iv_price_chart(iv_measured['series'],
-                                 iv_measured['window_start'], iv_measured['window_end']),
-            use_container_width=True,
-        )
-
-        with st.expander("The lens ruleset"):
-            st.markdown(
-                "| Price | IV | Read | Action |\n|---|---|---|---|\n"
-                "| ↓ Falling | ↓ Falling | Shakeout | 🟢 Longable — positioning flushed, not risk repriced |\n"
-                "| ↓ Falling | ↑ Rising | Distribution | ⛔ Stand down — **overrides the OI read** |\n"
-                "| ↑ Rising | ↑ Rising | Fear bid / squeeze | 🟠 Never chase; negative skew confirms the fade |\n"
-                "| ↑ Rising | ↓ Falling | Conviction | 🟢 Controlled accumulation — the smart-money grind |\n"
-            )
-            st.caption(
-                f"ATM IV = mean of CE and PE implied vol across ATM ± {int(iv_price_atm_width)} strike(s), "
-                f"zero/blank IVs excluded. Both changes are measured from the start to the end of the "
-                f"{iv_price_lookback}-minute window, each end averaged over {iv_measured['edge_n']} sample(s) "
-                f"so a single jumpy poll can't flip the verdict. 'Significant' is relative: IV as a % of the IV "
-                f"level, price as a % of spot — below those floors the leg counts as flat and the lens stays "
-                f"silent rather than picking a quadrant. Spot and IV both come from the same poll, so the two "
-                f"changes span exactly the same interval. Skew is the OI-weighted CE_IV − PE_IV across ATM ± "
-                f"{iv_lens_thresholds['skew_width']} strikes and is only consulted in the price-up + IV-up "
-                f"quadrant. The lens does not feed into the Master Signal, the VWAP Trend Read or the "
-                f"Institutional Footprint — it gates them."
-            )
-
-    st.markdown("---")
-
-# ==========================================
-# IV TERM STRUCTURE PANEL — front vs next expiry (gates the lens's IV leg)
-# ==========================================
-if show_term_panel:
-    st.subheader("📐 IV Term Structure (front vs next expiry)")
-    if term is None:
-        st.caption(
-            "Term structure needs a usable ATM IV on both expiries. It stays blank while the market "
-            "is closed, on the final expiry in the list (no next expiry to compare against), or if the "
-            "second chain fetch failed — that call fails soft so it can never take the dashboard down."
-        )
-    else:
-        t1, t2, t3 = st.columns(3)
-        t1.metric(f"Front expiry IV ({dte}d)", f"{term['front_iv']:.2f}",
-                  f"{term['d_front']:+.2f} over {iv_lens_thresholds['lookback_minutes']}m" if term['d_front'] is not None else "")
-        t2.metric(f"Next expiry IV ({term['next_dte']}d)" if term['next_dte'] is not None else "Next expiry IV",
-                  f"{term['next_iv']:.2f}",
-                  f"{term['d_next']:+.2f} over {iv_lens_thresholds['lookback_minutes']}m" if term['d_next'] is not None else "")
-        t3.metric("Spread (next − front)", f"{term['spread']:+.2f}", term['shape'].split(" — ")[0])
-
-        st.markdown(f"""
-<div style='background-color:{term['shape_color']};padding:14px 18px;border-radius:10px;margin:6px 0;'>
-    <h4 style='color:white;margin:0;'>{term['shape']}</h4>
-    <p style='color:white;margin:6px 0 0 0;'>{term['shape_detail']}</p>
-</div>""", unsafe_allow_html=True)
-
-        if term['divergence'] == 'front_only':
-            st.warning(f"⚠️ **Front-expiry noise.** {term['divergence_note']}")
-        elif term['divergence'] == 'confirmed':
-            st.success(f"✅ **Vol surface confirms.** {term['divergence_note']}")
-        else:
-            st.caption(
-                "No usable IV change to compare yet — the divergence test needs a few minutes of "
-                "logged front and next IV. It appears once the log has both columns populated across "
-                "the lens window."
-            )
-
-        if next_expiry:
-            _age = ((datetime.now() - st.session_state.next_chain_fetch_at).total_seconds()
-                    if st.session_state.next_chain_fetch_at else None)
-            st.caption(
-                f"Next expiry: **{next_expiry}**, refreshed every {term_settings['throttle_seconds']}s"
-                + (f" (last fetch {_age:.0f}s ago)." if _age is not None else ".")
-            )
-
-        with st.expander("Why single-expiry IV is a blind spot"):
-            st.markdown(
-                "The IV Lens reads one expiry, which leaves it open to the most common false positive "
-                "it can produce: **the front weekly's IV collapsing into its own expiry while the actual "
-                "volatility surface has not moved at all.** The lens sees IV DOWN, pairs it with price, "
-                "and calls Shakeout or Conviction — when nothing has happened except the calendar.\n\n"
-                "| Front IV | Next IV | Read |\n|---|---|---|\n"
-                "| ↓ | ↓ | Vol genuinely being sold. Lens reading is **real**. |\n"
-                "| ↓ | flat | Expiry decay only. **Discount** the lens's IV leg. |\n"
-                "| ↑ | ↑ | Genuine fear bid across the surface. Lens carries full weight. |\n"
-                "| ↑ | flat | Event premium in the front expiry alone. |\n\n"
-                "**Backwardation** (front above next) means the market expects something inside the "
-                "front expiry's life. It is normal on expiry day from gamma alone, and meaningful on any "
-                "other day. That premium decays violently once the event passes, which is why long "
-                "short-dated options into a known event so often lose money even when the direction "
-                "was right."
-            )
-            st.caption(
-                f"Both IVs use the same ATM ± {int(iv_price_atm_width)} strike band and the same "
-                f"{iv_lens_thresholds['lookback_minutes']}-minute change window as the lens, so the "
-                f"comparison is like-for-like. Divergence fires when the next expiry moves less than "
-                f"{term_settings['divergence_ratio']:.2f}× the front's move, or moves the opposite way."
-            )
-    st.markdown("---")
-
-# ==========================================
-# SIGNAL PROGRESS PANEL
-# ==========================================
-st.subheader("📐 Signal Progress — what's met, what's still missing")
-if sig != "wait for data confirmation":
-    st.success(f"**{sig}** is currently active — all conditions for this tier are satisfied.")
-elif tier_report:
-    # Surface the tier with the most conditions already satisfied, so you can
-    # watch a setup building through the day instead of only seeing a flip.
-    closest_tier = max(tier_report.items(), key=lambda kv: kv[1]['met'] / kv[1]['total'])
-    tier_name, tier_data = closest_tier
-    st.info(f"Closest to firing: **{tier_name}** ({tier_data['met']}/{tier_data['total']} conditions met)")
-    cols = st.columns(tier_data['total'])
-    for col, (label, met, gap) in zip(cols, tier_data['conditions']):
-        with col:
-            icon = "✅" if met else "❌"
-            gap_label = f"margin +{gap:.2f}" if met else f"short by {abs(gap):.2f}"
-            st.markdown(f"{icon} **{label}**")
-            st.caption(gap_label)
-
-    with st.expander("Show all 4 tiers' full checklists"):
-        for tier_name, tier_data in tier_report.items():
-            st.markdown(f"**{tier_name}** — {tier_data['met']}/{tier_data['total']} met")
-            for label, met, gap in tier_data['conditions']:
-                icon = "✅" if met else "❌"
-                gap_label = f"margin +{gap:.2f}" if met else f"short by {abs(gap):.2f}"
-                st.caption(f"{icon} {label} — {gap_label}")
-            st.markdown("")
-else:
-    st.caption("Not enough data yet to evaluate tier progress.")
-
-st.markdown("---")
-
-# ==========================================
-# CONFLUENCE PANEL
-# ==========================================
-st.subheader("🧭 Confluence Layer (supporting evidence — does not override the signal above)")
-cf1, cf2, cf3, cf4 = st.columns(4)
-with cf1:
-    if spot_vs_vwap:
-        st.metric("Spot vs VWAP", f"{vwap_val:.1f}", spot_vs_vwap.split(" (")[0])
-    else:
-        st.metric("Spot vs VWAP", "unavailable")
-with cf2:
-    if mp is not None:
-        st.metric("Max Pain", f"{mp:.0f}", f"Spot is {'above' if spot and spot > mp else 'below'} Max Pain" if spot else "")
-    else:
-        st.metric("Max Pain", "disabled")
-with cf3:
-    if ce_spread is not None:
-        flag = "⚠️ wide" if ce_spread > liquidity_spread_limit else "OK"
-        st.metric("ATM CE Spread %", f"{ce_spread:.1f}%", flag)
-    else:
-        st.metric("ATM CE Spread %", "—")
-with cf4:
-    st.metric("Days to Expiry", f"{dte}" if dte is not None else "—",
-               "⚠️ Gamma risk — size down" if dte is not None and dte <= 1 else "")
-
-if total_checks:
-    st.caption(f"Confluence agreement: **{agree}/{total_checks}** independent filters support the current directional read.")
-
-st.markdown("---")
-
-# ==========================================
-# RISK ENVELOPE PANEL — signal + risk envelope is what makes it a trade
-# ==========================================
-if show_risk_panel:
-    st.subheader("🛡️ Risk Envelope (ATR · stops · targets · position size)")
-    if atr_val is None or not spot:
-        st.caption(
-            "The risk envelope needs live spot and at least a few candles for ATR. It stays blank "
-            "while the market is closed or before the candle feed has populated."
-        )
-    else:
-        r1, r2, r3 = st.columns(3)
-        r1.metric(f"ATR ({risk_settings['atr_period']} × {candle_interval}m)", f"{atr_val:.1f} pts")
-        r2.metric("Risk budget / trade", f"₹{risk_settings['capital'] * risk_settings['risk_pct'] / 100:,.0f}",
-                  f"{risk_settings['risk_pct']:.1f}% of ₹{risk_settings['capital']:,.0f}")
-        r3.metric("Active direction",
-                  risk_active['side'] if risk_active else "none",
-                  ("from Scenario " + scenario['scenario']) if (scenario and scenario.get('scenario') in ('A', 'B'))
-                  else ("from Master Signal" if risk_direction else "no directional signal"))
-
-        def _render_envelope(env, is_active):
-            if env is None:
-                st.caption("Envelope unavailable — no priced ATM option on this leg.")
-                return
-            badge = "🟢 ACTIVE" if is_active else "⚪ reference"
-            st.markdown(f"**{env['side']}** — {badge}")
-            st.markdown(
-                f"| | Level | Distance |\n|---|---|---|\n"
-                f"| Entry | `{env['entry']:.0f}` | — |\n"
-                f"| Stop | `{env['stop']:.0f}` | {env['stop_dist']:.0f} pts ({env['stop_source']}) |\n"
-                f"| Target | `{env['target']:.0f}` | {env['target_dist']:.0f} pts ({env['rr']:.1f}R) |\n"
-            )
-            st.markdown(
-                f"**Size: {env['lots']} lot(s)** of the {env['leg']} {atm_strike:.0f} "
-                f"@ ₹{env['premium']:.1f} (δ {env['delta']:.2f})"
-            )
-            st.caption(
-                f"Premium outlay ₹{env['deployed']:,.0f} · risk at stop ₹{env['risk_at_stop']:,.0f} · "
-                f"gain at target ₹{env['gain_at_target']:,.0f}. One lot risks "
-                f"₹{env['prem_risk_per_lot']:,.0f}. Binding constraint: **{env['binding']}** "
-                f"({env['lots_by_risk']} by risk vs {env['lots_by_capital']} by premium cap)."
-                + (f" Stop set {env['structural_label']}."
-                   if env['stop_source'] == 'structural' and env['structural_label'] else
-                   f" ATR stop ({env['atr_mult']:.1f} × {env['atr']:.0f} = {env['atr_stop_dist']:.0f} pts) governs.")
-                + (f" The OI wall is further than {env['structural_cap']:.0f} pts away, so it's a target "
-                   f"here rather than a stop." if env['structural_ignored'] else "")
-                + (" ⚠️ ATM delta came back empty on this leg, so 0.50 is assumed — the lot count is an "
-                   "estimate, not a measurement." if env['delta_assumed'] else "")
-            )
-            for w in env['warnings']:
-                st.warning(w)
-
-        rc1, rc2 = st.columns(2)
-        with rc1:
-            _render_envelope(risk_long, risk_direction > 0)
-        with rc2:
-            _render_envelope(risk_short, risk_direction < 0)
-
-        if risk_direction == 0:
-            st.info(
-                "No directional signal is active, so neither envelope is live. They are shown so the "
-                "levels are already on screen when one fires — deciding where the stop goes after "
-                "entering is how a planned 1% loss becomes a 3% one."
-            )
-
-        with st.expander("How the stop, the target and the size are derived"):
-            st.markdown(
-                "**Stop** is the wider of two candidates:\n"
-                f"- **Volatility**: {risk_settings['atr_stop_mult']:.1f} × ATR on the chart's "
-                f"{candle_interval}-minute candles.\n"
-                "- **Structural**: just beyond the OI wall on the relevant side — below the put floor "
-                "for a long, above the call wall for a short.\n\n"
-                "The wider one wins, because a stop placed *inside* the wall everybody else is "
-                "defending gets taken out by exactly the flow the trade is betting on. A stop that is "
-                "too tight is not a smaller loss; it is the same loss taken more often.\n\n"
-                "**Size is computed in premium, not index points.** A 40-point index stop is not a "
-                "40-point premium loss — the option only moves by its delta. Treating them as equal is "
-                "the single most common way a nominal '1% risk' becomes a 4% one:\n\n"
-                "`risk per lot = stop distance × delta × lot size`\n\n"
-                "`lots = risk budget ÷ risk per lot`, then capped independently by the maximum premium "
-                "outlay, so a cheap far-dated option can't turn into an oversized bet just because each "
-                "lot is individually small."
-            )
-            st.caption(
-                "Two things this deliberately does not model. **Theta**: on a 0–1 DTE option the premium "
-                "decays whether or not the index moves, so the real loss at a stop hit later in the day "
-                "is worse than the delta arithmetic here suggests. **Gamma**: delta is not constant — a "
-                "move toward the strike raises it and away lowers it, so the true loss curve is convex "
-                "and this linear estimate is the optimistic edge of it. Both errors point the same "
-                "direction, which is why the sizing here should be treated as a ceiling rather than a "
-                "recommendation."
-            )
-    st.markdown("---")
-
-# ==========================================
-# INSTITUTIONAL FOOTPRINT SIGNAL (independent of Master Signal, VWAP Trend & IV Lens)
-# ==========================================
-if show_footprint_panel:
-    st.subheader("🕵️ Institutional Footprint Signal")
-    if footprint_headline:
-        footprint_colors = {"bullish": "#1e7e34", "bearish": "#c82333", "neutral": "#6c757d"}
-        st.markdown(f"""
-<div style='background-color:{footprint_colors.get(footprint_color_key, "#6c757d")};padding:18px;border-radius:10px;
-margin:6px 0;'>
-    <h3 style='color:white;margin:0;'>{footprint_headline}</h3>
-    <p style='color:white;margin:6px 0 0 0;'>Zone: ATM ± {footprint_width} strikes &nbsp;|&nbsp;
-    Today's price action: <b>{footprint_market_dir}</b></p>
-</div>""", unsafe_allow_html=True)
-
-        for line in footprint_lines:
-            st.caption(f"• {line}")
-
-        fp1, fp2, fp3 = st.columns(3)
-        fp1.metric("IV Skew (CE_IV − PE_IV)", f"{footprint_agg['iv_skew']:+.2f}" if pd.notna(footprint_agg['iv_skew']) else "—")
-        fp2.metric("ChgPCR (today's flow)", f"{footprint_agg['chg_pcr']:.2f}" if pd.notna(footprint_agg['chg_pcr']) else "—")
-        fp3.metric("Vol/OI (conviction)", f"{footprint_agg['vol_oi']:.2f}" if pd.notna(footprint_agg['vol_oi']) else "—")
-
-        # Threshold sanity check against the session's own distribution. A threshold
-        # that every poll clears (or none does) produces a constant tag that looks
-        # like a signal but carries no information -- which is exactly what the
-        # original 0.6 / 0.2 Vol/OI defaults did on the 14-Aug session.
-        _hist = pd.DataFrame(st.session_state.session_log)
-        if not _hist.empty and 'Footprint_Vol_OI' in _hist.columns:
-            _v = pd.to_numeric(_hist['Footprint_Vol_OI'], errors='coerce').dropna()
-            if len(_v) >= 20:
-                fresh_hit = (_v >= footprint_thresholds['vol_oi_fresh']).mean() * 100
-                fake_hit = (_v < footprint_thresholds['vol_oi_fakeout']).mean() * 100
-                warn = " ⚠️ this threshold isn't discriminating — retune it" if (
-                    fresh_hit > 95 or fresh_hit < 5) else ""
-                st.caption(
-                    f"Calibration check ({len(_v)} polls today): Vol/OI ranged {_v.min():.1f}–{_v.max():.1f} "
-                    f"(median {_v.median():.1f}). Your 'fresh' threshold fired on {fresh_hit:.0f}% of polls, "
-                    f"'fakeout' on {fake_hit:.0f}%.{warn}"
-                )
-
-        with st.expander(f"📋 Institutional Footprint Table (ATM ± {footprint_width} strikes)"):
-            fmt_table = footprint_table.copy()
-            fmt_table['ATM'] = np.where(fmt_table['Strike'] == atm_strike, '⬅ ATM', '')
-            display_fp_cols = ['Strike', 'ATM', 'CE_IV', 'PE_IV', 'IV_Skew', 'CE_OI_chg', 'PE_OI_chg',
-                                'ChgPCR', 'CE_Volume', 'PE_Volume', 'Total_OI', 'Vol_OI']
-
-            # MOBILE FIX: these return FOOTPRINT_TINTS entries, which pair each
-            # background with an explicit black foreground. Returning a bare
-            # background-color left the text at the theme's inherited colour --
-            # invisible in the mobile app's dark mode.
-            def _iv_skew_cell_color(val):
-                if pd.isna(val):
-                    return ''
-                if val <= footprint_thresholds['iv_skew_bearish']:
-                    return FOOTPRINT_TINTS['bearish']   # Put buying
-                if val >= footprint_thresholds['iv_skew_bullish']:
-                    return FOOTPRINT_TINTS['bullish']   # Put writing
-                return ''
-
-            def _vol_oi_cell_color(val):
-                if pd.isna(val):
-                    return ''
-                if val >= footprint_thresholds['vol_oi_fresh']:
-                    return FOOTPRINT_TINTS['fresh']     # fresh money
-                if val < footprint_thresholds['vol_oi_fakeout']:
-                    return FOOTPRINT_TINTS['fakeout']   # fakeout risk
-                return ''
-
-            # Manual CSS-based highlighting (no matplotlib dependency, unlike
-            # Styler.background_gradient which isn't installed on Streamlit
-            # Cloud by default). Wrapped so a styling hiccup never breaks the
-            # table -- it just falls back to plain formatting.
-            try:
-                styled = fmt_table[display_fp_cols].style.format(precision=2)
-                map_fn = styled.map if hasattr(styled, 'map') else styled.applymap
-                styled = map_fn(_iv_skew_cell_color, subset=['IV_Skew'])
-                map_fn2 = styled.map if hasattr(styled, 'map') else styled.applymap
-                styled = map_fn2(_vol_oi_cell_color, subset=['Vol_OI'])
-                st.dataframe(styled, use_container_width=True, height=360)
-            except Exception:
-                st.dataframe(fmt_table[display_fp_cols].style.format(precision=2),
-                              use_container_width=True, height=360)
-
-            st.caption(
-                "IV_Skew = CE_IV − PE_IV · ChgPCR = today's PE_OI_chg / CE_OI_chg (today's flow, not the "
-                "standing PCR) · Vol/OI = (CE_Volume+PE_Volume) / (CE_OI+PE_OI), the 'fresh money' ratio."
-            )
-    else:
-        st.caption("Not enough option chain data yet this poll to compute the Institutional Footprint.")
-
-    st.markdown("---")
-
-# ==========================================
-# HIGHEST-PCR (SUPPORT) STRIKES — auto replacement for Analysis!H8:I9
-# ==========================================
-st.subheader("📌 Highest-PCR Strikes (auto-tracked support levels)")
-if not top_pcr.empty:
-    pcr_cols = st.columns(len(top_pcr))
-    for i, (_, row) in enumerate(top_pcr.iterrows()):
-        with pcr_cols[i]:
-            st.metric(f"Strike {row['Strike']:.0f}", f"PCR {row['PCR']:.2f}")
-else:
-    st.caption("No qualifying strikes yet.")
-
-st.markdown("---")
-
-# ==========================================
-# OI CHANGE CHART (Zone B)
-# ==========================================
-st.subheader("📈 Zone B OI Change (Call Unwinding/Writing vs Put Writing)")
-zone_b_df = zb['zone']
-fig = make_subplots(rows=1, cols=1)
-fig.add_trace(go.Bar(x=zone_b_df['Strike'], y=zone_b_df['CE_OI_chg'], name='CE OI Change', marker_color='#dc3545'))
-fig.add_trace(go.Bar(x=zone_b_df['Strike'], y=zone_b_df['PE_OI_chg'], name='PE OI Change', marker_color='#28a745'))
-fig.add_hline(y=0, line_dash="dash", line_color="gray")
-fig.update_layout(barmode='group', height=400, legend=dict(orientation="h", y=1.1))
-st.plotly_chart(fig, use_container_width=True)
-
-# ==========================================
-# FULL CHAIN TABLE (Sensibull-equivalent columns from Dhan data)
-# ==========================================
-st.subheader("📋 Option Chain (ATM ± 10)")
-band = df[(df['Strike'] >= atm_strike - 10 * STRIKE_STEP) & (df['Strike'] <= atm_strike + 10 * STRIKE_STEP)]
-display_cols = ['CE_Delta', 'CE_IV', 'CE_Volume', 'CE_OI_chg', 'CE_OI', 'CE_LTP',
-                 'Strike', 'PCR',
-                 'PE_LTP', 'PE_OI', 'PE_OI_chg', 'PE_Volume', 'PE_IV', 'PE_Delta']
-st.dataframe(band[display_cols].style.format(precision=2), use_container_width=True, height=420)
-
-# ==========================================
-# BUILDUP DETECTION VIEW (new — additive; the plain chain above is unchanged)
+# BUILDUP DETECTION VIEW — step 3: direction (the full chain table further down is unchanged)
 # ==========================================
 if show_buildup:
-    st.markdown("### 🔥 Buildup Detection")
-    buildup_table = compute_buildup_table(df, atm_strike, int(buildup_width), buildup_thresholds)
-    bsum = summarize_buildup(buildup_table, spot) if not buildup_table.empty else None
-
+    st.subheader("3️⃣ 🔥 Buildup Detection — direction")
+    # buildup_table / bsum are computed further up, before the top-of-app conflict
+    # flag that consumes them. This block only renders them.
     if bsum is None:
         st.caption(
             "No strike in the band cleared the classification thresholds yet — usually means previous-close "
@@ -4960,6 +4529,784 @@ if show_buildup:
             )
 
 st.markdown("---")
+
+# ==========================================
+# IV LENS PANEL — step 4: the gate (does the environment permit a trade at all?)
+# ==========================================
+if show_iv_lens:
+    st.subheader("4️⃣ 🔬 IV Lens — the gate")
+
+    if iv_measured is None:
+        st.caption(
+            "No usable Spot + ATM IV history logged yet today. The lens builds its two series from your own "
+            "polls, so it needs the app running during market hours for a couple of minutes before it can read "
+            "anything. (Logs written by an older build of this app won't have the ATM_IV column — those days "
+            "will stay blank here.)"
+        )
+    elif not iv_measured.get('ready'):
+        st.info(
+            f"Building the read — **{iv_measured['samples']}/{iv_measured['needed']} polls** collected in the "
+            f"last {iv_price_lookback} minutes (~{iv_measured['span_minutes']:.1f} min of history so far)."
+        )
+        if len(iv_measured['series']) >= 2:
+            st.plotly_chart(build_iv_price_chart(iv_measured['series']), use_container_width=True)
+    else:
+        arrow = {'rising': '↑', 'falling': '↓', 'flat': '→'}
+        lens_skew_txt = f"{iv_lens['iv_skew']:+.2f}" if pd.notna(iv_lens['iv_skew']) else "n/a"
+        st.markdown(f"""
+<div style='background-color:{iv_lens['color']};padding:18px;border-radius:10px;margin:6px 0;'>
+    <h3 style='color:white;margin:0;'>{iv_lens['headline']}</h3>
+    <p style='color:white;margin:8px 0 0 0;'><b>{iv_lens['action']}</b></p>
+    <p style='color:white;margin:6px 0 0 0;'>
+    Price <b>{iv_measured['price_dir']} {arrow[iv_measured['price_dir']]}</b>
+    ({iv_measured['price_chg_pct']:+.2f}%, {iv_measured['price_chg_pts']:+.0f} pts)
+    &nbsp;|&nbsp;
+    IV <b>{iv_measured['iv_dir']} {arrow[iv_measured['iv_dir']]}</b>
+    ({iv_measured['iv_chg_pct']:+.2f}%, {iv_measured['iv_chg_pts']:+.2f} vol pts)
+    &nbsp;|&nbsp; Skew <b>{lens_skew_txt}</b>
+    &nbsp;|&nbsp; window ~{iv_measured['span_minutes']:.0f} min</p>
+</div>""", unsafe_allow_html=True)
+
+        for line in iv_lens['notes']:
+            st.caption(f"• {line}")
+
+        if iv_lens['veto']:
+            st.error(
+                "⛔ **Stand down.** This is the distribution quadrant — the lens overrides the OI read here by "
+                "design. No new positions while it holds, however constructive the Master Signal looks."
+            )
+        elif iv_lens['chase_block']:
+            st.warning(
+                "🟠 **Do not chase.** Price and IV rising together is a squeeze, not accumulation. "
+                + ("Skew has flipped negative — the fade is confirmed."
+                   if iv_lens['fade_confirmed'] else
+                   "Skew hasn't flipped negative yet, so the fade isn't confirmed — but still no chasing.")
+            )
+
+        ip1, ip2, ip3, ip4 = st.columns(4)
+        ip1.metric("Spot", f"{iv_measured['price_end']:.0f}",
+                   f"{iv_measured['price_chg_pct']:+.2f}% over window")
+        ip2.metric("ATM IV", f"{iv_measured['iv_end']:.2f}",
+                   f"{iv_measured['iv_chg_pct']:+.2f}% over window")
+        ip3.metric(f"Skew (ATM ± {iv_lens_thresholds['skew_width']})", lens_skew_txt,
+                   "fade confirmed" if iv_lens['fade_confirmed'] else "")
+        ip4.metric("Samples in window", f"{iv_measured['samples']}",
+                   f"~{iv_measured['span_minutes']:.0f} min")
+
+        # --- Distance to the floors: the difference between "silent" and "broken" ---
+        p_floor, iv_floor = iv_measured['price_floor'], iv_measured['iv_floor']
+        p_pct_of_floor = min(abs(iv_measured['price_chg_pct']) / p_floor, 1.0) if p_floor else 0
+        iv_pct_of_floor = min(abs(iv_measured['iv_chg_pct']) / iv_floor, 1.0) if iv_floor else 0
+        floor_pts = p_floor / 100 * iv_measured['price_end']
+
+        fl1, fl2 = st.columns(2)
+        with fl1:
+            st.caption(f"**Price leg** — {abs(iv_measured['price_chg_pct']):.3f}% of the ±{p_floor:.3f}% "
+                       f"floor (±{floor_pts:.0f} pts) {'✅' if p_pct_of_floor >= 1 else '⏳'}")
+            st.progress(p_pct_of_floor)
+        with fl2:
+            st.caption(f"**IV leg** — {abs(iv_measured['iv_chg_pct']):.2f}% of the ±{iv_floor:.2f}% "
+                       f"floor {'✅' if iv_pct_of_floor >= 1 else '⏳'}")
+            st.progress(iv_pct_of_floor)
+
+        if iv_measured['floor_source'] == 'adaptive':
+            st.caption(f"Floors auto-calibrated to the {adaptive_pctile}th percentile of today's own "
+                       f"{iv_price_lookback}-min moves ({iv_measured['floor_windows']} completed windows so far).")
+        elif iv_measured['floor_source'].startswith('fixed ('):
+            st.caption("Auto-calibration is on but still warming up — needs ~6 completed windows. "
+                       "Using the fixed floors until then.")
+
+        st.plotly_chart(
+            build_iv_price_chart(iv_measured['series'],
+                                 iv_measured['window_start'], iv_measured['window_end']),
+            use_container_width=True,
+        )
+
+        with st.expander("The lens ruleset"):
+            st.markdown(
+                "| Price | IV | Read | Action |\n|---|---|---|---|\n"
+                "| ↓ Falling | ↓ Falling | Shakeout | 🟢 Longable — positioning flushed, not risk repriced |\n"
+                "| ↓ Falling | ↑ Rising | Distribution | ⛔ Stand down — **overrides the OI read** |\n"
+                "| ↑ Rising | ↑ Rising | Fear bid / squeeze | 🟠 Never chase; negative skew confirms the fade |\n"
+                "| ↑ Rising | ↓ Falling | Conviction | 🟢 Controlled accumulation — the smart-money grind |\n"
+            )
+            st.caption(
+                f"ATM IV = mean of CE and PE implied vol across ATM ± {int(iv_price_atm_width)} strike(s), "
+                f"zero/blank IVs excluded. Both changes are measured from the start to the end of the "
+                f"{iv_price_lookback}-minute window, each end averaged over {iv_measured['edge_n']} sample(s) "
+                f"so a single jumpy poll can't flip the verdict. 'Significant' is relative: IV as a % of the IV "
+                f"level, price as a % of spot — below those floors the leg counts as flat and the lens stays "
+                f"silent rather than picking a quadrant. Spot and IV both come from the same poll, so the two "
+                f"changes span exactly the same interval. Skew is the OI-weighted CE_IV − PE_IV across ATM ± "
+                f"{iv_lens_thresholds['skew_width']} strikes and is only consulted in the price-up + IV-up "
+                f"quadrant. The lens does not feed into the Master Signal, the VWAP Trend Read or the "
+                f"Institutional Footprint — it gates them."
+            )
+
+    st.markdown("---")
+
+# ==========================================
+# OI VELOCITY PANEL — step 5: is anyone acting on it right now?
+# ==========================================
+if show_velocity_panel:
+    st.subheader("5️⃣ 💥 Intraday OI Velocity — is anyone acting right now?")
+    if oi_vel is None or vel_class is None:
+        st.caption(
+            "Velocity needs two consecutive live polls to diff. It appears a few seconds after the "
+            "first live fetch of the session, stays blank while the market is closed (there is no "
+            "second poll to difference against), and is skipped on the rerun that follows a sidebar "
+            "change — that rerun refetches milliseconds after the last poll, which is not a real "
+            "interval to measure a rate over."
+        )
+    else:
+        st.markdown(f"""
+<div style='background-color:{vel_class['color']};padding:16px;border-radius:10px;margin:6px 0;'>
+    <h4 style='color:white;margin:0;'>{vel_class['headline']}</h4>
+    <p style='color:white;margin:6px 0 0 0;'>{vel_class['detail']}</p>
+</div>""", unsafe_allow_html=True)
+
+        v1, v2, v3, v4 = st.columns(4)
+        v1.metric("CE OI flow", f"{oi_vel['net_ce']:+,.0f}",
+                  f"{oi_vel['net_ce_per_min']:+,.0f}/min")
+        v2.metric("PE OI flow", f"{oi_vel['net_pe']:+,.0f}",
+                  f"{oi_vel['net_pe_per_min']:+,.0f}/min")
+        v3.metric("Net bias (PE − CE)", f"{oi_vel['net_bias']:+,.0f}",
+                  "put writing leads" if oi_vel['net_bias'] > 0 else "call writing leads")
+        v4.metric("Flow intensity", f"{oi_vel['intensity_per_min']:,.0f}/min",
+                  (f"{vel_class['rank']:.0f}th pctile of today" if vel_class['rank'] is not None
+                   else f"calibrating ({vel_class['samples']}/20 polls)"))
+
+        st.caption(
+            f"Measured across the last **{oi_vel['elapsed_s']:.0f}s** between polls, ATM ± "
+            f"{oi_vel['width']} strikes. Biggest single-strike moves this interval: "
+            f"**CE {oi_vel['ce_burst']:+,.0f}** at {oi_vel['ce_burst_strike']:.0f}, "
+            f"**PE {oi_vel['pe_burst']:+,.0f}** at {oi_vel['pe_burst_strike']:.0f}."
+        )
+
+        vfig = go.Figure()
+        vfig.add_trace(go.Bar(x=oi_vel['table']['Strike'], y=oi_vel['table']['dCE_OI'],
+                              name="ΔCE OI (this interval)", marker_color='#dc3545'))
+        vfig.add_trace(go.Bar(x=oi_vel['table']['Strike'], y=oi_vel['table']['dPE_OI'],
+                              name="ΔPE OI (this interval)", marker_color='#28a745'))
+        vfig.add_hline(y=0, line_color="gray", line_width=1)
+        if spot:
+            vfig.add_vline(x=spot, line_dash="dash", line_color="#6c757d",
+                           annotation_text=" spot ", annotation_position="top")
+        vfig.update_layout(barmode='group', height=320, margin=dict(l=10, r=10, t=30, b=10),
+                           legend=dict(orientation="h", y=1.18), xaxis_title="Strike",
+                           yaxis_title="ΔOI since last poll")
+        st.plotly_chart(vfig, use_container_width=True)
+
+        with st.expander("Why this is different from the OI change everywhere else in this app"):
+            st.markdown(
+                "Every other OI-change number here is `oi − previous_oi`: **cumulative since the open**. "
+                "That column cannot distinguish 400k contracts of put writing that arrived steadily over "
+                "four hours from the same 400k that landed in the last twenty seconds — and those are "
+                "opposite pieces of information. The first is background positioning; the second is "
+                "someone with size acting *now*.\n\n"
+                "This panel differences consecutive chain snapshots instead, so it reads the **rate**. "
+                "A burst here that agrees with the Master Signal is that signal being acted on in real "
+                "time; a burst that contradicts it is the more important of the two, because standing OI "
+                "reflects yesterday and this reflects the last ten seconds."
+            )
+            st.caption(
+                f"'Burst' = flow intensity above the {vel_class['pctile']:.0f}th percentile of today's own "
+                f"polls **and** above the {vel_class['floor']:,.0f}/min absolute floor. Both conditions are "
+                f"needed: the percentile alone would call the quietest hour of a dead day a burst, since "
+                f"something is always in the top 15% of a distribution. "
+                + (f"Today's threshold is {vel_class['threshold']:,.0f}/min across {vel_class['samples']} polls."
+                   if vel_class['threshold'] else
+                   "Still calibrating — needs 20 polls before the percentile means anything.")
+            )
+    st.markdown("---")
+
+# ==========================================
+# EXPECTED MOVE PANEL — step 6: is there room left for the move you want?
+# ==========================================
+if show_em_panel:
+    st.subheader("6️⃣ 🎯 Expected Move — is there room left today?")
+    if expected_move is None:
+        st.caption("Expected move needs a priced ATM straddle — unavailable on this poll.")
+    else:
+        em = expected_move
+        e1, e2, e3, e4 = st.columns(4)
+        e1.metric("ATM straddle", f"{em['straddle']:.1f}",
+                  f"{em['ce']:.1f} CE + {em['pe']:.1f} PE")
+        e2.metric("1SD move — today", f"±{em['em_today_pts']:.0f}" if em['em_today_pts'] else "—",
+                  f"±{em['em_today_pct']:.2f}% of spot" if em['em_today_pct'] else "")
+        e3.metric("1SD move — to expiry", f"±{em['em_expiry_pts']:.0f}",
+                  f"{em['sd_factor']:.2f} × straddle")
+        e4.metric("Range used today",
+                  f"{em['range_used_pct']:.0f}%" if em['range_used_pct'] is not None else "—",
+                  f"{em['day_range']:.0f} pts of ±{em['em_today_pts']:.0f}" if (em['day_range'] and em['em_today_pts']) else "")
+
+        if em['verdict']:
+            st.markdown(f"""
+<div style='background-color:{em['verdict_color']};padding:14px 18px;border-radius:10px;margin:6px 0;'>
+    <p style='color:white;margin:0;'>{em['verdict']}</p>
+</div>""", unsafe_allow_html=True)
+
+        lvl1, lvl2 = st.columns(2)
+        with lvl1:
+            st.markdown("**Today's 1SD envelope**")
+            if em['expected_high'] and em['expected_low']:
+                st.caption(f"Upper `{em['expected_high']:.0f}` · Lower `{em['expected_low']:.0f}` — "
+                           f"roughly a 68% chance the session closes inside this band. A target beyond it "
+                           f"is a bet against the option market's own pricing, which is fine, but it should "
+                           f"be a deliberate one.")
+        with lvl2:
+            st.markdown("**Straddle breakevens (to expiry)**")
+            st.caption(f"Upper `{em['upper_be']:.0f}` · Lower `{em['lower_be']:.0f}` — beyond these a "
+                       f"long straddle bought at ATM makes money. Inside them, premium sellers do. "
+                       f"They are also where a directional option buyer stops fighting theta.")
+
+        if em_settings['drive_lens_floor']:
+            st.info(
+                f"🔗 The IV Lens is currently taking its price floor from this straddle: "
+                f"**±{iv_lens_thresholds['price_significant_pct']:.3f}%** over its "
+                f"{iv_lens_thresholds['lookback_minutes']}-minute window "
+                f"(today's 1SD scaled by √(window ÷ session)). That replaces both the fixed floor and "
+                f"the adaptive-percentile one while it's switched on."
+            )
+        else:
+            _suggest = straddle_implied_price_floor(em, spot, iv_lens_thresholds['lookback_minutes'])
+            if _suggest:
+                st.caption(
+                    f"For reference, the straddle implies a typical "
+                    f"{iv_lens_thresholds['lookback_minutes']}-minute move of about "
+                    f"**±{_suggest:.3f}%** of spot, against the lens's current "
+                    f"{lens_floor_source} floor of ±{iv_lens_thresholds['price_significant_pct']:.3f}%. "
+                    f"If those are far apart, the lens is either silent all day or firing on noise — "
+                    f"the sidebar toggle hands the floor to the straddle."
+                )
+
+        with st.expander("What the straddle is actually telling you"):
+            st.markdown(
+                "The ATM call plus the ATM put is what the market charges for the move it expects. It "
+                "reprices every tick, which makes it the only threshold in this dashboard that is "
+                "calibrated to *today* rather than to whichever regime happened to be running when a "
+                "constant was hard-coded.\n\n"
+                "Two horizons, because they answer different questions:\n"
+                "- **To expiry** — `0.8 × straddle`. On a weekly with days left, this covers several "
+                "sessions, not this one.\n"
+                "- **Today** — `spot × IV × √(1/252)`, the one-session 1SD. This is the number to "
+                "compare an intraday target against.\n\n"
+                "The two converge on expiry day, which doubles as a sanity check on the feed: if they "
+                "are far apart with DTE at zero, the IV or the straddle price is stale."
+            )
+    st.markdown("---")
+
+# ==========================================
+# RISK ENVELOPE PANEL — step 7: sizing, stop and target before execution
+# ==========================================
+if show_risk_panel:
+    st.subheader("7️⃣ 🛡️ Risk Envelope — stop, target and size")
+    if atr_val is None or not spot:
+        st.caption(
+            "The risk envelope needs live spot and at least a few candles for ATR. It stays blank "
+            "while the market is closed or before the candle feed has populated."
+        )
+    else:
+        r1, r2, r3 = st.columns(3)
+        r1.metric(f"ATR ({risk_settings['atr_period']} × {candle_interval}m)", f"{atr_val:.1f} pts")
+        r2.metric("Risk budget / trade", f"₹{risk_settings['capital'] * risk_settings['risk_pct'] / 100:,.0f}",
+                  f"{risk_settings['risk_pct']:.1f}% of ₹{risk_settings['capital']:,.0f}")
+        r3.metric("Active direction",
+                  risk_active['side'] if risk_active else "none",
+                  ("from Scenario " + scenario['scenario']) if (scenario and scenario.get('scenario') in ('A', 'B'))
+                  else ("from Master Signal" if risk_direction else "no directional signal"))
+
+        def _render_envelope(env, is_active):
+            if env is None:
+                st.caption("Envelope unavailable — no priced ATM option on this leg.")
+                return
+            badge = "🟢 ACTIVE" if is_active else "⚪ reference"
+            st.markdown(f"**{env['side']}** — {badge}")
+            st.markdown(
+                f"| | Level | Distance |\n|---|---|---|\n"
+                f"| Entry | `{env['entry']:.0f}` | — |\n"
+                f"| Stop | `{env['stop']:.0f}` | {env['stop_dist']:.0f} pts ({env['stop_source']}) |\n"
+                f"| Target | `{env['target']:.0f}` | {env['target_dist']:.0f} pts ({env['rr']:.1f}R) |\n"
+            )
+            st.markdown(
+                f"**Size: {env['lots']} lot(s)** of the {env['leg']} {atm_strike:.0f} "
+                f"@ ₹{env['premium']:.1f} (δ {env['delta']:.2f})"
+            )
+            st.caption(
+                f"Premium outlay ₹{env['deployed']:,.0f} · risk at stop ₹{env['risk_at_stop']:,.0f} · "
+                f"gain at target ₹{env['gain_at_target']:,.0f}. One lot risks "
+                f"₹{env['prem_risk_per_lot']:,.0f}. Binding constraint: **{env['binding']}** "
+                f"({env['lots_by_risk']} by risk vs {env['lots_by_capital']} by premium cap)."
+                + (f" Stop set {env['structural_label']}."
+                   if env['stop_source'] == 'structural' and env['structural_label'] else
+                   f" ATR stop ({env['atr_mult']:.1f} × {env['atr']:.0f} = {env['atr_stop_dist']:.0f} pts) governs.")
+                + (f" The OI wall is further than {env['structural_cap']:.0f} pts away, so it's a target "
+                   f"here rather than a stop." if env['structural_ignored'] else "")
+                + (" ⚠️ ATM delta came back empty on this leg, so 0.50 is assumed — the lot count is an "
+                   "estimate, not a measurement." if env['delta_assumed'] else "")
+            )
+            for w in env['warnings']:
+                st.warning(w)
+
+        rc1, rc2 = st.columns(2)
+        with rc1:
+            _render_envelope(risk_long, risk_direction > 0)
+        with rc2:
+            _render_envelope(risk_short, risk_direction < 0)
+
+        if risk_direction == 0:
+            st.info(
+                "No directional signal is active, so neither envelope is live. They are shown so the "
+                "levels are already on screen when one fires — deciding where the stop goes after "
+                "entering is how a planned 1% loss becomes a 3% one."
+            )
+
+        with st.expander("How the stop, the target and the size are derived"):
+            st.markdown(
+                "**Stop** is the wider of two candidates:\n"
+                f"- **Volatility**: {risk_settings['atr_stop_mult']:.1f} × ATR on the chart's "
+                f"{candle_interval}-minute candles.\n"
+                "- **Structural**: just beyond the OI wall on the relevant side — below the put floor "
+                "for a long, above the call wall for a short.\n\n"
+                "The wider one wins, because a stop placed *inside* the wall everybody else is "
+                "defending gets taken out by exactly the flow the trade is betting on. A stop that is "
+                "too tight is not a smaller loss; it is the same loss taken more often.\n\n"
+                "**Size is computed in premium, not index points.** A 40-point index stop is not a "
+                "40-point premium loss — the option only moves by its delta. Treating them as equal is "
+                "the single most common way a nominal '1% risk' becomes a 4% one:\n\n"
+                "`risk per lot = stop distance × delta × lot size`\n\n"
+                "`lots = risk budget ÷ risk per lot`, then capped independently by the maximum premium "
+                "outlay, so a cheap far-dated option can't turn into an oversized bet just because each "
+                "lot is individually small."
+            )
+            st.caption(
+                "Two things this deliberately does not model. **Theta**: on a 0–1 DTE option the premium "
+                "decays whether or not the index moves, so the real loss at a stop hit later in the day "
+                "is worse than the delta arithmetic here suggests. **Gamma**: delta is not constant — a "
+                "move toward the strike raises it and away lowers it, so the true loss curve is convex "
+                "and this linear estimate is the optimistic edge of it. Both errors point the same "
+                "direction, which is why the sizing here should be treated as a ceiling rather than a "
+                "recommendation."
+            )
+    st.markdown("---")
+
+# ==========================================
+# EXECUTION CHECKPOINT — the gate summary, immediately before acting
+# ==========================================
+# Everything above this line is analysis; everything below it is supporting detail.
+# This strip exists so the final decision is made against a single consolidated view
+# rather than against a memory of seven panels scrolled past on the way down.
+#
+# It computes nothing new. Every value here was already decided by the panel that
+# owns it — this only collects them, which is precisely why it can be trusted as the
+# last thing read before acting.
+st.subheader("8️⃣ 🚦 Execution Checkpoint — the last look before acting")
+
+_gates = []
+
+# 1. Read conflict (top of app)
+if read_conflict is None:
+    _gates.append(("—", "Read conflict", "Not evaluated — needs both Footprint and Buildup."))
+elif read_conflict['state'] == 'conflict':
+    _gates.append(("⛔", "Read conflict",
+                   f"Footprint {read_conflict['fp_label']} vs Buildup {read_conflict['bu_label']} — "
+                   f"your highest-probability no-trade condition."))
+elif read_conflict['state'] == 'aligned':
+    _gates.append(("✅", "Read conflict",
+                   f"Both reads {read_conflict['fp_label']}. Independent corroboration."))
+else:
+    _gates.append(("⚠️", "Read conflict",
+                   f"Inconclusive — Footprint {read_conflict['fp_label']}, "
+                   f"Buildup {read_conflict['bu_label']}. Direction unconfirmed."))
+
+# 2. Gamma regime
+if gex is None:
+    _gates.append(("—", "Gamma regime", "No live gamma this poll."))
+elif gex['at_flip']:
+    _gates.append(("⛔", "Gamma regime",
+                   f"Spot on the flip ({gex['flip_level']:.0f}). Regime unstable — worst place to size up."))
+elif gex['regime_key'] == 'trend':
+    _gates.append(("✅", "Gamma regime",
+                   f"Short gamma ({gex['net_gex']:+,.0f}). Breakouts carry; full size permitted."))
+else:
+    _gates.append(("⚠️", "Gamma regime",
+                   f"Long gamma ({gex['net_gex']:+,.0f}). Moves get faded — discount breakout signals."))
+
+# 3. Buildup direction
+if bsum is None:
+    _gates.append(("—", "Buildup direction", "No strike cleared the classification thresholds."))
+else:
+    _b_icon = "✅" if abs(bsum['net_pct']) > 20 else "⚠️"
+    _gates.append((_b_icon, "Buildup direction",
+                   f"{bsum['verdict'].split(' ', 1)[1]} at {bsum['net_pct']:+.0f}% net bias."))
+
+# 4. IV Lens gate
+if not iv_lens:
+    _gates.append(("—", "IV Lens gate", "No lens read yet — needs its lookback window to fill."))
+elif iv_lens.get('veto'):
+    _gates.append(("⛔", "IV Lens gate", f"VETO — {iv_lens['stance']}."))
+else:
+    _gates.append(("✅", "IV Lens gate", f"Open — {iv_lens['stance']}."))
+
+# 5. OI velocity — is anyone acting right now?
+if vel_class is None:
+    _gates.append(("—", "Live flow", "No poll-to-poll delta available."))
+elif vel_class['is_burst']:
+    _gates.append(("✅", "Live flow", f"{vel_class['headline']}."))
+else:
+    _gates.append(("⚠️", "Live flow",
+                   "Normal flow — nothing is being committed with urgency right now."))
+
+# 6. Expected move — is there room left?
+if not expected_move or expected_move.get('range_used_pct') is None:
+    _gates.append(("—", "Room left today", "No day range yet."))
+elif expected_move['range_used_pct'] >= em_settings['range_spent_high']:
+    _gates.append(("⚠️", "Room left today",
+                   f"{expected_move['range_used_pct']:.0f}% of the expected range already spent."))
+else:
+    _gates.append(("✅", "Room left today",
+                   f"{expected_move['range_used_pct']:.0f}% of the expected range used; "
+                   f"~{max(expected_move['range_left_pts'], 0):.0f} pts unspent."))
+
+# 7. Risk envelope — is the position actually sizeable?
+if risk_active is None:
+    _gates.append(("—", "Position sizing",
+                   "No directional signal active, so no envelope is live."))
+elif risk_active['lots'] == 0:
+    _gates.append(("⛔", "Position sizing",
+                   "Zero lots at current settings — the stop is too wide for the risk budget."))
+else:
+    _gates.append(("✅", "Position sizing",
+                   f"{risk_active['lots']} lot(s) {risk_active['leg']}, stop {risk_active['stop']:.0f}, "
+                   f"target {risk_active['target']:.0f}, risk ₹{risk_active['risk_at_stop']:,.0f}."))
+
+# 8. Decision-card discipline
+if decision and decision['blocked']:
+    _gates.append(("⛔", "Discipline",
+                   " · ".join(r[1] for r in decision['blocked']) + "."))
+elif decision:
+    _gates.append(("✅", "Discipline", "No rule breached — cutoff and loss limit both clear."))
+
+_blockers = [g for g in _gates if g[0] == "⛔"]
+_cautions = [g for g in _gates if g[0] == "⚠️"]
+
+if _blockers:
+    st.markdown(f"""
+<div style='background-color:#c82333;padding:20px;border-radius:10px;margin:6px 0;'>
+    <h3 style='color:white;margin:0;'>⛔ DO NOT EXECUTE — {len(_blockers)} hard blocker(s)</h3>
+    <p style='color:white;margin:8px 0 0 0;'>{' · '.join(g[1] for g in _blockers)}</p>
+</div>""", unsafe_allow_html=True)
+elif _cautions:
+    st.markdown(f"""
+<div style='background-color:#fd7e14;padding:18px;border-radius:10px;margin:6px 0;'>
+    <h4 style='color:white;margin:0;'>⚠️ PROCEED WITH REDUCED SIZE — {len(_cautions)} caution(s)</h4>
+    <p style='color:white;margin:8px 0 0 0;'>{' · '.join(g[1] for g in _cautions)}</p>
+</div>""", unsafe_allow_html=True)
+else:
+    st.markdown("""
+<div style='background-color:#1e7e34;padding:18px;border-radius:10px;margin:6px 0;'>
+    <h4 style='color:white;margin:0;'>✅ ALL GATES CLEAR</h4>
+    <p style='color:white;margin:8px 0 0 0;'>Every check above is satisfied. This is the
+    configuration the whole workflow exists to identify — and it should be rare.</p>
+</div>""", unsafe_allow_html=True)
+
+for icon, label, detail in _gates:
+    st.markdown(f"{icon} **{label}** — {detail}")
+
+st.caption(
+    "Nothing on this strip is new information. Each line is owned by the panel above it and is "
+    "restated here only so the last look before acting is a single consolidated view rather than a "
+    "recollection of seven panels. A dash means a gate could not be evaluated on this poll, which is "
+    "not the same as it passing — an unevaluated gate is an unknown, and unknowns are the reason "
+    "positions get sized as though a check passed when it was never run."
+)
+
+with st.expander("How to use this strip"):
+    st.markdown(
+        "**⛔ blockers are binary.** Any one of them and the answer is no. They are conditions where "
+        "the mechanics are actively against the trade — regime unstable at the flip, the lens vetoing, "
+        "a discipline rule breached, or a position that cannot be sized inside the risk budget.\n\n"
+        "**⚠️ cautions are cumulative.** One is a reason to trim; three together usually means the "
+        "setup is being forced. The most common of these is a long-gamma regime paired with a "
+        "breakout signal, which is the trap case the decision card also flags.\n\n"
+        "**A dash is not a pass.** It means the check could not run — no live gamma, no lens window "
+        "filled, no second poll to diff. Treat it as unknown rather than clear.\n\n"
+        "**All-clear should be uncommon.** Eight independent gates aligning is not an everyday event, "
+        "and a workflow that shows green most sessions has thresholds set too loose to be doing any "
+        "filtering. If that happens over your two-week window, the fix is tightening the individual "
+        "panels, not distrusting the strip."
+    )
+
+st.markdown("---")
+
+
+# ==========================================
+# ------------------------------------------------------------------
+# SUPPORTING DETAIL — everything below the execution line
+# ------------------------------------------------------------------
+# These panels are diagnostics and evidence, not steps in the decision.
+# They are consulted when a gate above is ambiguous, not on every trade.
+# ==========================================
+# IV TERM STRUCTURE PANEL — front vs next expiry (gates the lens's IV leg)
+# ==========================================
+if show_term_panel:
+    st.subheader("📐 IV Term Structure (front vs next expiry)")
+    if term is None:
+        st.caption(
+            "Term structure needs a usable ATM IV on both expiries. It stays blank while the market "
+            "is closed, on the final expiry in the list (no next expiry to compare against), or if the "
+            "second chain fetch failed — that call fails soft so it can never take the dashboard down."
+        )
+    else:
+        t1, t2, t3 = st.columns(3)
+        t1.metric(f"Front expiry IV ({dte}d)", f"{term['front_iv']:.2f}",
+                  f"{term['d_front']:+.2f} over {iv_lens_thresholds['lookback_minutes']}m" if term['d_front'] is not None else "")
+        t2.metric(f"Next expiry IV ({term['next_dte']}d)" if term['next_dte'] is not None else "Next expiry IV",
+                  f"{term['next_iv']:.2f}",
+                  f"{term['d_next']:+.2f} over {iv_lens_thresholds['lookback_minutes']}m" if term['d_next'] is not None else "")
+        t3.metric("Spread (next − front)", f"{term['spread']:+.2f}", term['shape'].split(" — ")[0])
+
+        st.markdown(f"""
+<div style='background-color:{term['shape_color']};padding:14px 18px;border-radius:10px;margin:6px 0;'>
+    <h4 style='color:white;margin:0;'>{term['shape']}</h4>
+    <p style='color:white;margin:6px 0 0 0;'>{term['shape_detail']}</p>
+</div>""", unsafe_allow_html=True)
+
+        if term['divergence'] == 'front_only':
+            st.warning(f"⚠️ **Front-expiry noise.** {term['divergence_note']}")
+        elif term['divergence'] == 'confirmed':
+            st.success(f"✅ **Vol surface confirms.** {term['divergence_note']}")
+        else:
+            st.caption(
+                "No usable IV change to compare yet — the divergence test needs a few minutes of "
+                "logged front and next IV. It appears once the log has both columns populated across "
+                "the lens window."
+            )
+
+        if next_expiry:
+            _age = ((datetime.now() - st.session_state.next_chain_fetch_at).total_seconds()
+                    if st.session_state.next_chain_fetch_at else None)
+            st.caption(
+                f"Next expiry: **{next_expiry}**, refreshed every {term_settings['throttle_seconds']}s"
+                + (f" (last fetch {_age:.0f}s ago)." if _age is not None else ".")
+            )
+
+        with st.expander("Why single-expiry IV is a blind spot"):
+            st.markdown(
+                "The IV Lens reads one expiry, which leaves it open to the most common false positive "
+                "it can produce: **the front weekly's IV collapsing into its own expiry while the actual "
+                "volatility surface has not moved at all.** The lens sees IV DOWN, pairs it with price, "
+                "and calls Shakeout or Conviction — when nothing has happened except the calendar.\n\n"
+                "| Front IV | Next IV | Read |\n|---|---|---|\n"
+                "| ↓ | ↓ | Vol genuinely being sold. Lens reading is **real**. |\n"
+                "| ↓ | flat | Expiry decay only. **Discount** the lens's IV leg. |\n"
+                "| ↑ | ↑ | Genuine fear bid across the surface. Lens carries full weight. |\n"
+                "| ↑ | flat | Event premium in the front expiry alone. |\n\n"
+                "**Backwardation** (front above next) means the market expects something inside the "
+                "front expiry's life. It is normal on expiry day from gamma alone, and meaningful on any "
+                "other day. That premium decays violently once the event passes, which is why long "
+                "short-dated options into a known event so often lose money even when the direction "
+                "was right."
+            )
+            st.caption(
+                f"Both IVs use the same ATM ± {int(iv_price_atm_width)} strike band and the same "
+                f"{iv_lens_thresholds['lookback_minutes']}-minute change window as the lens, so the "
+                f"comparison is like-for-like. Divergence fires when the next expiry moves less than "
+                f"{term_settings['divergence_ratio']:.2f}× the front's move, or moves the opposite way."
+            )
+    st.markdown("---")
+
+# ==========================================
+# INSTITUTIONAL FOOTPRINT SIGNAL (independent of Master Signal, VWAP Trend & IV Lens)
+# ==========================================
+if show_footprint_panel:
+    st.subheader("🕵️ Institutional Footprint Signal")
+    if footprint_headline:
+        footprint_colors = {"bullish": "#1e7e34", "bearish": "#c82333", "neutral": "#6c757d"}
+        st.markdown(f"""
+<div style='background-color:{footprint_colors.get(footprint_color_key, "#6c757d")};padding:18px;border-radius:10px;
+margin:6px 0;'>
+    <h3 style='color:white;margin:0;'>{footprint_headline}</h3>
+    <p style='color:white;margin:6px 0 0 0;'>Zone: ATM ± {footprint_width} strikes &nbsp;|&nbsp;
+    Today's price action: <b>{footprint_market_dir}</b></p>
+</div>""", unsafe_allow_html=True)
+
+        for line in footprint_lines:
+            st.caption(f"• {line}")
+
+        fp1, fp2, fp3 = st.columns(3)
+        fp1.metric("IV Skew (CE_IV − PE_IV)", f"{footprint_agg['iv_skew']:+.2f}" if pd.notna(footprint_agg['iv_skew']) else "—")
+        fp2.metric("ChgPCR (today's flow)", f"{footprint_agg['chg_pcr']:.2f}" if pd.notna(footprint_agg['chg_pcr']) else "—")
+        fp3.metric("Vol/OI (conviction)", f"{footprint_agg['vol_oi']:.2f}" if pd.notna(footprint_agg['vol_oi']) else "—")
+
+        # Threshold sanity check against the session's own distribution. A threshold
+        # that every poll clears (or none does) produces a constant tag that looks
+        # like a signal but carries no information -- which is exactly what the
+        # original 0.6 / 0.2 Vol/OI defaults did on the 14-Aug session.
+        _hist = pd.DataFrame(st.session_state.session_log)
+        if not _hist.empty and 'Footprint_Vol_OI' in _hist.columns:
+            _v = pd.to_numeric(_hist['Footprint_Vol_OI'], errors='coerce').dropna()
+            if len(_v) >= 20:
+                fresh_hit = (_v >= footprint_thresholds['vol_oi_fresh']).mean() * 100
+                fake_hit = (_v < footprint_thresholds['vol_oi_fakeout']).mean() * 100
+                warn = " ⚠️ this threshold isn't discriminating — retune it" if (
+                    fresh_hit > 95 or fresh_hit < 5) else ""
+                st.caption(
+                    f"Calibration check ({len(_v)} polls today): Vol/OI ranged {_v.min():.1f}–{_v.max():.1f} "
+                    f"(median {_v.median():.1f}). Your 'fresh' threshold fired on {fresh_hit:.0f}% of polls, "
+                    f"'fakeout' on {fake_hit:.0f}%.{warn}"
+                )
+
+        with st.expander(f"📋 Institutional Footprint Table (ATM ± {footprint_width} strikes)"):
+            fmt_table = footprint_table.copy()
+            fmt_table['ATM'] = np.where(fmt_table['Strike'] == atm_strike, '⬅ ATM', '')
+            display_fp_cols = ['Strike', 'ATM', 'CE_IV', 'PE_IV', 'IV_Skew', 'CE_OI_chg', 'PE_OI_chg',
+                                'ChgPCR', 'CE_Volume', 'PE_Volume', 'Total_OI', 'Vol_OI']
+
+            # MOBILE FIX: these return FOOTPRINT_TINTS entries, which pair each
+            # background with an explicit black foreground. Returning a bare
+            # background-color left the text at the theme's inherited colour --
+            # invisible in the mobile app's dark mode.
+            def _iv_skew_cell_color(val):
+                if pd.isna(val):
+                    return ''
+                if val <= footprint_thresholds['iv_skew_bearish']:
+                    return FOOTPRINT_TINTS['bearish']   # Put buying
+                if val >= footprint_thresholds['iv_skew_bullish']:
+                    return FOOTPRINT_TINTS['bullish']   # Put writing
+                return ''
+
+            def _vol_oi_cell_color(val):
+                if pd.isna(val):
+                    return ''
+                if val >= footprint_thresholds['vol_oi_fresh']:
+                    return FOOTPRINT_TINTS['fresh']     # fresh money
+                if val < footprint_thresholds['vol_oi_fakeout']:
+                    return FOOTPRINT_TINTS['fakeout']   # fakeout risk
+                return ''
+
+            # Manual CSS-based highlighting (no matplotlib dependency, unlike
+            # Styler.background_gradient which isn't installed on Streamlit
+            # Cloud by default). Wrapped so a styling hiccup never breaks the
+            # table -- it just falls back to plain formatting.
+            try:
+                styled = fmt_table[display_fp_cols].style.format(precision=2)
+                map_fn = styled.map if hasattr(styled, 'map') else styled.applymap
+                styled = map_fn(_iv_skew_cell_color, subset=['IV_Skew'])
+                map_fn2 = styled.map if hasattr(styled, 'map') else styled.applymap
+                styled = map_fn2(_vol_oi_cell_color, subset=['Vol_OI'])
+                st.dataframe(styled, use_container_width=True, height=360)
+            except Exception:
+                st.dataframe(fmt_table[display_fp_cols].style.format(precision=2),
+                              use_container_width=True, height=360)
+
+            st.caption(
+                "IV_Skew = CE_IV − PE_IV · ChgPCR = today's PE_OI_chg / CE_OI_chg (today's flow, not the "
+                "standing PCR) · Vol/OI = (CE_Volume+PE_Volume) / (CE_OI+PE_OI), the 'fresh money' ratio."
+            )
+    else:
+        st.caption("Not enough option chain data yet this poll to compute the Institutional Footprint.")
+
+    st.markdown("---")
+
+# ==========================================
+# SIGNAL PROGRESS PANEL
+# ==========================================
+st.subheader("📐 Signal Progress — what's met, what's still missing")
+if sig != "wait for data confirmation":
+    st.success(f"**{sig}** is currently active — all conditions for this tier are satisfied.")
+elif tier_report:
+    # Surface the tier with the most conditions already satisfied, so you can
+    # watch a setup building through the day instead of only seeing a flip.
+    closest_tier = max(tier_report.items(), key=lambda kv: kv[1]['met'] / kv[1]['total'])
+    tier_name, tier_data = closest_tier
+    st.info(f"Closest to firing: **{tier_name}** ({tier_data['met']}/{tier_data['total']} conditions met)")
+    cols = st.columns(tier_data['total'])
+    for col, (label, met, gap) in zip(cols, tier_data['conditions']):
+        with col:
+            icon = "✅" if met else "❌"
+            gap_label = f"margin +{gap:.2f}" if met else f"short by {abs(gap):.2f}"
+            st.markdown(f"{icon} **{label}**")
+            st.caption(gap_label)
+
+    with st.expander("Show all 4 tiers' full checklists"):
+        for tier_name, tier_data in tier_report.items():
+            st.markdown(f"**{tier_name}** — {tier_data['met']}/{tier_data['total']} met")
+            for label, met, gap in tier_data['conditions']:
+                icon = "✅" if met else "❌"
+                gap_label = f"margin +{gap:.2f}" if met else f"short by {abs(gap):.2f}"
+                st.caption(f"{icon} {label} — {gap_label}")
+            st.markdown("")
+else:
+    st.caption("Not enough data yet to evaluate tier progress.")
+
+st.markdown("---")
+
+# ==========================================
+# CONFLUENCE PANEL
+# ==========================================
+st.subheader("🧭 Confluence Layer (supporting evidence — does not override the signal above)")
+cf1, cf2, cf3, cf4 = st.columns(4)
+with cf1:
+    if spot_vs_vwap:
+        st.metric("Spot vs VWAP", f"{vwap_val:.1f}", spot_vs_vwap.split(" (")[0])
+    else:
+        st.metric("Spot vs VWAP", "unavailable")
+with cf2:
+    if mp is not None:
+        st.metric("Max Pain", f"{mp:.0f}", f"Spot is {'above' if spot and spot > mp else 'below'} Max Pain" if spot else "")
+    else:
+        st.metric("Max Pain", "disabled")
+with cf3:
+    if ce_spread is not None:
+        flag = "⚠️ wide" if ce_spread > liquidity_spread_limit else "OK"
+        st.metric("ATM CE Spread %", f"{ce_spread:.1f}%", flag)
+    else:
+        st.metric("ATM CE Spread %", "—")
+with cf4:
+    st.metric("Days to Expiry", f"{dte}" if dte is not None else "—",
+               "⚠️ Gamma risk — size down" if dte is not None and dte <= 1 else "")
+
+if total_checks:
+    st.caption(f"Confluence agreement: **{agree}/{total_checks}** independent filters support the current directional read.")
+
+st.markdown("---")
+
+# ==========================================
+# HIGHEST-PCR (SUPPORT) STRIKES — auto replacement for Analysis!H8:I9
+# ==========================================
+st.subheader("📌 Highest-PCR Strikes (auto-tracked support levels)")
+if not top_pcr.empty:
+    pcr_cols = st.columns(len(top_pcr))
+    for i, (_, row) in enumerate(top_pcr.iterrows()):
+        with pcr_cols[i]:
+            st.metric(f"Strike {row['Strike']:.0f}", f"PCR {row['PCR']:.2f}")
+else:
+    st.caption("No qualifying strikes yet.")
+
+st.markdown("---")
+
+# ==========================================
+# OI CHANGE CHART (Zone B)
+# ==========================================
+st.subheader("📈 Zone B OI Change (Call Unwinding/Writing vs Put Writing)")
+zone_b_df = zb['zone']
+fig = make_subplots(rows=1, cols=1)
+fig.add_trace(go.Bar(x=zone_b_df['Strike'], y=zone_b_df['CE_OI_chg'], name='CE OI Change', marker_color='#dc3545'))
+fig.add_trace(go.Bar(x=zone_b_df['Strike'], y=zone_b_df['PE_OI_chg'], name='PE OI Change', marker_color='#28a745'))
+fig.add_hline(y=0, line_dash="dash", line_color="gray")
+fig.update_layout(barmode='group', height=400, legend=dict(orientation="h", y=1.1))
+st.plotly_chart(fig, use_container_width=True)
+
+# ==========================================
+# FULL CHAIN TABLE (Sensibull-equivalent columns from Dhan data)
+# ==========================================
+st.subheader("📋 Option Chain (ATM ± 10)")
+band = df[(df['Strike'] >= atm_strike - 10 * STRIKE_STEP) & (df['Strike'] <= atm_strike + 10 * STRIKE_STEP)]
+display_cols = ['CE_Delta', 'CE_IV', 'CE_Volume', 'CE_OI_chg', 'CE_OI', 'CE_LTP',
+                 'Strike', 'PCR',
+                 'PE_LTP', 'PE_OI', 'PE_OI_chg', 'PE_Volume', 'PE_IV', 'PE_Delta']
+st.dataframe(band[display_cols].style.format(precision=2), use_container_width=True, height=420)
 
 # ==========================================
 # SIGNAL PERFORMANCE TRACKER — the panel that makes the rest falsifiable
