@@ -230,6 +230,21 @@ DEFAULT_GEX_SETTINGS = {
     "flip_near_pct": 0.15,  # spot within this % of the flip = "at the flip", regime unstable
 }
 
+# The GEX Decision Card: a fixed intraday playbook whose branches are chosen by the
+# live regime rather than read off a laminated sheet. The point of wiring it into the
+# app instead of keeping it on paper is that every branch condition — which side of
+# the flip, whether a wall has broken, whether the cutoff has passed, how much of the
+# daily risk budget is gone — is already computable here, so the card can show its
+# CURRENT state instead of asking the trader to evaluate five conditions under
+# pressure. Discipline rules fail at exactly the moment they matter most.
+DEFAULT_DECISION_CARD = {
+    "cutoff_hour": 15, "cutoff_minute": 0,   # all intraday longs flat by this IST time
+    "cutoff_warn_minutes": 30,               # start warning this long before the cutoff
+    "max_losses": 2,                         # stop for the day at this many losing trades
+    "daily_risk_pct": 1.0,                   # max % of capital at risk across the whole day
+    "per_trade_risk_pct": 0.5,               # ...and per individual trade
+}
+
 DEFAULT_VELOCITY_SETTINGS = {
     "width": 5,             # ATM ± N strikes watched for bursts
     "burst_pctile": 85,     # a poll is a "burst" above this percentile of today's own velocity
@@ -269,7 +284,10 @@ DEFAULT_RISK_SETTINGS = {
     "capital": 500_000,          # one NIFTY lot is 75 × spot in notional; at ₹2L, 1% risk
                                  # cannot fund a single lot on any realistic stop, so the
                                  # default is set where the sizing math produces a real answer
-    "risk_pct": 1.0,             # % of capital risked per trade
+    "risk_pct": 0.5,             # % of capital risked per trade — deliberately matched to
+                                 # DEFAULT_DECISION_CARD['per_trade_risk_pct'] so the envelope's
+                                 # lot count and the card's cap agree out of the box. Raise one
+                                 # without the other and the card flags the mismatch.
     "max_premium_pct": 25.0,     # cap total premium outlay at this % of capital
 }
 
@@ -328,6 +346,32 @@ def load_today_log(date_str: str) -> pd.DataFrame:
         except Exception:
             return pd.DataFrame()
     return pd.DataFrame()
+
+
+def load_loss_counter(date_str: str) -> int:
+    """The decision card's 'max 2 losses and you're done' rule needs to survive a
+    Streamlit rerun, which happens on every widget click and every 10-second poll.
+    Session state alone would survive reruns but not a redeploy or a browser
+    refresh mid-session, which is precisely when a trader would be tempted to
+    'lose' the count and take a third trade. One small file per day, read on every
+    run, fails soft to zero."""
+    try:
+        path = LOG_DIR / f"discipline_{date_str}.json"
+        if path.exists():
+            import json as _json
+            return int(_json.loads(path.read_text()).get('losses', 0))
+    except Exception:
+        pass
+    return 0
+
+
+def save_loss_counter(date_str: str, losses: int):
+    try:
+        import json as _json
+        (LOG_DIR / f"discipline_{date_str}.json").write_text(
+            _json.dumps({'losses': int(losses), 'updated': datetime.now(IST).isoformat()}))
+    except Exception as e:
+        st.sidebar.caption(f"⚠️ Loss counter save failed: {e}")
 
 
 def load_all_logs(max_days: int = 30) -> pd.DataFrame:
@@ -1639,6 +1683,233 @@ def gex_breakout_discount(gex, spot) -> tuple:
 
 
 # ==========================================
+# GEX DECISION CARD — the playbook, with its branches resolved against live state
+# ==========================================
+# A laminated decision card works right up until the moment it matters, when five
+# branch conditions have to be evaluated correctly under time pressure and with money
+# already moving. Every one of those conditions is computable here: which side of the
+# flip spot sits on, whether a wall has actually broken, how long to the cutoff, how
+# much of the daily risk budget is gone. So the card shows its CURRENT state rather
+# than asking to be read and applied.
+#
+# It is a presentation layer over the regime, not a new signal. Nothing here feeds the
+# Master Signal, the Scenario card or the IV Lens.
+def gex_flip_zone_pts(gex, spot, settings: dict = None):
+    """Half-width of the flip zone in points, for display. Shares its definition with
+    compute_gex() so the card and the regime flag can never drift apart on what
+    'at the flip' actually means."""
+    try:
+        pct = float((settings or DEFAULT_GEX_SETTINGS).get('flip_near_pct', 0.15))
+        return float(spot) * pct / 100.0
+    except Exception:
+        return 0.0
+
+
+def build_gex_decision(gex, spot, mp, vwap_val, walls, now_ist, risk_settings,
+                       card: dict, losses_today: int, breakout_signal_active: bool,
+                       gex_settings: dict = None):
+    """Resolves the fixed intraday playbook against the current tape.
+
+    Step 1 picks the mode from the gamma regime. Step 2 collects the levels that
+    matter into one price-ordered ladder. Step 3 evaluates each discipline rule
+    against live state, so a breached rule announces itself instead of waiting to be
+    remembered. Step 4 does the risk arithmetic and cross-checks it against what the
+    Risk Envelope panel is actually sizing.
+
+    With no GEX (market closed, or zero greeks on a cached snapshot) it still returns
+    the ladder and the discipline rules, because those stay valid for preparing a
+    session — only the mode is withheld."""
+    minutes_to_cutoff = None
+    if now_ist is not None:
+        try:
+            cutoff = now_ist.replace(hour=int(card.get('cutoff_hour', 15)),
+                                     minute=int(card.get('cutoff_minute', 0)),
+                                     second=0, microsecond=0)
+            minutes_to_cutoff = (cutoff - now_ist).total_seconds() / 60.0
+        except Exception:
+            minutes_to_cutoff = None
+
+    # ---------- STEP 1: mode ----------
+    if gex is None:
+        mode = {
+            'key': 'unavailable', 'title': 'Regime unavailable — no live gamma',
+            'stance': "Step 1 needs a live spot and non-zero greeks. Dhan returns zero greeks "
+                      "outside market hours, so this resolves on the first live poll of the "
+                      "session. Steps 2 and 3 below are still valid for preparation.",
+            'instrument': '—', 'size': 'No position', 'color': '#6c757d',
+        }
+    elif gex['at_flip']:
+        mode = {
+            'key': 'flip', 'title': 'ON THE FLIP — no position',
+            'stance': "Spot is inside the flip zone, where the tape can switch between fading and "
+                      "chasing on a 20-point move. Wait for a break AND hold of the flip level, "
+                      "then trade the regime it settles into — not the one it just left.",
+            'instrument': 'Nothing until the flip breaks and holds',
+            'size': 'MINIMUM SIZE once it does', 'color': '#fd7e14',
+        }
+    elif gex['net_gex'] < 0:
+        mode = {
+            'key': 'buyer', 'title': 'BUYER MODE — short gamma',
+            'stance': "Dealer hedging runs with the move, so broken walls accelerate rather than "
+                      "revert. Trade wall breaks and VWAP streaks in the direction of the break. "
+                      "This is the regime that produces extended trends, and the overshoots that "
+                      "look unsustainable are real.",
+            'instrument': 'ATM / ITM calls or puts (long premium)',
+            'size': 'FULL SIZE', 'color': '#1e7e34',
+        }
+    else:
+        mode = {
+            'key': 'seller', 'title': 'SELLER / FADER MODE — long gamma',
+            'stance': "Dealer hedging leans against the move. Fade the walls, expect the Max Pain "
+                      "magnet to hold, and treat every breakout signal elsewhere in this app as a "
+                      "trap until proven otherwise.",
+            'instrument': 'Defined-risk spreads (credit spreads / iron condors)',
+            'size': 'Defined risk only — no naked long premium', 'color': '#c82333',
+        }
+
+    # ---------- STEP 2: the level ladder ----------
+    levels = []
+
+    def _add(label, price, note):
+        try:
+            price = float(price)
+        except (TypeError, ValueError):
+            return
+        if not np.isfinite(price):
+            return
+        levels.append({'Level': label, 'Price': price,
+                       'Distance': (price - spot) if spot else np.nan, 'Role': note})
+
+    if gex:
+        _add("γ Flip", gex.get('flip_level'),
+             "Regime boundary — the whole card re-reads on the other side of this")
+        _add("γ Wall (max +GEX)", gex.get('gamma_wall'), "Strongest pin / magnet strike")
+        _add("γ Pit (max −GEX)", gex.get('gamma_pit'), "Acceleration zone — moves speed up here")
+    if walls:
+        _add("Call wall (max CE OI)", walls.get('max_ce_strike'),
+             "Resistance — writers defending. Break = upside acceleration in buyer mode")
+        _add("Put wall (max PE OI)", walls.get('max_pe_strike'),
+             "Support — put writers defending. Break = downside acceleration in buyer mode")
+    _add("Max Pain", mp, "Where the option book wants price to expire")
+    _add("VWAP", vwap_val, "Session mean — the streak reference")
+    _add("SPOT", spot, "◀ you are here")
+
+    ladder = (pd.DataFrame(levels).sort_values('Price', ascending=False).reset_index(drop=True)
+              if levels else pd.DataFrame())
+
+    # ---------- STEP 3: discipline rules, evaluated live ----------
+    rules = []
+
+    if mode['key'] == 'seller' and breakout_signal_active:
+        rules.append(('alert', "Long gamma + breakout signal = DISCOUNT IT",
+                      "A directional breakout signal is live right now while dealers are long "
+                      "gamma. This is the trap case the rule exists for — the mechanics say it gets "
+                      "faded back toward the high-OI strikes."))
+    elif mode['key'] == 'seller':
+        rules.append(('watch', "Long gamma + breakout signal = DISCOUNT IT",
+                      "In force. No breakout signal firing at the moment; if one appears, it does "
+                      "not override the regime."))
+    else:
+        rules.append(('ok', "Long gamma + breakout signal = DISCOUNT IT",
+                      "Not applicable in this regime."))
+
+    broke_up = bool(spot and walls and walls.get('max_ce_strike')
+                    and spot > float(walls['max_ce_strike']))
+    broke_dn = bool(spot and walls and walls.get('max_pe_strike')
+                    and spot < float(walls['max_pe_strike']))
+    if mode['key'] == 'buyer' and (broke_up or broke_dn):
+        rules.append(('alert', "Short gamma + wall break = ACCELERATION",
+                      f"Spot is {'above the call wall' if broke_up else 'below the put wall'} in a "
+                      f"short-gamma regime. This is the ride-it case: dealer hedging is now feeding "
+                      f"the move rather than absorbing it."))
+    elif mode['key'] == 'buyer':
+        rules.append(('watch', "Short gamma + wall break = ACCELERATION",
+                      "Armed. Spot is still inside the walls — this triggers on the break, not in "
+                      "anticipation of it."))
+    else:
+        rules.append(('ok', "Short gamma + wall break = ACCELERATION",
+                      "Not applicable in this regime."))
+
+    if gex and gex['at_flip']:
+        rules.append(('alert', "Stop trading the read inside the flip zone",
+                      "Spot has re-entered the flip zone. The regime read this card is built on is "
+                      "no longer stable — flatten or stop adding until it resolves to one side."))
+    elif gex and gex.get('flip_level') and spot:
+        zone = gex_flip_zone_pts(gex, spot, gex_settings)
+        rules.append(('watch', "Stop trading the read inside the flip zone",
+                      f"Clear of the flip by {abs(gex['flip_distance']):.0f} pts. The zone is "
+                      f"±{zone:.0f} pts around {gex['flip_level']:.0f}."))
+    else:
+        rules.append(('ok', "Stop trading the read inside the flip zone",
+                      "No flip level located in the current band — nothing to re-enter."))
+
+    cutoff_label = f"{int(card.get('cutoff_hour', 15)):02d}:{int(card.get('cutoff_minute', 0)):02d}"
+    warn_min = float(card.get('cutoff_warn_minutes', 30))
+    if minutes_to_cutoff is None:
+        rules.append(('ok', f"All intraday longs closed by {cutoff_label}", "Clock unavailable."))
+    elif minutes_to_cutoff <= 0:
+        rules.append(('alert', f"All intraday longs closed by {cutoff_label}",
+                      f"Past the cutoff by {abs(minutes_to_cutoff):.0f} min. Intraday longs should "
+                      f"already be flat — theta and the closing auction are both working against "
+                      f"holding now."))
+    elif minutes_to_cutoff <= warn_min:
+        rules.append(('watch', f"All intraday longs closed by {cutoff_label}",
+                      f"{minutes_to_cutoff:.0f} minutes to the cutoff. Stop opening new intraday "
+                      f"longs and start working out of what's open."))
+    else:
+        rules.append(('ok', f"All intraday longs closed by {cutoff_label}",
+                      f"{minutes_to_cutoff:.0f} minutes until the cutoff."))
+
+    max_losses = int(card.get('max_losses', 2))
+    if losses_today >= max_losses:
+        rules.append(('alert', f"Max {max_losses} losses per day",
+                      f"{losses_today} logged — done for the day. Two losses in one session usually "
+                      f"means the regime read is wrong, not that the next trade is due, and the "
+                      f"trade taken to get even is the one that does the damage."))
+    elif losses_today == max_losses - 1:
+        rules.append(('watch', f"Max {max_losses} losses per day",
+                      f"{losses_today} logged. One more and the session is over."))
+    else:
+        rules.append(('ok', f"Max {max_losses} losses per day",
+                      f"{losses_today} of {max_losses} used."))
+
+    # ---------- STEP 4: risk arithmetic ----------
+    capital = float(risk_settings.get('capital', 0) or 0)
+    daily_pct = float(card.get('daily_risk_pct', 1.0))
+    trade_pct = float(card.get('per_trade_risk_pct', 0.5))
+    daily_budget = capital * daily_pct / 100.0
+    per_trade_cap = capital * trade_pct / 100.0
+    spent = min(losses_today, max_losses) * per_trade_cap
+    remaining = max(daily_budget - spent, 0.0)
+
+    envelope_pct = float(risk_settings.get('risk_pct', 0) or 0)
+    conflict_note = None
+    if envelope_pct > trade_pct + 1e-9 and trade_pct > 0:
+        conflict_note = (
+            f"The Risk Envelope panel is sizing at **{envelope_pct:.2f}%** per trade while this card "
+            f"caps a trade at **{trade_pct:.2f}%**. Its lot count is therefore about "
+            f"**{envelope_pct / trade_pct:.1f}× too large** for this playbook — either halve what it "
+            f"suggests, or set 'Risk per trade' to {trade_pct:.2f}% so the two panels agree.")
+
+    risk = {
+        'capital': capital, 'daily_pct': daily_pct, 'trade_pct': trade_pct,
+        'daily_budget': daily_budget, 'per_trade_cap': per_trade_cap,
+        'spent': spent, 'remaining': remaining,
+        'trades_left': int(remaining // per_trade_cap) if per_trade_cap > 0 else 0,
+        'envelope_pct': envelope_pct, 'conflict_note': conflict_note,
+    }
+
+    # A hard block comes only from the discipline rules (flip zone, cutoff, loss limit),
+    # never from the two regime rules — those change WHICH trade is right, not whether
+    # trading is permitted at all.
+    blocked = [r for r in rules[2:] if r[0] == 'alert']
+
+    return {'mode': mode, 'ladder': ladder, 'rules': rules, 'risk': risk,
+            'blocked': blocked, 'cutoff_label': cutoff_label,
+            'minutes_to_cutoff': minutes_to_cutoff}
+
+
+# ==========================================
 # MODULE 2 — INTRADAY OI VELOCITY (the burst detector)
 # ==========================================
 # Every OI-change number in this app is `oi - previous_oi`: cumulative since the
@@ -1886,6 +2157,11 @@ SIGNAL_DIRECTION = {
     'IV_Lens_Stance': {'shakeout': 1, 'conviction': 1, 'distribution': -1, 'fear_bid': -1},
     'ZoneB_Signal': {'Buy CE': 1, 'Write PE': 1, 'Buy PE': -1, 'Write CE': -1},
     'VWAP_Trend_Side': {'above': 1, 'below': -1},
+    # Card_Mode is NOT listed here on purpose. It is a regime label, not a direction —
+    # "buyer mode" says breaks accelerate, it does not say which way price breaks, so
+    # grading it as if it were long or short would be meaningless. To test whether the
+    # regime split adds anything, filter the log by Card_Mode and re-grade the
+    # directional signals within each subset instead.
 }
 
 
@@ -2682,6 +2958,28 @@ with st.sidebar:
             help="Leave OFF with Dhan. Its greeks already embed time-to-expiry, so weighting again "
                  "double-counts the expiry effect and makes expiry-day numbers meaningless.")
 
+        st.markdown("**📋 Decision card**")
+        show_decision_card = st.checkbox(
+            "Show the GEX decision card", value=True,
+            help="The intraday playbook with its branches resolved against live state — mode, "
+                 "levels, discipline rules and the risk budget, all evaluated for right now "
+                 "instead of left to be applied under pressure.")
+        card_cutoff = st.time_input(
+            "Close all intraday longs by",
+            value=dtime(DEFAULT_DECISION_CARD['cutoff_hour'], DEFAULT_DECISION_CARD['cutoff_minute']),
+            help="The card warns as this approaches and flags a breach once it passes.")
+        card_max_losses = st.number_input(
+            "Stop for the day after N losses", min_value=1, max_value=10,
+            value=DEFAULT_DECISION_CARD['max_losses'])
+        card_daily_risk = st.number_input(
+            "Max capital at risk per DAY (%)", value=DEFAULT_DECISION_CARD['daily_risk_pct'],
+            step=0.25, format="%.2f")
+        card_trade_risk = st.number_input(
+            "Max capital at risk per TRADE (%)", value=DEFAULT_DECISION_CARD['per_trade_risk_pct'],
+            step=0.25, format="%.2f",
+            help="Cross-checked against the Risk Envelope's own 'Risk per trade' setting — the card "
+                 "flags it when the envelope is sizing larger than this playbook allows.")
+
     st.markdown("---")
     with st.expander("💥 OI Velocity (burst detector)", expanded=True):
         show_velocity_panel = st.checkbox("Show poll-to-poll OI velocity", value=True)
@@ -2840,6 +3138,12 @@ signal_thresholds = {"strong": strong_diff_th, "mild": mild_diff_th}
 gex_settings = {
     "width": int(gex_width), "lot_size": int(gex_lot_size),
     "time_weight": gex_time_weight, "flip_near_pct": gex_flip_near,
+}
+decision_card_settings = {
+    "cutoff_hour": card_cutoff.hour, "cutoff_minute": card_cutoff.minute,
+    "cutoff_warn_minutes": DEFAULT_DECISION_CARD['cutoff_warn_minutes'],
+    "max_losses": int(card_max_losses),
+    "daily_risk_pct": card_daily_risk, "per_trade_risk_pct": card_trade_risk,
 }
 velocity_settings = {
     "width": int(vel_width), "burst_pctile": int(vel_pctile),
@@ -3200,6 +3504,25 @@ risk_short = build_risk_envelope(spot, atr_val, expected_move, -1, df, atm_strik
                                  _scen_walls, risk_settings, f"{candle_interval}m") if atr_val else None
 risk_active = risk_long if risk_direction > 0 else (risk_short if risk_direction < 0 else None)
 
+# ==========================================
+# GEX DECISION CARD — resolved against live state
+# ==========================================
+# Built here rather than in the panel because it needs the scenario walls, the VWAP
+# trend and the risk settings, all of which are only complete at this point. A
+# "breakout signal" for the trap rule means any of the three independent directional
+# reads firing at once — the Master Signal at a strong tier, a confirmed VWAP streak,
+# or a live Scenario A/B — since the rule is about the regime overruling ALL of them.
+losses_today = load_loss_counter(today_str)
+breakout_signal_active = bool(
+    sig in ("Strong CE Buy", "Strong PE Buy", "PE writers strong", "CE writers strong")
+    or (vwap_trend and vwap_trend.get('confirmed'))
+    or (scenario and scenario.get('scenario') in ('A', 'B'))
+)
+decision = build_gex_decision(
+    gex, spot, mp, vwap_val, _scen_walls, now_ist, risk_settings,
+    decision_card_settings, losses_today, breakout_signal_active, gex_settings
+) if show_decision_card else None
+
 # Confluence agreement counter (informational only)
 bullish_signals = sig in ("Strong CE Buy", "PE writers strong") or zb['signal'] in ("Buy CE", "Write PE")
 bearish_signals = sig in ("Strong PE Buy", "CE writers strong") or zb['signal'] in ("Buy PE", "Write CE")
@@ -3268,6 +3591,13 @@ if is_open:
         'ATR': round(atr_val, 1) if atr_val else None,
         'Risk_Stop_Dist': round(risk_active['stop_dist'], 1) if risk_active else None,
         'Risk_Lots': risk_active['lots'] if risk_active else None,
+        # Card mode is logged so the tracker can eventually answer the question the card
+        # itself can't: did signals taken in buyer mode actually outperform the same
+        # signals taken in seller mode? That is the test of whether the regime split is
+        # doing any work, and it needs weeks of logs before it means anything.
+        'Card_Mode': decision['mode']['key'] if decision else None,
+        'Card_Blocked': (", ".join(r[1] for r in decision['blocked'])
+                         if (decision and decision['blocked']) else None),
     }
     st.session_state.session_log.append(log_row)
     append_log_row(log_row, today_str)
@@ -3709,6 +4039,119 @@ if show_gex_panel:
                 "reprice of the book at each hypothetical spot — treat it as a zone of roughly a "
                 "strike's width, not a line to the point."
             )
+
+    # ----------------------------------------
+    # DECISION CARD — the playbook with its branches already resolved
+    # ----------------------------------------
+    if decision:
+        st.markdown("#### 📋 GEX Decision Card")
+
+        _rule_icon = {'alert': '🔴', 'watch': '🟡', 'ok': '🟢'}
+
+        # A breached discipline rule outranks the mode entirely, so it goes ABOVE it.
+        # Showing "FULL SIZE" at the top while the loss limit is hit would be the
+        # single most dangerous thing this panel could render.
+        if decision['blocked']:
+            reasons = " · ".join(r[1] for r in decision['blocked'])
+            st.error(f"⛔ **STAND DOWN — {reasons}.** The mode below describes the regime, but a "
+                     f"discipline rule is breached. Regime tells you which trade; discipline tells "
+                     f"you whether to take one at all, and it wins.")
+
+        m = decision['mode']
+        st.markdown(f"""
+<div style='background-color:{m['color']};padding:20px;border-radius:10px;margin:6px 0;
+{"opacity:0.55;" if decision['blocked'] else ""}'>
+    <p style='color:white;margin:0;font-size:0.85em;letter-spacing:1px;'>STEP 1 — NET GEX SIGN</p>
+    <h3 style='color:white;margin:4px 0 0 0;'>{m['title']}</h3>
+    <p style='color:white;margin:10px 0 0 0;'>{m['stance']}</p>
+    <p style='color:white;margin:10px 0 0 0;'>Instrument: <b>{m['instrument']}</b>
+    &nbsp;|&nbsp; Size: <b>{m['size']}</b></p>
+</div>""", unsafe_allow_html=True)
+
+        st.markdown("**STEP 2 — Levels**")
+        if decision['ladder'].empty:
+            st.caption("No levels available on this poll.")
+        else:
+            _lad = decision['ladder'].copy()
+            _lad['Price'] = _lad['Price'].map(lambda v: f"{v:,.0f}")
+            _lad['Distance'] = _lad['Distance'].map(
+                lambda v: "—" if pd.isna(v) else f"{v:+,.0f}")
+            st.dataframe(_lad, use_container_width=True, hide_index=True,
+                         height=min(360, 60 + 35 * len(_lad)))
+            st.caption(
+                "Ordered by price, high to low, so it reads as a ladder rather than a list — the "
+                "rows immediately above and below SPOT are the ones that matter for the next move. "
+                "Distances are in points from spot."
+            )
+
+        st.markdown("**STEP 3 — Rules**")
+        for status, title, detail in decision['rules']:
+            st.markdown(f"{_rule_icon[status]} **{title}**")
+            st.caption(detail)
+
+        st.markdown("**STEP 4 — Risk**")
+        rk = decision['risk']
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Daily risk budget", f"₹{rk['daily_budget']:,.0f}",
+                  f"{rk['daily_pct']:.2f}% of ₹{rk['capital']:,.0f}")
+        k2.metric("Max loss per trade", f"₹{rk['per_trade_cap']:,.0f}",
+                  f"{rk['trade_pct']:.2f}% of capital")
+        k3.metric("Budget used", f"₹{rk['spent']:,.0f}",
+                  f"{losses_today} loss(es) logged")
+        k4.metric("Trades left today", f"{rk['trades_left']}",
+                  f"₹{rk['remaining']:,.0f} remaining")
+
+        if rk['conflict_note']:
+            st.warning(f"⚠️ **Sizing conflict.** {rk['conflict_note']}")
+
+        st.caption(
+            "In seller/fader mode the per-trade cap is what sets the **spread width**: a defined-risk "
+            "spread's max loss is (width − credit) × lot size, so pick the width that brings that at "
+            "or under the cap. In buyer mode the Risk Envelope panel below already does this "
+            "arithmetic against the ATR stop."
+        )
+
+        # --- the loss counter that makes rule 5 real ---
+        lc1, lc2, lc3 = st.columns([1, 1, 2])
+        with lc1:
+            if st.button("➕ Log a loss", use_container_width=True):
+                save_loss_counter(today_str, losses_today + 1)
+                st.rerun()
+        with lc2:
+            if st.button("↺ Reset counter", use_container_width=True):
+                save_loss_counter(today_str, 0)
+                st.rerun()
+        with lc3:
+            st.caption(
+                "The counter is written to a small daily file, so it survives reruns, the 10-second "
+                "poll and a browser refresh — which is exactly when it would otherwise get "
+                "conveniently forgotten."
+            )
+
+        with st.expander("What this card does and does not decide"):
+            st.markdown(
+                "This is a **presentation layer over the regime**, not a new signal. It reads GEX, "
+                "the OI walls, Max Pain, VWAP and the clock, and resolves your fixed playbook "
+                "against them. Nothing here feeds the Master Signal, the Scenario card or the IV "
+                "Lens — the three OI reads are untouched.\n\n"
+                "**What it decides:** which *kind* of setup fits today's dealer positioning, which "
+                "levels frame it, and whether a discipline rule currently forbids trading at all.\n\n"
+                "**What it does not decide:** direction. Buyer mode says breaks accelerate; it does "
+                "not say which way price breaks. That still comes from the Master Signal, the "
+                "Scenario card and the flow panels. A card in buyer mode with no directional signal "
+                "is not a trade — it is permission to take one when a signal appears.\n\n"
+                "**The ordering is deliberate.** Discipline breaches render above the mode, because "
+                "a card showing 'FULL SIZE' while the loss limit is hit is worse than no card at "
+                "all. Regime tells you which trade; discipline tells you whether to take one."
+            )
+            st.caption(
+                "The two regime rules (steps 3.1 and 3.2) never block — they change which trade is "
+                "right, not whether trading is allowed. Only the flip zone, the cutoff and the loss "
+                "limit produce a stand-down. Also worth saying plainly: the cutoff, the loss cap and "
+                "the risk percentages are your parameters, not the app's recommendations. It "
+                "enforces what you configured in the sidebar."
+            )
+
     st.markdown("---")
 
 # ==========================================
