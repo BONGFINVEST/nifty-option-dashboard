@@ -301,11 +301,17 @@ GSHEET_SNAPSHOT_SHEET = "closing_snapshot"
 GSHEET_LOG_SHEET = "session_log"
 
 
-def save_chain_snapshot(df: pd.DataFrame, fetched_at: datetime, expiry: str):
+def save_chain_snapshot(df: pd.DataFrame, fetched_at: datetime, expiry: str,
+                        spot: float = None):
     try:
         out = df.copy()
         out['_fetched_at'] = fetched_at.isoformat()
         out['_expiry'] = expiry
+        # Spot is persisted so a closed-market rerun can recover the true ATM.
+        # Without it the ATM fallback used the chain's MEDIAN STRIKE, which is a
+        # property of how wide the chain is, not of where price is -- that is what
+        # produced sub-intrinsic ATM puts and a fabricated IV skew on cached reads.
+        out['_spot'] = float(spot) if spot else np.nan
         out.to_csv(SNAPSHOT_DIR / f"{fetched_at.strftime('%Y-%m-%d')}.csv", index=False)
     except Exception as e:
         st.sidebar.caption(f"⚠️ Chain snapshot save failed: {e}")
@@ -421,7 +427,8 @@ def get_gsheet_worksheet(name: str, rows=2000, cols=30):
         return sh.add_worksheet(title=name, rows=rows, cols=cols)
 
 
-def save_chain_snapshot_to_gsheet(df: pd.DataFrame, fetched_at: datetime, expiry: str):
+def save_chain_snapshot_to_gsheet(df: pd.DataFrame, fetched_at: datetime, expiry: str,
+                                  spot: float = None):
     if not gsheets_configured():
         return
     try:
@@ -430,6 +437,7 @@ def save_chain_snapshot_to_gsheet(df: pd.DataFrame, fetched_at: datetime, expiry
         out = df.copy()
         out['_fetched_at'] = fetched_at.isoformat()
         out['_expiry'] = expiry
+        out['_spot'] = float(spot) if spot else np.nan
         ws.clear()
         set_with_dataframe(ws, out, include_index=False, resize=True)
     except Exception as e:
@@ -762,6 +770,65 @@ def analyze_vwap_trend(ohlc_df: pd.DataFrame, interval_minutes: int, confirm_can
         'distance_pts': distance_pts, 'distance_pct': distance_pct,
         'touched_vwap_now': bool(out['touched_vwap'].iloc[-1]),
     }
+
+
+def recover_spot(df: pd.DataFrame):
+    """Spot for a cached / closed-market chain, in order of trustworthiness.
+
+    1. the value persisted alongside the snapshot ('_spot')
+    2. put-call parity: at the strike where |CE_LTP - PE_LTP| is smallest,
+       spot ~= K + CE_LTP - PE_LTP  (rates/carry ignored -- immaterial intraday)
+
+    Returns (spot, source). Deliberately never falls back to the median strike:
+    a median strike describes the chain's WIDTH, not price, and silently
+    substituting it is what corrupted every vol-surface read on cached polls.
+    """
+    if '_spot' in df.columns:
+        v = pd.to_numeric(df['_spot'], errors='coerce').dropna()
+        if len(v) and np.isfinite(v.iloc[0]) and v.iloc[0] > 0:
+            return float(v.iloc[0]), 'snapshot'
+    try:
+        d = df.dropna(subset=['CE_LTP', 'PE_LTP']).copy()
+        d = d[(d['CE_LTP'] > 0) & (d['PE_LTP'] > 0)]
+        if not d.empty:
+            row = d.loc[(d['CE_LTP'] - d['PE_LTP']).abs().idxmin()]
+            synth = float(row['Strike'] + row['CE_LTP'] - row['PE_LTP'])
+            if np.isfinite(synth) and synth > 0:
+                return synth, 'parity'
+    except Exception:
+        pass
+    return None, None
+
+
+def chain_is_coherent(df: pd.DataFrame, atm: float, spot: float):
+    """Guard rail on the CE/PE alignment. Returns (ok, [problems]).
+
+    Two assertions:
+      * ATM must sit within one strike interval of spot
+      * the ATM put must not trade below intrinsic
+
+    Either failure means the CE and PE legs are being read off different strikes,
+    which silently corrupts IV skew, ChgPCR, the Expected Move envelope and the
+    straddle breakevens. When it trips, the caller blanks those panels rather than
+    publishing them -- a dark panel is safe, a confident wrong number is not.
+    """
+    problems = []
+    if spot is None or atm is None:
+        return False, ["no usable spot -- vol-surface reads suppressed"]
+    if abs(atm - spot) > STRIKE_STEP:
+        problems.append(f"ATM {atm:.0f} is {abs(atm - spot):.0f} pts from spot "
+                        f"{spot:.0f} (max {STRIKE_STEP:.0f})")
+    row = df[df['Strike'] == atm]
+    if not row.empty:
+        pe = row.iloc[0].get('PE_LTP')
+        ce = row.iloc[0].get('CE_LTP')
+        pe_intrinsic = max(0.0, atm - spot)
+        ce_intrinsic = max(0.0, spot - atm)
+        if pd.notna(pe) and pe < pe_intrinsic - 1.0:
+            problems.append(f"ATM PE {pe:.1f} is below intrinsic {pe_intrinsic:.1f}")
+        if pd.notna(ce) and ce < ce_intrinsic - 1.0:
+            problems.append(f"ATM CE {ce:.1f} is below intrinsic {ce_intrinsic:.1f}")
+    return (len(problems) == 0), problems
 
 
 def build_oi_profile(df: pd.DataFrame, atm: float, width: int):
@@ -2617,9 +2684,14 @@ def institutional_footprint_signal(iv_skew, chg_pcr, vol_oi, market_direction, t
          bias when it fires, since a trap is a higher-conviction, more
          specific read than a standing skew)
       3. Vol/OI -> conviction tag on whichever headline above is chosen
-    Returns (headline, color_key, explanation_lines: list[str])."""
+    Returns (headline, color_key, explanation_lines, footprint_leg_detail).
+    The 4th element is the per-leg breakdown the hierarchy arbiter consumes."""
     lines = []
 
+    # NOTE: iv_bias and trap_bias below are retained because they document the
+    # reasoning in `lines`, but they NO LONGER set the headline. The headline is
+    # decided by footprint_direction() further down, which requires >=2 agreeing
+    # legs. Do not reconnect them.
     # -- 1. IV Skew --
     if pd.isna(iv_skew):
         iv_bias, iv_line = "Neutral", "IV Skew unavailable."
@@ -2665,19 +2737,252 @@ def institutional_footprint_signal(iv_skew, chg_pcr, vol_oi, market_direction, t
         conv_line = f"Vol/OI {vol_oi:.2f} — moderate participation, no strong confirmation either way."
     lines.append(conv_line)
 
-    # Trap read takes precedence (more specific, higher-conviction signal) over the standing skew bias
-    headline_bias = trap_bias if trap_bias else iv_bias
+    # -- headline: requires >=2 DIRECTIONAL legs in agreement --
+    # The old line here was `headline_bias = trap_bias if trap_bias else iv_bias`,
+    # which let a SINGLE leg set the headline. That is how a lone IV skew produced a
+    # BULLISH Footprint while every other read on the page was bearish. Under the
+    # hierarchy the Footprint sits at rank 3 and must clear its own bar before it is
+    # allowed to assert a direction at all.
+    #
+    # Vol/OI deliberately does not vote. It measures whether flow is REAL, not which
+    # way it points, so letting it vote would count conviction as direction. That
+    # leaves exactly two genuine legs -- IV skew and ChgPCR -- so ">=2 agreeing"
+    # means both of them, agreeing.
+    fl = footprint_legs(iv_skew, chg_pcr, vol_oi, market_direction, t, chg_pcr_reliable)
+    fp_dir, fp_state, n_agree, n_total = footprint_direction(
+        fl, t.get('_hierarchy', HIERARCHY_DEFAULTS)['footprint_min_legs'])
+
+    if fp_state == 'qualified':
+        headline_bias = "Bullish" if fp_dir > 0 else "Bearish"
+    else:
+        headline_bias = "Neutral"
+        if fp_state == 'split':
+            lines.append(f"⚠️ Legs disagree ({n_total} directional, none in agreement) — the "
+                         f"Footprint asserts NO direction. Rank 3 yields to Buildup.")
+        else:
+            lines.append(f"⚠️ Only {n_total} directional leg — the Footprint needs 2 in "
+                         f"agreement before it asserts a direction. Vol/OI measures whether "
+                         f"the flow is real, not which way it points, so it does not vote.")
+
     if headline_bias == "Bullish":
         headline, color_key = "🟢 Institutional Footprint: BULLISH", "bullish"
     elif headline_bias == "Bearish":
         headline, color_key = "🔴 Institutional Footprint: BEARISH", "bearish"
     else:
-        headline, color_key = "⚪ Institutional Footprint: NEUTRAL", "neutral"
+        headline, color_key = "⚪ Institutional Footprint: NO QUALIFIED READ", "neutral"
 
     if conviction == "Fakeout risk" and headline_bias != "Neutral":
         headline += " (low conviction — Vol/OI thin)"
 
-    return headline, color_key, lines
+    return headline, color_key, lines, fl
+
+
+# ============================================================================
+# DIRECTIONAL HIERARCHY
+#   rank 1  GEX regime      -> gate + mode (PERMISSION, not a direction)
+#   rank 2  Buildup         -> direction, only on full inputs
+#   rank 3  Footprint       -> direction, only when >=2 legs agree
+#   rank 4  ChgPCR alone    -> direction of last resort, minimum size
+#
+# GEX is rank 1 but it is a DIFFERENT KIND of object from ranks 2-4. Buildup,
+# Footprint and ChgPCR each output a direction. GEX outputs a regime -- whether
+# dealer hedging runs with the move or against it -- so it cannot outrank the
+# others on direction, because it does not produce one. It therefore gates, and
+# the highest-ranked qualified source below it supplies the direction. That is
+# what lets one bearish read be traded short in short gamma and long in long
+# gamma without either being a contradiction.
+# ============================================================================
+
+HIERARCHY_DEFAULTS = {
+    "footprint_min_legs": 2,        # directional legs that must agree
+    "chgpcr_bullish": 1.15,         # raw ChgPCR >= this votes bullish
+    "chgpcr_bearish": 0.85,         # raw ChgPCR <= this votes bearish
+    "buildup_min_net_pct": 20.0,    # |net_pct| below this = no direction
+    "buildup_min_strikes": 4,       # contributing strike-legs required
+    "chgpcr_alone_max_rank": 4,     # ChgPCR alone can only ever be rank 4
+}
+
+
+# ---------------------------------------------------------------- FOOTPRINT
+def footprint_legs(iv_skew, chg_pcr, vol_oi, market_direction, t, chg_pcr_reliable=True):
+    """Decomposes the Footprint into its DIRECTIONAL legs.
+
+    Vol/OI is deliberately excluded: it measures whether flow is real, not which
+    way it points, so letting it vote would be counting conviction as direction.
+    That leaves two genuine legs -- IV skew and ChgPCR -- which is why the
+    >=2-leg rule means 'both, and agreeing'."""
+    legs, notes = {}, {}
+
+    # leg 1 -- IV skew
+    if pd.isna(iv_skew):
+        legs['iv_skew'], notes['iv_skew'] = 0, "unavailable"
+    elif iv_skew <= t['iv_skew_bearish']:
+        legs['iv_skew'], notes['iv_skew'] = -1, f"{iv_skew:+.2f} <= {t['iv_skew_bearish']}"
+    elif iv_skew >= t['iv_skew_bullish']:
+        legs['iv_skew'], notes['iv_skew'] = 1, f"{iv_skew:+.2f} >= {t['iv_skew_bullish']}"
+    else:
+        legs['iv_skew'], notes['iv_skew'] = 0, f"{iv_skew:+.2f} inside the dead band"
+
+    # leg 2 -- ChgPCR: trap read when it fires, else the raw ratio with a dead band
+    h = t.get('_hierarchy', HIERARCHY_DEFAULTS)
+    if not chg_pcr_reliable or pd.isna(chg_pcr):
+        legs['chg_pcr'], notes['chg_pcr'] = 0, "unreliable / unavailable"
+    else:
+        trap = None
+        if market_direction == "falling" and chg_pcr > t['chgpcr_bear_trap']:
+            trap = 1
+        elif market_direction == "rising" and chg_pcr < t['chgpcr_bull_trap']:
+            trap = -1
+        if trap is not None:
+            legs['chg_pcr'] = trap
+            notes['chg_pcr'] = f"{chg_pcr:.2f} trap vs {market_direction} price"
+        elif chg_pcr >= h['chgpcr_bullish']:
+            legs['chg_pcr'], notes['chg_pcr'] = 1, f"{chg_pcr:.2f} put-side flow"
+        elif chg_pcr <= h['chgpcr_bearish']:
+            legs['chg_pcr'], notes['chg_pcr'] = -1, f"{chg_pcr:.2f} call-side flow"
+        else:
+            legs['chg_pcr'], notes['chg_pcr'] = 0, f"{chg_pcr:.2f} inside the dead band"
+
+    # conviction only -- never votes on direction
+    conviction = ("unknown" if pd.isna(vol_oi) else
+                  "confirmed" if vol_oi >= t['vol_oi_fresh'] else
+                  "fakeout" if vol_oi < t['vol_oi_fakeout'] else "moderate")
+    return {'legs': legs, 'notes': notes, 'conviction': conviction}
+
+
+def footprint_direction(fp_legs, min_legs=2):
+    """Returns (direction, state, n_agreeing, n_directional).
+
+    state is 'qualified' (enough legs, all agreeing), 'split' (legs disagree),
+    or 'insufficient' (fewer directional legs than required)."""
+    votes = [v for v in fp_legs['legs'].values() if v != 0]
+    n = len(votes)
+    if n < min_legs:
+        return 0, 'insufficient', n, n
+    if all(v == votes[0] for v in votes):
+        return votes[0], 'qualified', n, n
+    return 0, 'split', 0, n
+
+
+# ----------------------------------------------------------------- BUILDUP
+def buildup_quality(bsum, h=None):
+    """Is the Buildup read running on full inputs?
+
+    Rejects three degenerate states: too few contributing strikes, a net bias
+    inside the dead band, and saturation -- a net_pct of exactly +/-100 means one
+    side contributed literally zero weight, so the ratio carries no information
+    about DEGREE, only that nothing at all landed on the other side."""
+    h = h or HIERARCHY_DEFAULTS
+    if bsum is None:
+        return {'ok': False, 'dir': 0, 'reason': "no strike cleared the buildup thresholds"}
+
+    net = float(bsum.get('net_pct', 0.0))
+    detail = bsum.get('detail')
+    n_legs = int(len(detail)) if detail is not None else 0
+    bull, bear = float(bsum.get('bull_weight', 0)), float(bsum.get('bear_weight', 0))
+    saturated = (bull == 0) or (bear == 0)
+
+    if n_legs < h['buildup_min_strikes']:
+        return {'ok': False, 'dir': 0, 'n_legs': n_legs, 'saturated': saturated,
+                'reason': f"only {n_legs} strike-leg(s) classified; needs {h['buildup_min_strikes']}"}
+    if abs(net) < h['buildup_min_net_pct']:
+        return {'ok': False, 'dir': 0, 'n_legs': n_legs, 'saturated': saturated,
+                'reason': f"net bias {net:+.0f}% is inside the +/-{h['buildup_min_net_pct']:.0f}% dead band"}
+
+    d = 1 if net > 0 else -1
+    return {'ok': True, 'dir': d, 'n_legs': n_legs, 'saturated': saturated, 'net_pct': net,
+            'reason': (f"net {net:+.0f}% across {n_legs} strike-legs"
+                       + (" -- SATURATED: one side contributed zero weight, so treat the "
+                          "magnitude as unreadable even though the sign is usable."
+                          if saturated else ""))}
+
+
+# ---------------------------------------------------------------- ARBITER
+def resolve_direction(gex, bsum, fp_legs, chg_pcr, chg_pcr_reliable, t, h=None):
+    """Applies the fixed precedence:
+
+        1. GEX regime      -- PERMISSION and MODE (not a direction)
+        2. Buildup         -- direction, when running on full inputs
+        3. Footprint       -- direction, only when >=2 legs agree
+        4. ChgPCR alone    -- direction of last resort, minimum size only
+
+    GEX is rank 1 but it is a different KIND of object from ranks 2-4: it says
+    whether a directional read may be traded and whether to follow or fade it, not
+    which way the tape is going. So it gates, and the highest-ranked qualified
+    source below it supplies the direction."""
+    h = h or HIERARCHY_DEFAULTS
+    t = dict(t); t['_hierarchy'] = h
+
+    # ---- rank 1: gamma regime, as a gate ----
+    if gex is None:
+        gate = {'ok': False, 'mode': None, 'why': "no live gamma this poll -- regime unknown",
+                'size': 'No position'}
+    elif gex.get('at_flip'):
+        gate = {'ok': False, 'mode': 'flip', 'size': 'No position',
+                'why': f"spot is inside the flip zone ({gex['flip_level']:.0f}); regime is undefined"}
+    elif gex.get('net_gex', 0) < 0:
+        gate = {'ok': True, 'mode': 'follow', 'size': 'Full size',
+                'why': "short gamma -- dealer hedging runs WITH the move, so trade the direction below"}
+    else:
+        gate = {'ok': True, 'mode': 'fade', 'size': 'Defined risk only',
+                'why': "long gamma -- dealer hedging leans AGAINST the move, so FADE the direction below"}
+
+    # ---- ranks 2-4: the direction sources, in order ----
+    bq = buildup_quality(bsum, h)
+    fp_dir, fp_state, fp_agree, fp_total = footprint_direction(fp_legs, h['footprint_min_legs'])
+
+    raw_pcr_dir = 0
+    if chg_pcr_reliable and not pd.isna(chg_pcr):
+        raw_pcr_dir = (1 if chg_pcr >= h['chgpcr_bullish'] else
+                       -1 if chg_pcr <= h['chgpcr_bearish'] else 0)
+
+    if bq['ok']:
+        src, rank, direction = 'Buildup', 2, bq['dir']
+        why = f"Buildup on full inputs -- {bq['reason']}"
+        size_cap = 1.0
+    elif fp_state == 'qualified':
+        src, rank, direction = 'Footprint', 3, fp_dir
+        why = (f"Buildup did not qualify ({bq['reason']}); Footprint has "
+               f"{fp_agree}/{fp_total} legs agreeing")
+        size_cap = 0.75
+    elif raw_pcr_dir != 0:
+        src, rank, direction = 'ChgPCR alone', 4, raw_pcr_dir
+        why = (f"neither Buildup nor Footprint qualified; ChgPCR {chg_pcr:.2f} is the only "
+               f"directional input left")
+        size_cap = 0.25
+    else:
+        src, rank, direction = None, None, 0
+        why = "no source in the hierarchy qualified -- direction is genuinely unknown"
+        size_cap = 0.0
+
+    label = {1: "BULLISH", -1: "BEARISH", 0: "NO DIRECTION"}[direction]
+
+    # A disagreement only matters between sources that BOTH qualified. A Footprint
+    # running on one leg disagreeing with a qualified Buildup is not a conflict --
+    # it is the hierarchy doing its job.
+    contested = None
+    if bq['ok'] and fp_state == 'qualified' and bq['dir'] != fp_dir:
+        contested = ("Buildup and a fully-qualified Footprint disagree. Both cleared their own "
+                     "bars, so this is a real split -- take the Buildup per the hierarchy, at "
+                     "half the size the gate would otherwise allow.")
+        size_cap = min(size_cap, 0.5)
+
+    # Trade direction after the gamma gate is applied.
+    trade_dir = 0
+    if gate['ok'] and direction != 0:
+        trade_dir = direction if gate['mode'] == 'follow' else -direction
+
+    return {
+        'gate': gate, 'source': src, 'rank': rank,
+        'direction': direction, 'label': label, 'trade_dir': trade_dir,
+        'why': why, 'contested': contested, 'size_cap': size_cap,
+        'buildup': bq, 'footprint': {'dir': fp_dir, 'state': fp_state,
+                                     'agree': fp_agree, 'total': fp_total,
+                                     'legs': fp_legs['legs'], 'notes': fp_legs['notes'],
+                                     'conviction': fp_legs['conviction']},
+        'chg_pcr_dir': raw_pcr_dir,
+        'tradeable': bool(gate['ok'] and trade_dir != 0),
+    }
 
 
 # ==========================================
@@ -2698,7 +3003,7 @@ def institutional_footprint_signal(iv_skew, chg_pcr, vol_oi, market_direction, t
 # This is deliberately advisory. It never touches the Master Signal, the Scenario
 # card or the IV Lens gate — same rule as every other read added to this app.
 def detect_read_conflict(footprint_color_key, footprint_agg, bsum,
-                         footprint_market_dir=None):
+                         footprint_market_dir=None, footprint_state=None):
     """Compares the two independent directional reads and returns a verdict dict,
     or None when there is nothing to compare.
 
@@ -2707,6 +3012,14 @@ def detect_read_conflict(footprint_color_key, footprint_agg, bsum,
     (at least one is neutral or mixed, which is not a conflict — it is one read
     declining to have an opinion)."""
     if not footprint_color_key or bsum is None:
+        return None
+
+    # Under the hierarchy a Footprint that failed its own >=2-leg bar has NO
+    # STANDING to contest a qualified Buildup. Suppressing the banner here is the
+    # difference between "two independent reads disagree" (rare, informative, a
+    # genuine no-trade condition) and "a one-legged read disagrees with a full one"
+    # (common, uninformative, and previously blocked the whole session).
+    if footprint_state is not None and footprint_state != 'qualified':
         return None
 
     fp_dir = {'bullish': 1, 'bearish': -1}.get(footprint_color_key, 0)
@@ -3312,11 +3625,11 @@ if is_open:
     st.session_state.previous_df = df.copy()
     st.session_state.last_fetch = datetime.now(IST)
     st.session_state.baseline_source = 'live'
-    save_chain_snapshot(df, st.session_state.last_fetch, st.session_state.selected_expiry)
+    save_chain_snapshot(df, st.session_state.last_fetch, st.session_state.selected_expiry, spot)
 
     last_write = st.session_state.last_gsheet_write
     if gsheets_configured() and (last_write is None or (datetime.now() - last_write).total_seconds() >= GSHEET_WRITE_THROTTLE_SECONDS):
-        save_chain_snapshot_to_gsheet(df, st.session_state.last_fetch, st.session_state.selected_expiry)
+        save_chain_snapshot_to_gsheet(df, st.session_state.last_fetch, st.session_state.selected_expiry, spot)
         st.session_state.last_gsheet_write = datetime.now()
 else:
     df = st.session_state.previous_df.copy()
@@ -3329,11 +3642,33 @@ else:
     else:
         st.info(f"Showing the last snapshot fetched at {st.session_state.last_fetch.strftime('%H:%M:%S') if st.session_state.last_fetch else 'N/A'}.")
 
-# ATM strike: live spot when available, else nearest-to-median-strike fallback for closed market
+# ATM strike: live spot when available, else RECOVER spot from the snapshot.
+# The old fallback here was round(median strike), which is a property of how wide
+# the chain is rather than of where price is. On a cached poll it pinned ATM two
+# hundred points away from spot, which fed a sub-intrinsic ATM put into the IV
+# skew, the Expected Move envelope and the straddle breakevens -- all three then
+# published confident, wrong numbers. recover_spot() prefers the persisted spot,
+# then put-call parity, and returns None rather than guessing.
+spot_source = 'live'
+if not spot:
+    spot, spot_source = recover_spot(df)
+    if spot:
+        st.caption(f"Spot recovered from {spot_source}: {spot:.2f} "
+                   f"(no live quote on this poll).")
+
 if spot:
     atm_strike = round(spot / STRIKE_STEP) * STRIKE_STEP
 else:
     atm_strike = round(df['Strike'].median() / STRIKE_STEP) * STRIKE_STEP
+    spot_source = 'median-fallback'
+
+# Coherence guard. When this trips, every vol-surface read downstream is
+# suppressed instead of published.
+chain_ok, chain_problems = chain_is_coherent(df, atm_strike, spot)
+if not chain_ok:
+    st.error("CHAIN INCOHERENT -- vol-surface reads (IV skew, ChgPCR, Expected "
+             "Move, straddle breakevens) are suppressed this poll: "
+             + "; ".join(chain_problems))
 
 # ==========================================
 # CORE REPLICATED LOGIC
@@ -3475,14 +3810,25 @@ elif not (vel_class and vel_class['is_burst']):
 # INSTITUTIONAL FOOTPRINT — independent third read (IV Skew / ChgPCR / Vol-OI)
 # ==========================================
 footprint_table = compute_footprint_table(df, atm_strike, footprint_width) if show_footprint_panel else pd.DataFrame()
-footprint_agg = aggregate_footprint_metrics(footprint_table, footprint_thresholds) if not footprint_table.empty else {
-    'iv_skew': np.nan, 'chg_pcr': np.nan, 'vol_oi': np.nan, 'chg_pcr_reliable': False}
+# chain_ok gates this: an incoherent CE/PE alignment makes IV skew and ChgPCR
+# meaningless, and a meaningless number ranked at tier 3 of the hierarchy is worse
+# than no number at all.
+footprint_agg = aggregate_footprint_metrics(footprint_table, footprint_thresholds) \
+    if (not footprint_table.empty and chain_ok) else {
+        'iv_skew': np.nan, 'chg_pcr': np.nan, 'vol_oi': np.nan, 'chg_pcr_reliable': False}
 day_open = ohlc_df['open'].iloc[0] if (ohlc_df is not None and not ohlc_df.empty) else None
 footprint_market_dir = market_direction_today(spot, day_open, footprint_thresholds['trend_flat_band_pct'])
-footprint_headline, footprint_color_key, footprint_lines = institutional_footprint_signal(
-    footprint_agg['iv_skew'], footprint_agg['chg_pcr'], footprint_agg['vol_oi'],
-    footprint_market_dir, footprint_thresholds, chg_pcr_reliable=footprint_agg.get('chg_pcr_reliable', True)
-) if show_footprint_panel and not footprint_table.empty else (None, None, [])
+footprint_headline, footprint_color_key, footprint_lines, footprint_leg_detail = \
+    institutional_footprint_signal(
+        footprint_agg['iv_skew'], footprint_agg['chg_pcr'], footprint_agg['vol_oi'],
+        footprint_market_dir, footprint_thresholds,
+        chg_pcr_reliable=footprint_agg.get('chg_pcr_reliable', True)
+    ) if show_footprint_panel and not footprint_table.empty else (
+        None, None, [], {'legs': {}, 'notes': {}, 'conviction': 'unknown'})
+
+# The Footprint's own verdict on whether it qualifies to speak at rank 3.
+_fp_dir, _fp_state, _fp_agree, _fp_total = footprint_direction(
+    footprint_leg_detail, HIERARCHY_DEFAULTS['footprint_min_legs'])
 
 # ==========================================
 # BUILDUP — computed here, not in its panel
@@ -3495,8 +3841,25 @@ buildup_table = compute_buildup_table(df, atm_strike, int(buildup_width), buildu
     if show_buildup else pd.DataFrame()
 bsum = summarize_buildup(buildup_table, spot) if (show_buildup and not buildup_table.empty) else None
 
-# The conflict flag itself: two independent directional reads, compared.
-read_conflict = detect_read_conflict(footprint_color_key, footprint_agg, bsum, footprint_market_dir)
+# The conflict flag itself: only fires when BOTH reads qualified.
+read_conflict = detect_read_conflict(footprint_color_key, footprint_agg, bsum,
+                                     footprint_market_dir, footprint_state=_fp_state)
+
+# ==========================================
+# DIRECTIONAL HIERARCHY — the arbiter
+# ==========================================
+#   rank 1  GEX regime      -> gate + mode (permission, NOT a direction)
+#   rank 2  Buildup         -> direction, only on full inputs
+#   rank 3  Footprint       -> direction, only when >=2 legs agree
+#   rank 4  ChgPCR alone    -> direction of last resort, minimum size
+#
+# gex is computed above (line ~3439) so it is available here. Everything the
+# arbiter needs now exists; panels below consume `hierarchy` rather than
+# re-deriving a direction of their own.
+hierarchy = resolve_direction(
+    gex, bsum, footprint_leg_detail,
+    footprint_agg.get('chg_pcr'), footprint_agg.get('chg_pcr_reliable', False),
+    footprint_thresholds)
 
 # ==========================================
 # IV LENS — trade gate (spot change vs ATM IV change, + skew for fade confirmation)
@@ -3505,7 +3868,8 @@ read_conflict = detect_read_conflict(footprint_color_key, footprint_agg, bsum, f
 # part of the window and the resulting stance can be written into the same log row
 # rather than lagging one poll behind.
 atm_iv = compute_atm_iv(df, atm_strike, int(iv_price_atm_width))
-lens_skew = compute_lens_skew(df, atm_strike, iv_lens_thresholds['skew_width'])
+lens_skew = compute_lens_skew(df, atm_strike, iv_lens_thresholds['skew_width']) \
+    if chain_ok else np.nan
 
 # ==========================================
 # MODULE 3 — ATM STRADDLE / EXPECTED MOVE
@@ -3514,7 +3878,8 @@ lens_skew = compute_lens_skew(df, atm_strike, iv_lens_thresholds['skew_width'])
 # price floor. This is the fix for the calibration problem the adaptive-floors
 # comment already documents: instead of a fixed 0.10% or a percentile of the
 # session's own moves, "significant" becomes what the straddle says it is.
-expected_move = compute_expected_move(df, atm_strike, spot, atm_iv, dte, ohlc_df, em_settings)
+expected_move = compute_expected_move(df, atm_strike, spot, atm_iv, dte, ohlc_df, em_settings) \
+    if chain_ok else None
 
 lens_floor_source = 'adaptive percentile' if iv_lens_thresholds['adaptive_floors'] else 'fixed %'
 if em_settings['drive_lens_floor'] and expected_move:
@@ -4904,41 +5269,57 @@ st.subheader("8️⃣ 🚦 Execution Checkpoint — the last look before acting"
 
 _gates = []
 
-# 1. Read conflict (top of app)
-if read_conflict is None:
-    _gates.append(("—", "Read conflict", "Not evaluated — needs both Footprint and Buildup."))
-elif read_conflict['state'] == 'conflict':
-    _gates.append(("⛔", "Read conflict",
-                   f"Footprint {read_conflict['fp_label']} vs Buildup {read_conflict['bu_label']} — "
-                   f"your highest-probability no-trade condition."))
-elif read_conflict['state'] == 'aligned':
-    _gates.append(("✅", "Read conflict",
-                   f"Both reads {read_conflict['fp_label']}. Independent corroboration."))
-else:
-    _gates.append(("⚠️", "Read conflict",
-                   f"Inconclusive — Footprint {read_conflict['fp_label']}, "
-                   f"Buildup {read_conflict['bu_label']}. Direction unconfirmed."))
+# ------------------------------------------------------------------
+# Gates 1-3 are the DIRECTIONAL HIERARCHY, in rank order:
+#   rank 1  GEX regime    -> gate + mode (permission, not a direction)
+#   rank 2  Buildup       -> direction on full inputs
+#   rank 3  Footprint     -> direction when >=2 legs agree
+#   rank 4  ChgPCR alone  -> last resort, minimum size
+# The old "Read conflict" and "Buildup direction" gates are folded into these:
+# a conflict between a qualified and an unqualified read is not a conflict, it is
+# the hierarchy resolving itself, and it should never have blocked a session.
+# ------------------------------------------------------------------
 
-# 2. Gamma regime
-if gex is None:
-    _gates.append(("—", "Gamma regime", "No live gamma this poll."))
-elif gex['at_flip']:
-    _gates.append(("⛔", "Gamma regime",
-                   f"Spot on the flip ({gex['flip_level']:.0f}). Regime unstable — worst place to size up."))
-elif gex['regime_key'] == 'trend':
-    _gates.append(("✅", "Gamma regime",
-                   f"Short gamma ({gex['net_gex']:+,.0f}). Breakouts carry; full size permitted."))
+# 1. GAMMA REGIME — rank 1, the gate
+_g = hierarchy['gate']
+if not _g['ok']:
+    _gates.append(("⛔", "Gamma regime (rank 1)", _g['why'][:1].upper() + _g['why'][1:] + "."))
 else:
-    _gates.append(("⚠️", "Gamma regime",
-                   f"Long gamma ({gex['net_gex']:+,.0f}). Moves get faded — discount breakout signals."))
+    _gates.append(("✅", f"Gamma regime (rank 1) — {_g['mode'].upper()}",
+                   _g['why'][:1].upper() + _g['why'][1:] + "."))
 
-# 3. Buildup direction
-if bsum is None:
-    _gates.append(("—", "Buildup direction", "No strike cleared the classification thresholds."))
+# 2. DIRECTION SOURCE — whichever rank won
+if hierarchy['source'] is None:
+    _gates.append(("⛔", "Direction source",
+                   hierarchy['why'][:1].upper() + hierarchy['why'][1:] + "."))
 else:
-    _b_icon = "✅" if abs(bsum['net_pct']) > 20 else "⚠️"
-    _gates.append((_b_icon, "Buildup direction",
-                   f"{bsum['verdict'].split(' ', 1)[1]} at {bsum['net_pct']:+.0f}% net bias."))
+    _icon = {2: "✅", 3: "⚠️", 4: "⚠️"}[hierarchy['rank']]
+    _gates.append((_icon, f"Direction — {hierarchy['source']} (rank {hierarchy['rank']})",
+                   f"{hierarchy['label']} · {hierarchy['why']}. "
+                   f"Size cap {hierarchy['size_cap']:.0%}."))
+
+# 3. NET TRADE DIRECTION, after the gamma gate is applied to the direction.
+#    This is the line that reproduces the 24000->24150 session: one directional
+#    read, followed in short gamma and faded in long gamma.
+if hierarchy['tradeable']:
+    _side = "LONG" if hierarchy['trade_dir'] > 0 else "SHORT"
+    _gates.append(("✅", "Net trade direction",
+                   f"{_g['mode'].upper()} the {hierarchy['label'].lower()} read → go {_side}. "
+                   f"Instrument per Step 1 of the GEX card."))
+else:
+    _gates.append(("⛔", "Net trade direction",
+                   "Gate closed or no qualified direction — no position."))
+
+# 3b. Contested: only when TWO qualified sources disagree. Rare and informative.
+if hierarchy['contested']:
+    _gates.append(("⚠️", "Contested read", hierarchy['contested']))
+
+# 3c. Buildup saturation note — a net bias of exactly +/-100% means one side
+#     contributed zero weight, so the SIGN is usable but the MAGNITUDE is not.
+if hierarchy['buildup'].get('saturated') and hierarchy['buildup'].get('ok'):
+    _gates.append(("⚠️", "Buildup saturated",
+                   "One side contributed zero weight, so the net-bias magnitude is "
+                   "unreadable. Trade the sign, ignore the strength."))
 
 # 4. IV Lens gate
 if not iv_lens:
@@ -4986,6 +5367,20 @@ if decision and decision['blocked']:
                    " · ".join(r[1] for r in decision['blocked']) + "."))
 elif decision:
     _gates.append(("✅", "Discipline", "No rule breached — cutoff and loss limit both clear."))
+
+# Apply the hierarchy's size cap to the live envelope. A rank-3 or rank-4 read is
+# permitted to trade, but not at the size a rank-2 read earns.
+if risk_active and hierarchy['size_cap'] < 1.0:
+    _uncapped_lots = risk_active['lots']
+    risk_active['lots'] = max(int(_uncapped_lots * hierarchy['size_cap']), 0)
+    if risk_active['lots'] == 0 and _uncapped_lots > 0:
+        _gates.append(("⛔", "Position sizing",
+                       f"Size cap {hierarchy['size_cap']:.0%} rounds {_uncapped_lots} lot(s) to "
+                       f"zero. A rank-{hierarchy['rank']} read is not worth a minimum-size trade."))
+    elif _uncapped_lots != risk_active['lots']:
+        _gates.append(("⚠️", "Position sizing capped",
+                       f"{_uncapped_lots} → {risk_active['lots']} lot(s) at the "
+                       f"{hierarchy['size_cap']:.0%} cap for a rank-{hierarchy['rank']} read."))
 
 _blockers = [g for g in _gates if g[0] == "⛔"]
 _cautions = [g for g in _gates if g[0] == "⚠️"]
