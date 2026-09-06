@@ -1689,18 +1689,61 @@ def compute_gex(df: pd.DataFrame, spot: float, dte, settings: dict):
     # them, since the true level usually sits inside a 50-point gap. Where the
     # profile crosses more than once, the crossing nearest spot is the one that
     # governs the current regime.
+    def _find_crossings(strikes, cumvals):
+        out = []
+        for i in range(1, len(cumvals)):
+            a, b = cumvals[i - 1], cumvals[i]
+            if (a < 0 <= b) or (a > 0 >= b):
+                x = (strikes[i] if b == a else
+                     strikes[i - 1] + (strikes[i] - strikes[i - 1]) * (0 - a) / (b - a))
+                out.append(float(x))
+        return out
+
     ks, cum = d['Strike'].values, d['cum_GEX'].values
-    crossings = []
-    for i in range(1, len(cum)):
-        a, b = cum[i - 1], cum[i]
-        if (a < 0 <= b) or (a > 0 >= b):
-            x = ks[i] if b == a else ks[i - 1] + (ks[i] - ks[i - 1]) * (0 - a) / (b - a)
-            crossings.append(float(x))
+    crossings = _find_crossings(ks, cum)
+    flip_search_width = width
+
+    # When the ATM +-width band is uniformly one-signed the cumulative profile never
+    # crosses zero and the flip is simply OUTSIDE the band -- not absent. Re-run the
+    # search on the WHOLE chain before concluding there is no flip, because "no flip
+    # located" leaves the trader with no idea how far price must travel to change
+    # regime, which is the single most useful number the panel can produce.
+    if not crossings:
+        wide = df.copy()
+        for c in ('CE_Gamma', 'PE_Gamma', 'CE_OI', 'PE_OI'):
+            wide[c] = pd.to_numeric(wide.get(c), errors='coerce').fillna(0.0)
+        wide = wide[(wide['CE_OI'] > 0) | (wide['PE_OI'] > 0)].sort_values('Strike')
+        if not wide.empty:
+            w_gex = (-wide['CE_Gamma'] * wide['CE_OI'] + wide['PE_Gamma'] * wide['PE_OI']) * unit * tw
+            w_cum = w_gex.cumsum().values
+            crossings = _find_crossings(wide['Strike'].values, w_cum)
+            if crossings:
+                flip_search_width = int(len(wide) // 2)
+
     flip = min(crossings, key=lambda k: abs(k - spot)) if crossings else None
 
     dist = (spot - flip) if flip else None
     near_pct = float(settings.get('flip_near_pct', 0.15))
     at_flip = bool(flip and abs(dist) / spot * 100 <= near_pct)
+
+    # Nearest approach: the strike where the cumulative profile comes closest to
+    # zero. When no crossing exists this is where a flip would occur FIRST if
+    # positioning shifts, which is the level to watch for a regime change.
+    _i_near = int(np.argmin(np.abs(cum)))
+    nearest_approach = float(ks[_i_near])
+    nearest_approach_val = float(cum[_i_near])
+
+    # Regime margin: net GEX as a fraction of GROSS gamma in the band. Near zero
+    # means the regime is marginal and one large trade can flip it; near +/-1 means
+    # it is decisive. A regime read without this is a sign with no magnitude.
+    gross = float(d['GEX'].abs().sum())
+    regime_margin = (net_gex / gross) if gross > 0 else 0.0
+
+    # Distance to the acceleration pocket -- the largest NEGATIVE-gamma strike. In a
+    # pinning regime this is the practical invalidation level for a fade: beyond it,
+    # dealer hedging stops damping the move and starts amplifying it.
+    _pit_strike = float(d.loc[d['GEX'].idxmin(), 'Strike']) if d['GEX'].min() < 0 else None
+    pit_distance = (_pit_strike - spot) if _pit_strike is not None else None
 
     # Largest single-strike gamma concentrations — where hedging flow clusters.
     peak_pos = d.loc[d['GEX'].idxmax()] if d['GEX'].max() > 0 else None
@@ -1710,6 +1753,12 @@ def compute_gex(df: pd.DataFrame, spot: float, dte, settings: dict):
         'per_strike': d[['Strike', 'CE_GEX', 'PE_GEX', 'GEX', 'cum_GEX', 'DEX']],
         'net_gex': net_gex, 'net_dex': net_dex,
         'flip_level': flip, 'flip_distance': dist, 'at_flip': at_flip,
+        'flip_search_width': flip_search_width,
+        'flip_beyond_band': bool(flip is None),
+        'nearest_approach': nearest_approach,
+        'nearest_approach_val': nearest_approach_val,
+        'regime_margin': regime_margin,
+        'pit_distance': pit_distance,
         'regime': 'Pinning (moves get faded)' if net_gex > 0 else 'Trending (moves get amplified)',
         'regime_key': 'pin' if net_gex > 0 else 'trend',
         'gamma_wall': float(peak_pos['Strike']) if peak_pos is not None else None,
@@ -1907,8 +1956,28 @@ def build_gex_decision(gex, spot, mp, vwap_val, walls, now_ist, risk_settings,
                       f"Clear of the flip by {abs(gex['flip_distance']):.0f} pts. The zone is "
                       f"±{zone:.0f} pts around {gex['flip_level']:.0f}."))
     else:
+        # No zero-crossing anywhere in the chain means the regime is UNIFORM, not
+        # that the rule is inapplicable. Report how decisive it is and where it
+        # would flip first, so the trader knows the distance to a regime change
+        # instead of being told nothing was found.
+        _margin = gex.get('regime_margin') if gex else None
+        _near = gex.get('nearest_approach') if gex else None
+        _pitd = gex.get('pit_distance') if gex else None
+        _bits = []
+        if _margin is not None:
+            _decisive = ("decisive" if abs(_margin) > 0.5 else
+                         "moderate" if abs(_margin) > 0.2 else "MARGINAL — one large trade could flip it")
+            _bits.append(f"regime margin {_margin:+.2f} ({_decisive})")
+        if _near is not None and spot:
+            _bits.append(f"closest approach to a flip is {_near:.0f} "
+                         f"({_near - float(spot):+.0f} pts)")
+        if _pitd is not None:
+            _bits.append(f"acceleration pocket {_pitd:+.0f} pts away — treat it as the "
+                         f"hard invalidation on any fade")
         rules.append(('ok', "Stop trading the read inside the flip zone",
-                      "No flip level located in the current band — nothing to re-enter."))
+                      "No zero-crossing in the chain, so the whole band is one-signed: "
+                      + "; ".join(_bits) + "." if _bits else
+                      "No zero-crossing in the chain — the whole band is one-signed."))
 
     cutoff_label = f"{int(card.get('cutoff_hour', 15)):02d}:{int(card.get('cutoff_minute', 0)):02d}"
     warn_min = float(card.get('cutoff_warn_minutes', 30))
@@ -2224,6 +2293,11 @@ SIGNAL_DIRECTION = {
     'IV_Lens_Stance': {'shakeout': 1, 'conviction': 1, 'distribution': -1, 'fear_bid': -1},
     'ZoneB_Signal': {'Buy CE': 1, 'Write PE': 1, 'Buy PE': -1, 'Write CE': -1},
     'VWAP_Trend_Side': {'above': 1, 'below': -1},
+    # The arbitrated decision. This is the ONLY row in the tracker that grades what
+    # the app actually instructed -- everything above it grades a component read that
+    # is never traded on its own. When these two disagree in the results, trust this
+    # one: it is the output, the others are inputs.
+    'Hier_Signal': {'LONG': 1, 'SHORT': -1},
     # Card_Mode is NOT listed here on purpose. It is a regime label, not a direction —
     # "buyer mode" says breaks accelerate, it does not say which way price breaks, so
     # grading it as if it were long or short would be meaningless. To test whether the
@@ -3956,21 +4030,48 @@ elif scenario is None or scenario['scenario'] not in ('A', 'B'):
 # of the wrong side is usually the more informative number.
 atr_val = compute_atr(ohlc_df, risk_settings['atr_period']) if show_risk_panel else None
 
+# The HIERARCHY is the authority on direction. The Scenario card and the Master
+# Signal remain as fallbacks for when no rank qualifies, but they can no longer
+# size a position that points the opposite way to the arbitrated direction --
+# which is what happened while the envelope still read the legacy path and the
+# size cap in the Execution Checkpoint never got a chance to execute.
 risk_direction = 0
-if scenario and scenario.get('scenario') == 'A':
-    risk_direction = 1
+risk_direction_source = "none"
+if hierarchy['tradeable']:
+    risk_direction = hierarchy['trade_dir']
+    risk_direction_source = f"hierarchy rank {hierarchy['rank']} ({hierarchy['source']})"
+elif scenario and scenario.get('scenario') == 'A':
+    risk_direction, risk_direction_source = 1, "Scenario A"
 elif scenario and scenario.get('scenario') == 'B':
-    risk_direction = -1
+    risk_direction, risk_direction_source = -1, "Scenario B"
 elif sig in ("Strong CE Buy", "PE writers strong"):
-    risk_direction = 1
+    risk_direction, risk_direction_source = 1, "Master Signal"
 elif sig in ("Strong PE Buy", "CE writers strong"):
-    risk_direction = -1
+    risk_direction, risk_direction_source = -1, "Master Signal"
 
 risk_long = build_risk_envelope(spot, atr_val, expected_move, 1, df, atm_strike,
                                 _scen_walls, risk_settings, f"{candle_interval}m") if atr_val else None
 risk_short = build_risk_envelope(spot, atr_val, expected_move, -1, df, atm_strike,
                                  _scen_walls, risk_settings, f"{candle_interval}m") if atr_val else None
 risk_active = risk_long if risk_direction > 0 else (risk_short if risk_direction < 0 else None)
+
+# Size cap applied HERE, at the single point where the active envelope is chosen, so
+# the log row, the envelope panel and the Execution Checkpoint all read the same lot
+# count. Applying it only in the checkpoint left the other two reporting uncapped size.
+risk_size_cap_note = None
+if risk_active and hierarchy['tradeable'] and hierarchy['size_cap'] < 1.0:
+    _uncapped = risk_active['lots']
+    risk_active = dict(risk_active)
+    risk_active['lots'] = max(int(_uncapped * hierarchy['size_cap']), 0)
+    risk_active['uncapped_lots'] = _uncapped
+    risk_active['size_cap'] = hierarchy['size_cap']
+    if risk_active['lots'] == 0 and _uncapped > 0:
+        risk_size_cap_note = (f"Size cap {hierarchy['size_cap']:.0%} rounds {_uncapped} lot(s) to "
+                              f"zero. A rank-{hierarchy['rank']} read is not worth a "
+                              f"minimum-size trade.")
+    elif _uncapped != risk_active['lots']:
+        risk_size_cap_note = (f"{_uncapped} → {risk_active['lots']} lot(s) at the "
+                              f"{hierarchy['size_cap']:.0%} cap for a rank-{hierarchy['rank']} read.")
 
 # ==========================================
 # GEX DECISION CARD — resolved against live state
@@ -4071,6 +4172,25 @@ if is_open:
         # subset. If signals fired on 'conflict' polls grade materially worse than
         # the same signals on 'aligned' polls, the no-trade rule is earning its keep.
         'Read_Conflict': read_conflict['state'] if read_conflict else None,
+        # --- hierarchy: log the ARBITRATED decision, not just the raw read. Grading
+        # the raw Master Signal measures a number nobody trades; grading this
+        # measures what the app actually told you to do.
+        'Hier_Source': hierarchy['source'],
+        'Hier_Rank': hierarchy['rank'],
+        'Hier_Direction': hierarchy['label'],
+        'Hier_Gate_Mode': hierarchy['gate']['mode'],
+        'Hier_Trade_Dir': hierarchy['trade_dir'],
+        'Hier_Signal': ("LONG" if hierarchy['trade_dir'] > 0 else
+                        "SHORT" if hierarchy['trade_dir'] < 0 else "NO TRADE"),
+        'Hier_Size_Cap': hierarchy['size_cap'],
+        'Hier_Contested': bool(hierarchy['contested']),
+        'Buildup_Saturated': bool(hierarchy['buildup'].get('saturated')),
+        'FP_State': _fp_state,
+        'FP_Legs_Directional': _fp_total,
+        'Spot_Source': spot_source,
+        'Chain_OK': bool(chain_ok),
+        'GEX_Regime_Margin': round(gex['regime_margin'], 4) if gex else None,
+        'GEX_Pit_Distance': round(gex['pit_distance'], 1) if (gex and gex.get('pit_distance') is not None) else None,
         'Buildup_Net_Pct': round(bsum['net_pct'], 1) if bsum else None,
     }
     st.session_state.session_log.append(log_row)
@@ -4229,12 +4349,54 @@ if show_scenario_card:
             )
     st.markdown("---")
 
+# ------------------------------------------------------------------
+# MASTER SIGNAL BANNER — raw read on top, ARBITRATED direction underneath.
+#
+# The Master Signal is the ported workbook logic. It knows nothing about the gamma
+# regime, so in long gamma it can read "Buy CE" while the hierarchy resolves to
+# SHORT -- both correct in their own frame, but a page that OPENS with "Buy CE" and
+# CLOSES with "go SHORT" gets traded on whichever line was read first. The banner
+# therefore carries both, with the arbitrated line labelled as the executable one.
+# ------------------------------------------------------------------
+if hierarchy['tradeable']:
+    _net_side = "LONG" if hierarchy['trade_dir'] > 0 else "SHORT"
+    _net_mode = hierarchy['gate']['mode'].upper()
+    _net_html = (f"<div style='background-color:rgba(0,0,0,0.28);border-radius:8px;"
+                 f"padding:10px 14px;margin:12px 0 0 0;'>"
+                 f"<span style='color:white;font-size:0.85em;opacity:0.85;'>"
+                 f"AFTER HIERARCHY — this is the executable direction</span><br>"
+                 f"<b style='color:white;font-size:1.25em;'>{_net_side}</b>"
+                 f"<span style='color:white;'> &nbsp;·&nbsp; {_net_mode} the "
+                 f"{hierarchy['label'].lower()} read from "
+                 f"{hierarchy['source']} (rank {hierarchy['rank']}) "
+                 f"&nbsp;·&nbsp; size cap {hierarchy['size_cap']:.0%}</span></div>")
+elif hierarchy['source'] is None:
+    _net_html = ("<div style='background-color:rgba(0,0,0,0.28);border-radius:8px;"
+                 "padding:10px 14px;margin:12px 0 0 0;'>"
+                 "<span style='color:white;font-size:0.85em;opacity:0.85;'>"
+                 "AFTER HIERARCHY</span><br>"
+                 "<b style='color:white;font-size:1.15em;'>NO POSITION</b>"
+                 "<span style='color:white;'> &nbsp;·&nbsp; no source in the hierarchy "
+                 "qualified, so direction is unknown</span></div>")
+else:
+    _gate_why = hierarchy['gate']['why']
+    _net_html = (f"<div style='background-color:rgba(0,0,0,0.28);border-radius:8px;"
+                 f"padding:10px 14px;margin:12px 0 0 0;'>"
+                 f"<span style='color:white;font-size:0.85em;opacity:0.85;'>"
+                 f"AFTER HIERARCHY</span><br>"
+                 f"<b style='color:white;font-size:1.15em;'>NO POSITION</b>"
+                 f"<span style='color:white;'> &nbsp;·&nbsp; rank 1 gate closed — "
+                 f"{_gate_why}</span></div>")
+
 st.markdown(f"""
 <div style='background-color:{signal_colors.get(sig, "#6c757d")};padding:24px;border-radius:10px;
 text-align:center;margin:10px 0;'>
     <h2 style='color:white;margin:0;'>{sig}</h2>
+    <p style='color:white;margin:6px 0 0 0;font-size:0.9em;opacity:0.9;'>RAW READ (pre-hierarchy,
+    no gamma-regime awareness)</p>
     <p style='color:white;margin:6px 0 0 0;'>Action: <b>{action or "—"}</b> &nbsp;|&nbsp;
     Zone B raw signal: <b>{zb['signal']}</b> &nbsp;|&nbsp; PCR regime: <b>{za['classification']}</b></p>
+    {_net_html}
 </div>""", unsafe_allow_html=True)
 
 # --- IV LENS GATE STRIP (directly under the Master Signal, where the decision happens) ---
@@ -4511,13 +4673,38 @@ if show_gex_panel:
         g1, g2, g3, g4 = st.columns(4)
         g1.metric("Net GEX (₹cr δ / 1% move)", f"{gex['net_gex']:+,.1f}",
                   "long gamma" if gex['net_gex'] > 0 else "short gamma")
-        g2.metric("Gamma Flip Level",
-                  f"{gex['flip_level']:.0f}" if gex['flip_level'] else "—",
-                  (f"spot {gex['flip_distance']:+.0f} pts" if gex['flip_level'] else "no zero-crossing in band"))
+        if gex['flip_level']:
+            _flip_val = f"{gex['flip_level']:.0f}"
+            _flip_note = f"spot {gex['flip_distance']:+.0f} pts"
+            if gex.get('flip_search_width', 0) > gex.get('width', 0):
+                _flip_note += " (found outside the display band)"
+        else:
+            # No crossing anywhere in the chain: report the nearest approach rather
+            # than a bare dash, so the panel still answers "how far to a regime change".
+            _flip_val = f"~{gex['nearest_approach']:.0f}"
+            _flip_note = (f"no crossing — closest approach "
+                          f"{gex['nearest_approach'] - float(spot):+.0f} pts")
+        g2.metric("Gamma Flip Level", _flip_val, _flip_note)
         g3.metric("Net DEX (lakh δ)", f"{gex['net_dex']:+,.1f}",
                   "dealers short index" if gex['net_dex'] < 0 else "dealers long index")
         g4.metric("Regime", "Pin" if gex['regime_key'] == 'pin' else "Trend",
                   "⚠️ unstable — at the flip" if gex['at_flip'] else gex['regime'])
+
+        # Regime margin + acceleration pocket: sign alone is not a regime read.
+        _rm = gex.get('regime_margin')
+        if _rm is not None:
+            _rm_word = ("decisive" if abs(_rm) > 0.5 else
+                        "moderate" if abs(_rm) > 0.2 else "MARGINAL")
+            _pit_txt = ""
+            if gex.get('pit_distance') is not None:
+                _pit_txt = (f" Nearest acceleration pocket (largest negative-gamma strike) is "
+                            f"**{gex['pit_distance']:+.0f} pts** away — in a pinning regime that is "
+                            f"the hard invalidation on any fade, because past it dealer hedging "
+                            f"stops damping the move and starts amplifying it.")
+            st.caption(
+                f"Regime margin **{_rm:+.2f}** ({_rm_word}) — net GEX as a share of gross gamma in "
+                f"the band. Near zero means one large trade can flip the regime; a sign without a "
+                f"magnitude is not a regime read.{_pit_txt}")
 
         if gex['flip_level'] and spot:
             side = "above" if spot > gex['flip_level'] else "below"
@@ -5179,7 +5366,7 @@ if show_risk_panel:
         r3.metric("Active direction",
                   risk_active['side'] if risk_active else "none",
                   ("from Scenario " + scenario['scenario']) if (scenario and scenario.get('scenario') in ('A', 'B'))
-                  else ("from Master Signal" if risk_direction else "no directional signal"))
+                  else (f"from {risk_direction_source}" if risk_direction else "no directional signal"))
 
         def _render_envelope(env, is_active):
             if env is None:
@@ -5368,19 +5555,12 @@ if decision and decision['blocked']:
 elif decision:
     _gates.append(("✅", "Discipline", "No rule breached — cutoff and loss limit both clear."))
 
-# Apply the hierarchy's size cap to the live envelope. A rank-3 or rank-4 read is
-# permitted to trade, but not at the size a rank-2 read earns.
-if risk_active and hierarchy['size_cap'] < 1.0:
-    _uncapped_lots = risk_active['lots']
-    risk_active['lots'] = max(int(_uncapped_lots * hierarchy['size_cap']), 0)
-    if risk_active['lots'] == 0 and _uncapped_lots > 0:
-        _gates.append(("⛔", "Position sizing",
-                       f"Size cap {hierarchy['size_cap']:.0%} rounds {_uncapped_lots} lot(s) to "
-                       f"zero. A rank-{hierarchy['rank']} read is not worth a minimum-size trade."))
-    elif _uncapped_lots != risk_active['lots']:
-        _gates.append(("⚠️", "Position sizing capped",
-                       f"{_uncapped_lots} → {risk_active['lots']} lot(s) at the "
-                       f"{hierarchy['size_cap']:.0%} cap for a rank-{hierarchy['rank']} read."))
+# The size cap is applied AT SOURCE (where risk_active is chosen), so the log row,
+# the envelope panel and this strip all report the same lot count. This block only
+# surfaces it -- applying the cap twice would compound it.
+if risk_size_cap_note:
+    _cap_icon = "⛔" if (risk_active and risk_active.get('lots') == 0) else "⚠️"
+    _gates.append((_cap_icon, "Position sizing capped", risk_size_cap_note))
 
 _blockers = [g for g in _gates if g[0] == "⛔"]
 _cautions = [g for g in _gates if g[0] == "⚠️"]
@@ -5663,7 +5843,16 @@ with cf4:
                "⚠️ Gamma risk — size down" if dte is not None and dte <= 1 else "")
 
 if total_checks:
-    st.caption(f"Confluence agreement: **{agree}/{total_checks}** independent filters support the current directional read.")
+    _conf_target = "raw read"
+    if hierarchy['tradeable']:
+        _raw_side = 1 if bullish_signals else (-1 if bearish_signals else 0)
+        _conf_target = ("the RAW read — which the hierarchy has INVERTED to "
+                        f"{'LONG' if hierarchy['trade_dir'] > 0 else 'SHORT'}, so read these "
+                        "as support for the pre-gate direction, not the executable one"
+                        if _raw_side != 0 and _raw_side != hierarchy['trade_dir']
+                        else "the raw read, which agrees with the arbitrated direction")
+    st.caption(f"Confluence agreement: **{agree}/{total_checks}** independent filters support "
+               f"{_conf_target}.")
 
 st.markdown("---")
 
