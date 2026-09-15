@@ -4268,6 +4268,16 @@ lens_skew = compute_lens_skew(df, atm_strike, iv_lens_thresholds['skew_width']) 
 expected_move = compute_expected_move(df, atm_strike, spot, atm_iv, dte, ohlc_df, em_settings) \
     if chain_ok else None
 
+# ==========================================
+# TRADE CONSTRUCTOR — resolve the arbitrated read into a concrete order
+# ==========================================
+# Computed here, the moment every input it needs exists (hierarchy, gex, the
+# Expected Move band, Max Pain and DTE). It is RENDERED further down, immediately
+# above the GEX Decision Card, so the order and the discipline rules that can veto
+# it are read together rather than seven panels apart.
+trade = build_trade(hierarchy, gex, expected_move, spot, atm_strike, mp, dte,
+                    df, risk_settings, lot=LOT_SIZE, step=STRIKE_STEP)
+
 lens_floor_source = 'adaptive percentile' if iv_lens_thresholds['adaptive_floors'] else 'fixed %'
 if em_settings['drive_lens_floor'] and expected_move:
     _straddle_floor = straddle_implied_price_floor(
@@ -5098,6 +5108,48 @@ if show_gex_panel:
             )
 
     # ----------------------------------------
+    # TRADE CONSTRUCTOR — the order, placed directly above the discipline card
+    # ----------------------------------------
+    # Deliberately sits between the regime read and the Decision Card: the regime
+    # says which KIND of trade fits, this says exactly which one, and the card
+    # immediately below can still veto it on discipline. Reading them adjacently is
+    # the point -- an order and the rule that blocks it belong on the same screen.
+    st.markdown("#### 🎯 Trade Constructor — structure, strikes and size")
+    if trade['blocked']:
+        st.warning(f"**No order.** {trade['blocked']}")
+        for _n in trade['notes']:
+            st.caption(_n)
+    else:
+        _prem_lbl = "CREDIT" if trade['net_premium'] > 0 else "DEBIT"
+        _prem_rs = abs(trade['net_premium']) * LOT_SIZE * trade['lots']
+        st.markdown(f"""
+<div style='background-color:#0d6efd;padding:18px;border-radius:10px;margin:6px 0;'>
+    <h3 style='color:white;margin:0;'>{trade['structure']} &nbsp;·&nbsp; {trade['lots']} lot(s)</h3>
+    <p style='color:white;margin:8px 0 0 0;'>{_prem_lbl} <b>{abs(trade['net_premium']):.1f} pts</b>
+    (₹{_prem_rs:,.0f}) &nbsp;|&nbsp; Max loss <b>₹{trade['max_loss']:,.0f}</b>
+    &nbsp;|&nbsp; Invalidation <b>{trade['invalidation']}</b></p>
+</div>""", unsafe_allow_html=True)
+        _leg_rows = [{'Action': a, 'Strike': f"{k:.0f}", 'Type': sd,
+                      'LTP': (lambda v: f"{v:.2f}" if v else "—")(_ltp(df, k, sd)),
+                      'Qty': f"{int(trade['lots'] * LOT_SIZE)}"}
+                     for a, k, sd in trade['legs']]
+        st.dataframe(pd.DataFrame(_leg_rows), use_container_width=True, hide_index=True)
+        st.caption("Execution order matters: **buy the long legs first**, then sell the shorts. "
+                   "Reversed, the account is briefly naked short and margin can spike enough to "
+                   "reject the second leg. Unwind in the opposite order.")
+        for _n in trade['notes']:
+            st.caption(_n)
+        # A breached discipline rule outranks a valid structure. Saying so HERE, on the
+        # order itself, is the point of moving this panel above the card -- otherwise
+        # the order is read first and the stand-down second.
+        if decision and decision['blocked']:
+            _why = " · ".join(r[1] for r in decision['blocked'])
+            st.error(f"⛔ The Decision Card below is in STAND DOWN — {_why}. This order is shown "
+                     f"for preparation only. Do not send it.")
+
+    st.markdown("---")
+
+    # ----------------------------------------
     # DECISION CARD — the playbook with its branches already resolved
     # ----------------------------------------
     if decision:
@@ -5765,40 +5817,6 @@ if show_risk_panel:
 # It computes nothing new. Every value here was already decided by the panel that
 # owns it — this only collects them, which is precisely why it can be trusted as the
 # last thing read before acting.
-# ==========================================
-# TRADE CONSTRUCTOR — resolved order
-# ==========================================
-# Built here rather than beside the hierarchy because it needs the Expected Move
-# band, Max Pain and DTE, none of which exist earlier in the script.
-trade = build_trade(hierarchy, gex, expected_move, spot, atm_strike, mp, dte,
-                    df, risk_settings, lot=LOT_SIZE, step=STRIKE_STEP)
-
-st.subheader("🎯 Trade Constructor — structure, strikes and size")
-if trade['blocked']:
-    st.warning(f"**No order.** {trade['blocked']}")
-    for _n in trade['notes']:
-        st.caption(_n)
-else:
-    _prem_lbl = "CREDIT" if trade['net_premium'] > 0 else "DEBIT"
-    _prem_rs = abs(trade['net_premium']) * LOT_SIZE * trade['lots']
-    st.markdown(f"""
-<div style='background-color:#0d6efd;padding:18px;border-radius:10px;margin:6px 0;'>
-    <h3 style='color:white;margin:0;'>{trade['structure']} &nbsp;·&nbsp; {trade['lots']} lot(s)</h3>
-    <p style='color:white;margin:8px 0 0 0;'>{_prem_lbl} <b>{abs(trade['net_premium']):.1f} pts</b>
-    (₹{_prem_rs:,.0f}) &nbsp;|&nbsp; Max loss <b>₹{trade['max_loss']:,.0f}</b>
-    &nbsp;|&nbsp; Invalidation <b>{trade['invalidation']}</b></p>
-</div>""", unsafe_allow_html=True)
-    _leg_rows = [{'Action': a, 'Strike': f"{k:.0f}", 'Type': sd,
-                  'LTP': (lambda v: f"{v:.2f}" if v else "—")(_ltp(df, k, sd)),
-                  'Qty': f"{int(trade['lots'] * LOT_SIZE)}"}
-                 for a, k, sd in trade['legs']]
-    st.dataframe(pd.DataFrame(_leg_rows), use_container_width=True, hide_index=True)
-    st.caption("Execution order matters: **buy the long legs first**, then sell the shorts. "
-               "Reversed, the account is briefly naked short and margin can spike enough to "
-               "reject the second leg. Unwind in the opposite order.")
-    for _n in trade['notes']:
-        st.caption(_n)
-
 st.subheader("8️⃣ 🚦 Execution Checkpoint — the last look before acting")
 
 _gates = []
