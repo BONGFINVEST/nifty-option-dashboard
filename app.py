@@ -219,7 +219,8 @@ DEFAULT_SCENARIO_THRESHOLDS = {
 #   6. Risk envelope  -- ATR, stop/target levels, and premium-based position
 #                        sizing. Signal without a risk envelope is not a trade.
 # ==========================================
-LOT_SIZE = 75          # NIFTY F&O lot size — retire this constant when the exchange changes it again
+LOT_SIZE = 65          # NIFTY F&O lot size (revised Jan-2026; was 75). Every rupee figure in
+                       # this app scales off it — verify against the contract master each series.
 TRADING_DAYS_YEAR = 252
 SESSION_MINUTES = 375  # 09:15–15:30
 
@@ -3059,6 +3060,318 @@ def resolve_direction(gex, bsum, fp_legs, chg_pcr, chg_pcr_reliable, t, h=None):
     }
 
 
+# ============================================================================
+# TRADE CONSTRUCTOR — structure selection and concrete strikes
+# ============================================================================
+# Turns the arbitrated read into an executable order: which STRUCTURE fits the
+# regime, which STRIKES to use, how many lots the risk budget funds, and where the
+# trade is invalidated.
+#
+# Two principles drive every rule below.
+#
+# 1. The gamma regime picks the STRUCTURE, not just the side. Short gamma means
+#    dealer hedging amplifies moves, so long premium can actually pay for its theta
+#    -- debit spreads and outright buys belong there. Long gamma means moves get
+#    damped back toward the high-OI strikes, which is the only regime where selling
+#    premium has the mechanics behind it. Selling premium in short gamma, or buying
+#    it in long gamma, is fighting the hedging flow.
+#
+# 2. Short strikes are placed on LEVELS, not on deltas. A 15-delta strike is a
+#    statistical abstraction; a gamma wall is a price dealers are mechanically
+#    obliged to defend. Where the two disagree, the wall is the better anchor.
+# ============================================================================
+
+STRUCTURE_RULES = {
+    # (regime, has_direction) -> structure family
+    ('trend', True):  'debit_spread',      # short gamma + direction: buy, spread-financed
+    ('trend', False): 'no_trade',          # short gamma + no direction: moves amplify and you
+                                           # do not know which way. The worst cell on the grid.
+    ('pin',   True):  'credit_spread',     # long gamma + direction: sell the faded side
+    ('pin',   False): 'neutral_credit',    # long gamma + no direction: condor / fly
+    ('flip',  True):  'no_trade',
+    ('flip',  False): 'no_trade',
+}
+
+
+def _snap(x, step, mode='near'):
+    if x is None:
+        return None
+    if mode == 'up':
+        return float(np.ceil(x / step) * step)
+    if mode == 'down':
+        return float(np.floor(x / step) * step)
+    return float(round(x / step) * step)
+
+
+def _ltp(chain, strike, side):
+    """Last traded price for a strike/side, or None. Falls back across the columns
+    the chain may expose so a missing LTP never silently becomes zero -- a zero
+    premium would make every spread look free and blow the sizing math."""
+    try:
+        row = chain[chain['Strike'] == strike]
+        if row.empty:
+            return None
+        v = pd.to_numeric(row.iloc[0].get(f'{side}_LTP'), errors='coerce')
+        return float(v) if pd.notna(v) and v > 0 else None
+    except Exception:
+        return None
+
+
+def _net_premium(chain, legs):
+    """Net premium of a leg list. Positive = net CREDIT received, negative = net
+    DEBIT paid. Returns (value, complete) -- complete is False when any leg has no
+    usable LTP, in which case the caller must not size off the number."""
+    total, complete = 0.0, True
+    for act, strike, side in legs:
+        p = _ltp(chain, strike, side)
+        if p is None:
+            complete = False
+            continue
+        total += p if act == 'SELL' else -p
+    return total, complete
+
+
+def _fit_credit_spread(chain, short_k, side, cap_rs, lot, step,
+                       widths=(50, 100, 150, 200, 250, 300)):
+    """Widest defined-risk credit spread that fits the per-trade cap, priced off the
+    ACTUAL chain rather than a rule-of-thumb fraction of the short premium. The long
+    leg is real money and its cost changes the max loss materially, so estimating it
+    is how a structure that does not fit gets reported as one that does.
+
+    Returns (width, long_k, credit_pts, lots, max_loss) or (None, ...) when nothing fits."""
+    best = (None, None, None, 0, None)
+    for w in widths:
+        long_k = short_k + w if side == 'CE' else short_k - w
+        credit, complete = _net_premium(chain, [('SELL', short_k, side), ('BUY', long_k, side)])
+        if not complete or credit <= 0:
+            continue
+        risk_pts = w - credit
+        if risk_pts <= 0:          # credit >= width is a mispriced or stale quote, not free money
+            continue
+        loss_1lot = risk_pts * lot
+        if loss_1lot <= cap_rs:
+            lots = max(int(cap_rs // loss_1lot), 1)
+            best = (float(w), float(long_k), float(credit), lots, loss_1lot * lots)
+    return best
+
+
+def _fit_neutral(chain, short_ce, short_pe, cap_rs, lot, step, put_ratio=1.0,
+                 widths=(50, 100, 150, 200, 250, 300, 400, 500)):
+    """Same idea for a four-leg neutral structure. The put wing can be set tighter
+    than the call wing via put_ratio, because downside moves in this index are the
+    sharper ones and that is not the side to economise on."""
+    best = (None, None, None, 0, None, None)
+    for w in widths:
+        pw = max(step, round(w * put_ratio / step) * step)
+        legs = [('SELL', short_ce, 'CE'), ('BUY', short_ce + w, 'CE'),
+                ('SELL', short_pe, 'PE'), ('BUY', short_pe - pw, 'PE')]
+        credit, complete = _net_premium(chain, legs)
+        if not complete or credit <= 0:
+            continue
+        # Max loss is on the WIDER wing: the structure can only be tested on one side.
+        risk_pts = max(w, pw) - credit
+        if risk_pts <= 0:
+            continue
+        loss_1lot = risk_pts * lot
+        if loss_1lot <= cap_rs:
+            lots = max(int(cap_rs // loss_1lot), 1)
+            best = (float(w), float(pw), float(credit), lots, loss_1lot * lots, legs)
+    return best
+
+
+def _fit_debit_spread(chain, long_k, side, target_k, cap_rs, lot, step):
+    """Debit spread sized to the cap. Tries the full spread first, then narrows the
+    short leg toward the long leg, because a cheaper spread with a nearer target is
+    a real trade whereas a blocked one is not."""
+    best = (None, None, None, 0, None)
+    span = abs(target_k - long_k)
+    steps = [s for s in np.arange(span, step, -step) if s >= step * 2]
+    for w in steps:
+        sk = long_k + w if side == 'CE' else long_k - w
+        net, complete = _net_premium(chain, [('BUY', long_k, side), ('SELL', sk, side)])
+        if not complete:
+            continue
+        debit = -net
+        if debit <= 0:
+            continue
+        loss_1lot = debit * lot
+        if loss_1lot <= cap_rs:
+            lots = max(int(cap_rs // loss_1lot), 1)
+            return (float(w), float(sk), float(debit), lots, loss_1lot * lots)
+    return best
+
+
+def build_trade(hierarchy, gex, expected_move, spot, atm_strike, mp, dte,
+                chain, risk_settings, lot=None, step=None):
+    """Resolves the arbitrated read into a concrete, sized order.
+
+    Returns a dict the dashboard can render directly, or None when there is
+    nothing to trade. Every branch states WHY, because a blocked trade is
+    information and a silent one is not."""
+    lot = float(lot or LOT_SIZE)
+    step = float(step or STRIKE_STEP)
+    out = {'legs': [], 'notes': [], 'structure': None, 'family': None,
+           'lots': 0, 'max_loss': None, 'net_premium': None, 'premium_complete': False,
+           'invalidation': None, 'target': None, 'blocked': None}
+
+    if spot is None or chain is None or chain.empty:
+        out['blocked'] = "No spot or no chain — nothing to construct."
+        return out
+
+    # ---- regime key ----
+    if gex is None:
+        out['blocked'] = "No live gamma. The regime picks the structure, so nothing is built without it."
+        return out
+    regime = 'flip' if gex.get('at_flip') else gex.get('regime_key')
+    has_dir = bool(hierarchy and hierarchy.get('tradeable'))
+    family = STRUCTURE_RULES.get((regime, has_dir), 'no_trade')
+    out['family'] = family
+
+    if family == 'no_trade':
+        if regime == 'flip':
+            out['blocked'] = ("Spot is on the gamma flip. The regime can invert on a 20-point "
+                              "move, so neither the buy structure nor the sell structure is safe.")
+        else:
+            out['blocked'] = ("Short gamma with no qualified direction. Dealer hedging amplifies "
+                              "whatever move comes and the hierarchy cannot say which way — this is "
+                              "the one cell where premium selling AND premium buying are both wrong.")
+        return out
+
+    # ---- anchors ----
+    wall = gex.get('gamma_wall')          # largest positive gamma = defended magnet
+    pit = gex.get('gamma_pit')            # largest negative gamma = acceleration pocket
+    # compute_expected_move() names the 1SD band expected_high / expected_low.
+    em_hi = expected_move.get('expected_high') if expected_move else None
+    em_lo = expected_move.get('expected_low') if expected_move else None
+    cap_rs = float(risk_settings.get('capital', 500000)) * float(risk_settings.get('risk_pct', 0.5)) / 100.0
+    trade_dir = hierarchy['trade_dir'] if has_dir else 0
+
+    def _above_pit(candidate):
+        """A short call must not sit between spot and the acceleration pocket. Past
+        the pit dealer hedging flips from damping the move to amplifying it, so a
+        strike inside that zone is short premium directly in front of the flow."""
+        if pit is not None and candidate is not None and spot < pit <= candidate + step:
+            return _snap(pit + step, step, 'up')
+        return candidate
+
+    def _below_pit(candidate):
+        if pit is not None and candidate is not None and candidate - step <= pit < spot:
+            return _snap(pit - step, step, 'down')
+        return candidate
+
+    # ================= CREDIT SPREAD (long gamma + direction) =================
+    if family == 'credit_spread':
+        if trade_dir < 0:      # fade a bullish read -> BEAR CALL SPREAD
+            anchor = max([v for v in (em_hi, wall if (wall and wall > spot) else None,
+                                      spot + step * 2) if v is not None])
+            short_k = _above_pit(_snap(anchor, step, 'up'))
+            side, name, direction_txt = 'CE', 'Bear Call Spread', "short"
+        else:                  # fade a bearish read -> BULL PUT SPREAD
+            anchor = min([v for v in (em_lo, wall if (wall and wall < spot) else None,
+                                      spot - step * 2) if v is not None])
+            short_k = _below_pit(_snap(anchor, step, 'down'))
+            side, name, direction_txt = 'PE', 'Bull Put Spread', "long"
+
+        width, long_k, credit, lots, max_loss = _fit_credit_spread(
+            chain, short_k, side, cap_rs, lot, step)
+        if width is None:
+            out['blocked'] = (f"No {name} width fits the ₹{cap_rs:,.0f} per-trade cap at lot "
+                              f"{lot:.0f} with the short leg at {short_k:.0f}. Raise the cap, move "
+                              f"the short leg closer to spot for more credit, or stand down.")
+            return out
+        out['legs'] = [('SELL', short_k, side), ('BUY', long_k, side)]
+        out['structure'] = name
+        out['lots'], out['max_loss'] = lots, max_loss
+        out['net_premium'], out['premium_complete'] = credit, True
+        out['invalidation'] = short_k
+        out['target'] = mp if mp else _snap(spot, step)
+        out['notes'].append(
+            f"Long gamma fades the {hierarchy['label'].lower()} read, so the trade is {direction_txt}. "
+            f"Short leg at {short_k:.0f} sits outside the 1SD band"
+            + (f" and beyond the {pit:.0f} acceleration pocket" if pit is not None else "")
+            + f". Width {width:.0f} is the widest the ₹{cap_rs:,.0f} cap funds.")
+
+    # ================= DEBIT SPREAD (short gamma + direction) =================
+    elif family == 'debit_spread':
+        long_k = _snap(atm_strike, step)
+        if trade_dir > 0:
+            tgt = min([v for v in (em_hi, wall if (wall and wall > spot) else None)
+                       if v is not None], default=spot + step * 4)
+            target_k, side, name = max(_snap(tgt, step, 'up'), long_k + step * 4), 'CE', 'Bull Call Spread'
+        else:
+            tgt = max([v for v in (em_lo, wall if (wall and wall < spot) else None)
+                       if v is not None], default=spot - step * 4)
+            target_k, side, name = min(_snap(tgt, step, 'down'), long_k - step * 4), 'PE', 'Bear Put Spread'
+
+        width, short_k, debit, lots, max_loss = _fit_debit_spread(
+            chain, long_k, side, target_k, cap_rs, lot, step)
+        if width is None:
+            out['blocked'] = (f"Even the narrowest {name} from the {long_k:.0f} strike costs more "
+                              f"than the ₹{cap_rs:,.0f} per-trade cap at lot {lot:.0f}. Buying "
+                              f"premium at the money needs a bigger allowance than 0.5%.")
+            return out
+        out['legs'] = [('BUY', long_k, side), ('SELL', short_k, side)]
+        out['structure'] = name
+        out['lots'], out['max_loss'] = lots, max_loss
+        out['net_premium'], out['premium_complete'] = -debit, True
+        out['invalidation'] = _snap(spot - step * 2 if trade_dir > 0 else spot + step * 2, step)
+        out['target'] = short_k
+        out['notes'].append(
+            f"Short gamma gives the move follow-through, so premium is bought rather than sold. "
+            f"Long leg at the money for delta; short leg at {short_k:.0f} finances it at the level "
+            f"the move is expected to reach anyway. Debit {debit:.1f} pts = "
+            f"₹{debit * lot:,.0f} per lot, which IS the max loss.")
+
+    # ================= NEUTRAL CREDIT (long gamma, no direction) =================
+    elif family == 'neutral_credit':
+        expiry_day = (dte is not None and dte <= 1)
+        if expiry_day:
+            k = _snap(atm_strike, step)
+            short_ce, short_pe, name, put_ratio = k, k, 'Iron Fly (broken wing)', 0.6
+        else:
+            short_ce = _above_pit(_snap(max(em_hi or spot + step * 3, spot + step * 3), step, 'up'))
+            short_pe = _below_pit(_snap(min(em_lo or spot - step * 3, spot - step * 3), step, 'down'))
+            name, put_ratio = 'Iron Condor', 1.0
+
+        cw, pw, credit, lots, max_loss, legs = _fit_neutral(
+            chain, short_ce, short_pe, cap_rs, lot, step, put_ratio)
+        if cw is None:
+            out['blocked'] = (f"No wing width for a {name} fits the ₹{cap_rs:,.0f} cap at lot "
+                              f"{lot:.0f}. A four-leg neutral structure on NIFTY needs roughly 1-2% "
+                              f"per trade; at 0.5% the arithmetic does not close.")
+            return out
+        out['legs'] = legs
+        out['structure'] = name
+        out['lots'], out['max_loss'] = lots, max_loss
+        out['net_premium'], out['premium_complete'] = credit, True
+        out['invalidation'] = (short_ce, short_pe)
+        out['target'] = mp if mp else _snap(spot, step)
+        out['notes'].append(
+            f"Long gamma with no qualified direction is the one regime whose mechanics support "
+            f"selling premium on both sides. Credit {credit:.1f} pts; call wing {cw:.0f}, put wing "
+            f"{pw:.0f} — the put wing is the tighter one because downside moves are the sharper ones.")
+
+    # The hierarchy size cap applies ON TOP of the risk-budget lot count: the budget
+    # says what the account can afford, the cap says what the quality of the read
+    # deserves. A rank-4 read that rounds to zero lots is the correct answer, not a
+    # rounding error -- it means the signal is not good enough to be worth the floor
+    # size the account would have to take.
+    if out['lots'] and hierarchy and hierarchy.get('size_cap', 1.0) < 1.0:
+        per_lot = (out['max_loss'] / out['lots']) if out['max_loss'] else None
+        capped = max(int(out['lots'] * hierarchy['size_cap']), 0)
+        if capped != out['lots']:
+            out['notes'].append(
+                f"Rank-{hierarchy['rank']} size cap ({hierarchy['size_cap']:.0%}): "
+                f"{out['lots']} → {capped} lot(s).")
+        out['lots'] = capped
+        out['max_loss'] = (per_lot * capped) if (per_lot is not None) else out['max_loss']
+
+    if out['lots'] == 0 and out['legs'] and not out['blocked']:
+        out['blocked'] = (f"Structure resolves to {out['structure']} at these strikes, but the "
+                          f"sizing comes to zero lots. Shown for reference — do not send it.")
+    return out
+
+
 # ==========================================
 # READ CONFLICT — the highest-probability no-trade condition
 # ==========================================
@@ -5452,6 +5765,40 @@ if show_risk_panel:
 # It computes nothing new. Every value here was already decided by the panel that
 # owns it — this only collects them, which is precisely why it can be trusted as the
 # last thing read before acting.
+# ==========================================
+# TRADE CONSTRUCTOR — resolved order
+# ==========================================
+# Built here rather than beside the hierarchy because it needs the Expected Move
+# band, Max Pain and DTE, none of which exist earlier in the script.
+trade = build_trade(hierarchy, gex, expected_move, spot, atm_strike, mp, dte,
+                    df, risk_settings, lot=LOT_SIZE, step=STRIKE_STEP)
+
+st.subheader("🎯 Trade Constructor — structure, strikes and size")
+if trade['blocked']:
+    st.warning(f"**No order.** {trade['blocked']}")
+    for _n in trade['notes']:
+        st.caption(_n)
+else:
+    _prem_lbl = "CREDIT" if trade['net_premium'] > 0 else "DEBIT"
+    _prem_rs = abs(trade['net_premium']) * LOT_SIZE * trade['lots']
+    st.markdown(f"""
+<div style='background-color:#0d6efd;padding:18px;border-radius:10px;margin:6px 0;'>
+    <h3 style='color:white;margin:0;'>{trade['structure']} &nbsp;·&nbsp; {trade['lots']} lot(s)</h3>
+    <p style='color:white;margin:8px 0 0 0;'>{_prem_lbl} <b>{abs(trade['net_premium']):.1f} pts</b>
+    (₹{_prem_rs:,.0f}) &nbsp;|&nbsp; Max loss <b>₹{trade['max_loss']:,.0f}</b>
+    &nbsp;|&nbsp; Invalidation <b>{trade['invalidation']}</b></p>
+</div>""", unsafe_allow_html=True)
+    _leg_rows = [{'Action': a, 'Strike': f"{k:.0f}", 'Type': sd,
+                  'LTP': (lambda v: f"{v:.2f}" if v else "—")(_ltp(df, k, sd)),
+                  'Qty': f"{int(trade['lots'] * LOT_SIZE)}"}
+                 for a, k, sd in trade['legs']]
+    st.dataframe(pd.DataFrame(_leg_rows), use_container_width=True, hide_index=True)
+    st.caption("Execution order matters: **buy the long legs first**, then sell the shorts. "
+               "Reversed, the account is briefly naked short and margin can spike enough to "
+               "reject the second leg. Unwind in the opposite order.")
+    for _n in trade['notes']:
+        st.caption(_n)
+
 st.subheader("8️⃣ 🚦 Execution Checkpoint — the last look before acting")
 
 _gates = []
