@@ -5329,7 +5329,6 @@ if trade and not trade.get('blocked') and trade.get('lots', 0) > 0 and spot:
     payoff_df = compute_payoff_table(trade, spot, LOT_SIZE, STRIKE_STEP, points_range=300)
 
     if payoff_df is not None and not payoff_df.empty:
-        # --- Summary strip ---
         _max_p = payoff_df.attrs['max_profit']
         _max_l = payoff_df.attrs['max_loss']
         _bes = payoff_df.attrs['breakevens']
@@ -5348,7 +5347,6 @@ if trade and not trade.get('blocked') and trade.get('lots', 0) > 0 and spot:
                    f"₹{abs(_prem) * LOT_SIZE * _lots:,.0f}")
         sc5.metric("Range shown", "300 pts", f"spot ± 150 in {STRIKE_STEP}-pt steps")
 
-        # --- Styled table ---
         _spot_now = float(spot)
         def _color_pnl(val):
             if pd.isna(val): return ''
@@ -5375,9 +5373,7 @@ if trade and not trade.get('blocked') and trade.get('lots', 0) > 0 and spot:
         except Exception:
             st.dataframe(payoff_df, use_container_width=True, height=420, hide_index=True)
 
-        # --- Payoff chart ---
         pfig = go.Figure()
-        # Fill profit zone green, loss zone red
         pfig.add_trace(go.Scatter(
             x=payoff_df['Spot'], y=payoff_df['Total P&L'],
             mode='lines', name='P&L',
@@ -5385,18 +5381,14 @@ if trade and not trade.get('blocked') and trade.get('lots', 0) > 0 and spot:
             fill='tozeroy',
             fillcolor='rgba(40,167,69,0.15)',
         ))
-        # Zero line
         pfig.add_hline(y=0, line_color='#6c757d', line_width=1, line_dash='dash')
-        # Current spot
         pfig.add_vline(x=_spot_now, line_dash='solid', line_color='#fd7e14', line_width=2,
                        annotation_text=f" spot {_spot_now:.0f} ", annotation_position='top left',
                        annotation_bgcolor='#fd7e14', annotation_font_color='white')
-        # Breakeven markers
         for be in _bes:
             pfig.add_vline(x=be, line_dash='dot', line_color='#6f42c1', line_width=1.5,
                            annotation_text=f" BE {be:.0f} ", annotation_position='bottom right',
                            annotation_bgcolor='#6f42c1', annotation_font_color='white')
-        # Max profit / max loss markers
         _mp_spot = payoff_df.loc[payoff_df['Total P&L'].idxmax(), 'Spot']
         _ml_spot = payoff_df.loc[payoff_df['Total P&L'].idxmin(), 'Spot']
         pfig.add_trace(go.Scatter(x=[_mp_spot], y=[_max_p], mode='markers+text',
@@ -5412,15 +5404,13 @@ if trade and not trade.get('blocked') and trade.get('lots', 0) > 0 and spot:
             height=360, margin=dict(l=10, r=10, t=20, b=10),
             xaxis_title='Spot at expiry', yaxis_title='Total P&L (₹)',
             legend=dict(orientation='h', y=1.12),
-            xaxis=dict(tick0=lo, dtick=STRIKE_STEP * 2),
         )
         st.plotly_chart(pfig, use_container_width=True)
 
         st.caption(
             "**Reading the table:** the yellow-highlighted row is the current spot. "
-            "Green rows = profit, red = loss. The chart's breakeven lines (purple dots) "
-            "are linearly interpolated between the two bracketing strikes — the true "
-            "breakeven sits somewhere between those two rows. "
+            "Green rows = profit, red = loss. Breakeven lines (purple dots) are linearly "
+            "interpolated between bracketing strikes. "
             "**This is an expiry-day payoff** (intrinsic value only); it does NOT model "
             "theta decay or IV drift during the hold. For live stop/target levels, use the "
             "Risk Envelope panel above."
