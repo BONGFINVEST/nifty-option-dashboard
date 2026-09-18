@@ -5321,6 +5321,118 @@ if show_gex_panel:
                      f"for preparation only. Do not send it.")
 
     st.markdown("---")
+# ==========================================
+# PAYOFF TABLE — spot-wise P&L for the constructed trade
+# ==========================================
+st.markdown("#### 📊 Payoff Table — P&L at different spot levels (±150 pts)")
+if trade and not trade.get('blocked') and trade.get('lots', 0) > 0 and spot:
+    payoff_df = compute_payoff_table(trade, spot, LOT_SIZE, STRIKE_STEP, points_range=300)
+
+    if payoff_df is not None and not payoff_df.empty:
+        # --- Summary strip ---
+        _max_p = payoff_df.attrs['max_profit']
+        _max_l = payoff_df.attrs['max_loss']
+        _bes = payoff_df.attrs['breakevens']
+        _prem = payoff_df.attrs['net_premium']
+        _lots = payoff_df.attrs['lots']
+        _rr = abs(_max_p / _max_l) if _max_l < 0 else float('inf')
+        _be_txt = (" · ".join(f"`{b:.0f}`" for b in _bes)) if _bes else "n/a (no crossing in range)"
+
+        sc1, sc2, sc3, sc4, sc5 = st.columns(5)
+        sc1.metric("Max profit", f"₹{_max_p:,.0f}",
+                   f"{_lots} lot(s) · {'credit' if _prem > 0 else 'debit'}")
+        sc2.metric("Max loss", f"₹{_max_l:,.0f}",
+                   f"R:R = {_rr:.2f}" if _max_l < 0 else "no loss side")
+        sc3.metric("Breakeven(s)", _be_txt)
+        sc4.metric("Net premium", f"{_prem:+.1f} pts",
+                   f"₹{abs(_prem) * LOT_SIZE * _lots:,.0f}")
+        sc5.metric("Range shown", "300 pts", f"spot ± 150 in {STRIKE_STEP}-pt steps")
+
+        # --- Styled table ---
+        _spot_now = float(spot)
+        def _color_pnl(val):
+            if pd.isna(val): return ''
+            if val > 0:   return 'background-color: #d4edda; color: #000000; font-weight: 600'
+            if val < 0:   return 'background-color: #f8d7da; color: #000000; font-weight: 600'
+            return 'background-color: #fff3cd; color: #000000; font-weight: 600'
+
+        def _highlight_spot(val):
+            if abs(val - _spot_now) < (STRIKE_STEP / 2):
+                return 'background-color: #fff3cd; color: #000000; font-weight: 700'
+            return ''
+
+        try:
+            sty = payoff_df.style.format({
+                'Spot': '{:.0f}',
+                'P&L per unit': '{:+.2f}',
+                'P&L per lot': '{:+,.0f}',
+                'Total P&L': '{:+,.0f}',
+            }, na_rep='—')
+            map_fn = sty.map if hasattr(sty, 'map') else sty.applymap
+            sty = map_fn(_color_pnl, subset=['Total P&L'])
+            sty = map_fn(_highlight_spot, subset=['Spot'])
+            st.dataframe(sty, use_container_width=True, height=420, hide_index=True)
+        except Exception:
+            st.dataframe(payoff_df, use_container_width=True, height=420, hide_index=True)
+
+        # --- Payoff chart ---
+        pfig = go.Figure()
+        # Fill profit zone green, loss zone red
+        pfig.add_trace(go.Scatter(
+            x=payoff_df['Spot'], y=payoff_df['Total P&L'],
+            mode='lines', name='P&L',
+            line=dict(color='#0d6efd', width=2.5),
+            fill='tozeroy',
+            fillcolor='rgba(40,167,69,0.15)',
+        ))
+        # Zero line
+        pfig.add_hline(y=0, line_color='#6c757d', line_width=1, line_dash='dash')
+        # Current spot
+        pfig.add_vline(x=_spot_now, line_dash='solid', line_color='#fd7e14', line_width=2,
+                       annotation_text=f" spot {_spot_now:.0f} ", annotation_position='top left',
+                       annotation_bgcolor='#fd7e14', annotation_font_color='white')
+        # Breakeven markers
+        for be in _bes:
+            pfig.add_vline(x=be, line_dash='dot', line_color='#6f42c1', line_width=1.5,
+                           annotation_text=f" BE {be:.0f} ", annotation_position='bottom right',
+                           annotation_bgcolor='#6f42c1', annotation_font_color='white')
+        # Max profit / max loss markers
+        _mp_spot = payoff_df.loc[payoff_df['Total P&L'].idxmax(), 'Spot']
+        _ml_spot = payoff_df.loc[payoff_df['Total P&L'].idxmin(), 'Spot']
+        pfig.add_trace(go.Scatter(x=[_mp_spot], y=[_max_p], mode='markers+text',
+                                  name='Max profit',
+                                  marker=dict(color='#28a745', size=12, symbol='star'),
+                                  text=[f"+₹{_max_p:,.0f}"], textposition='top center'))
+        pfig.add_trace(go.Scatter(x=[_ml_spot], y=[_max_l], mode='markers+text',
+                                  name='Max loss',
+                                  marker=dict(color='#dc3545', size=12, symbol='star'),
+                                  text=[f"₹{_max_l:,.0f}"], textposition='bottom center'))
+
+        pfig.update_layout(
+            height=360, margin=dict(l=10, r=10, t=20, b=10),
+            xaxis_title='Spot at expiry', yaxis_title='Total P&L (₹)',
+            legend=dict(orientation='h', y=1.12),
+            xaxis=dict(tick0=lo, dtick=STRIKE_STEP * 2),
+        )
+        st.plotly_chart(pfig, use_container_width=True)
+
+        st.caption(
+            "**Reading the table:** the yellow-highlighted row is the current spot. "
+            "Green rows = profit, red = loss. The chart's breakeven lines (purple dots) "
+            "are linearly interpolated between the two bracketing strikes — the true "
+            "breakeven sits somewhere between those two rows. "
+            "**This is an expiry-day payoff** (intrinsic value only); it does NOT model "
+            "theta decay or IV drift during the hold. For live stop/target levels, use the "
+            "Risk Envelope panel above."
+        )
+    else:
+        st.caption("Payoff could not be computed — the trade has no priced legs on this poll.")
+else:
+    st.caption(
+        "No executable trade above — the Trade Constructor either blocked the structure "
+        "or sized it to zero lots. Build a valid structure first to see the payoff table."
+    )
+st.markdown("---")
 
     # ----------------------------------------
     # DECISION CARD — the playbook with its branches already resolved
