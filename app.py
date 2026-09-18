@@ -3097,6 +3097,7 @@ oi_vel = compute_oi_velocity(
     df, st.session_state.poll_prev_df, st.session_state.poll_prev_ts,
     st.session_state.last_fetch, atm_strike, velocity_settings
 ) if (show_velocity_panel and is_open) else None
+vel_class = None    
 if oi_vel:
     hist = list(st.session_state.oi_velocity_hist)
     hist.append(float(oi_vel['intensity_per_min']))
