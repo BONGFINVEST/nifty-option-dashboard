@@ -2491,8 +2491,8 @@ if need_refresh:
         render_fetch_error(expiry_error)
     st.session_state.expiry_list = expiry_list
     st.session_state.expiry_list_fetched_at = datetime.now()
-if st.session_state.selected_expiry not in expiry_list:
-    st.session_state.selected_expiry = get_nearest_expiry(expiry_list)
+if st.session_state.selected_expiry not in st.session_state.expiry_list:
+    st.session_state.selected_expiry = get_nearest_expiry(st.session_state.expiry_list)
 # ==========================================
 # SIDEBAR
 # ==========================================
