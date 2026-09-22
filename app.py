@@ -534,6 +534,12 @@ def get_dhan_headers():
         "Accept": "application/json",
         "Content-Type": "application/json",
     }
+
+# 🔧 FIX: Assign the headers to the global variable expected by the fetch functions.
+# Because Streamlit reruns the script on every 10s poll/interaction, this still 
+# satisfies the "read credentials fresh" requirement.
+DHAN_HEADERS = get_dhan_headers()
+
 NIFTY_SCRIP, NIFTY_SEG = 13, "IDX_I"
 
 # ==========================================
