@@ -2,26 +2,22 @@
 INSTITUTIONAL NIFTY OI SCANNER
 ==============================
 This automates the exact manual workflow from OI_Analysis_NIFTY.xlsx:
-
-  Zone A (ATM +-6 strikes) -> PCR regime classification
-                              (Analysis!B15/B16 -> OverBought/Bullish/Neutral/Bearish/Oversold)
-  Zone B (ATM +-3 strikes) -> writer-activity signal from OI-change % contribution
-                              (Analysis!A19:H29 -> Buy CE / Write PE / Buy PE / Write CE / Neutral)
-  Master Signal            -> the 'Dash Board'!F1 composite formula
-                              (Strong CE Buy / Strong PE Buy / PE writers strong /
-                               CE writers strong / wait for data confirmation)
-  Action tag                -> 'Dash Board'!L3 lookup table (incl. Reversal detection)
-
+Zone A (ATM +-6 strikes) -> PCR regime classification
+(Analysis!B15/B16 -> OverBought/Bullish/Neutral/Bearish/Oversold)
+Zone B (ATM +-3 strikes) -> writer-activity signal from OI-change % contribution
+(Analysis!A19:H29 -> Buy CE / Write PE / Buy PE / Write CE / Neutral)
+Master Signal            -> the 'Dash Board'!F1 composite formula
+(Strong CE Buy / Strong PE Buy / PE writers strong /
+CE writers strong / wait for data confirmation)
+Action tag                -> 'Dash Board'!L3 lookup table (incl. Reversal detection)
 Everything above is YOUR proven logic, ported 1:1 from the formulas in your workbook.
 Nothing about it has been changed. On top of it this adds a separate, clearly-labeled
 CONFLUENCE panel (spot vs VWAP, Max Pain, bid/ask liquidity, days-to-expiry gamma risk)
 that never overrides the core signal -- it just tells you how much independent support
 that signal has right now, so you can size conviction accordingly.
-
 It also adds a REAL-TIME CANDLESTICK CHART panel (spot OHLC + VWAP + Max Pain trend),
 built from Dhan's intraday-candle endpoint and your own session log -- purely visual,
 never feeds back into the Master Signal.
-
 On top of that, a VWAP TREND READ panel tracks the pattern you watch manually: while
 price keeps *closing* on one side of the running session VWAP, that bias has tended to
 persist for the next ~30-60 minutes. It surfaces the current streak (consecutive candles
@@ -29,24 +25,19 @@ closed on one side), flags VWAP "touch-and-hold" retests (price dips into VWAP i
 but still closes through in the trend direction), and confirms once the streak crosses a
 threshold you set. This is descriptive of what price has actually done, not a prediction,
 and it's entirely separate from the OI-based Master Signal above.
-
 And directly below the chart, the IV LENS implements your trade-gating read of implied
 volatility against price:
-
-    Price DOWN + IV DOWN -> Shakeout            -> longable
-    Price DOWN + IV UP   -> Distribution        -> stand down, however good the OI looks
-    Price UP   + IV UP   -> Fear bid / squeeze  -> never chase; negative skew confirms the fade
-    Price UP   + IV DOWN -> Conviction          -> controlled accumulation (the smart-money grind)
-
+Price DOWN + IV DOWN -> Shakeout            -> longable
+Price DOWN + IV UP   -> Distribution        -> stand down, however good the OI looks
+Price UP   + IV UP   -> Fear bid / squeeze  -> never chase; negative skew confirms the fade
+Price UP   + IV DOWN -> Conviction          -> controlled accumulation (the smart-money grind)
 The lens is a GATE, not another opinion: the distribution quadrant vetoes the OI Master
 Signal outright, and the squeeze quadrant blocks chasing. A compact gate strip sits under
 the Master Signal banner (toggleable) with the full detail below the chart.
-
 Data source: Dhan API v2 Option Chain (see fetch_option_chain for schema notes).
 Sensibull's CSV had "CE OI change" as a pre-computed column; Dhan gives the same
 thing natively via `previous_oi` (oi - previous_oi = today's cumulative change),
 so no manual VLOOKUP/diffing is needed anymore.
-
 MOBILE READABILITY FIX (this build): every cell tint in the Buildup Detection and
 Institutional Footprint tables now sets an explicit BLACK font colour alongside its
 background. Previously the tints set only a background, so the text kept whatever
@@ -54,8 +45,13 @@ colour it inherited from the active Streamlit theme -- dark on desktop light mod
 (readable), near-white on the mobile app's dark theme (effectively invisible on a
 pale green/pink/blue cell). Setting the foreground explicitly makes those columns
 render identically in both themes.
-"""
 
+DHAN TOKEN FIX (this build): the Dhan access token is now read fresh from Streamlit
+Secrets on every API call instead of being cached once at startup. This means that
+when you regenerate the token in the Dhan app and paste it into Streamlit Cloud
+Secrets, the app picks it up automatically on its very next poll -- no redeploy,
+no manual restart, no stale-token error banner hanging around.
+"""
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -66,69 +62,60 @@ from zoneinfo import ZoneInfo
 from pathlib import Path
 import requests
 from streamlit_autorefresh import st_autorefresh
-
 st.set_page_config(page_title="Institutional NIFTY OI Scanner", layout="wide", initial_sidebar_state="expanded")
-
 # ==========================================
 # CONSTANTS
 # ==========================================
 REFRESH_INTERVAL_MS = 10_000
 IDLE_CHECK_INTERVAL_MS = 60_000
 GSHEET_WRITE_THROTTLE_SECONDS = 60
-
 IST = ZoneInfo("Asia/Kolkata")
 NSE_OPEN = dtime(9, 15)
 NSE_CLOSE = dtime(15, 30)
-
 STRIKE_STEP = 50           # NIFTY strike interval
 ZONE_A_WIDTH = 6           # PCR classification zone: ATM +- 6 strikes (matches Analysis!A2:E14)
 ZONE_B_WIDTH = 3           # OI-change writer-signal zone: ATM +- 3 strikes (matches Analysis!A21:H28)
-
 # Thresholds -- copied verbatim from your workbook's formulas. Editable in the sidebar
 # under "Advanced (Excel-equivalent) Settings" so you can retune without touching code.
 DEFAULT_PCR_THRESHOLDS = {"overbought": 1.48, "bullish": 1.00, "bearish": 0.80}   # Analysis!B15
 DEFAULT_SIGNAL_THRESHOLDS = {"strong": 20, "mild": 10}                            # Analysis!B20
 DEFAULT_MASTER_THRESHOLDS = {                                                     # Dash Board!F1
-    "pcr_high": 1.0, "pcr_low": 0.8, "pcr_ce_writers": 0.7,
-    "vol_imbalance_strong": 5, "vol_imbalance_mild": 1,
+"pcr_high": 1.0, "pcr_low": 0.8, "pcr_ce_writers": 0.7,
+"vol_imbalance_strong": 5, "vol_imbalance_mild": 1,
 }
-
 # Candlestick chart settings -- separate concern from the OI-based Master Signal above.
 # This is purely a visual overlay of spot price action + intraday VWAP + Max Pain trend.
 CANDLE_FETCH_THROTTLE_SECONDS = 30   # don't hammer Dhan's intraday-candle endpoint every 10s OI poll
 DEFAULT_CANDLE_INTERVAL = "5"        # minutes -- matches your M5 Fibonacci Pine Script granularity
-
 # OI PROFILE overlay -- horizontal per-strike OI bars pinned to the right edge of the
 # candle chart, on the SAME price axis as the candles, so an OI wall lines up visually
 # with the price level it sits at. Read like a volume profile, but of open interest.
 OI_PROFILE_WIDTH = 8          # ATM +- N strikes included in the profile
 OI_PROFILE_FRAC = 0.25        # widest bar occupies this fraction of the chart width
 OI_PROFILE_PAD_STRIKES = 3    # headroom (in strikes) above/below the day's range when fitting Y to price
-
 # Institutional Footprint settings -- a THIRD, fully independent read (IV Skew,
 # ChgPCR momentum, Vol/OI conviction) layered alongside the Master Signal and the
 # VWAP Trend Read above. Never feeds into either of those; purely additive.
 FOOTPRINT_WIDTH = 5                                    # ATM +- N strikes for the footprint zone/table
 DEFAULT_FOOTPRINT_THRESHOLDS = {
-    "iv_skew_bearish": -2.0,     # CE_IV - PE_IV <= this -> aggressive Put buying -> look for breakdown
-    "iv_skew_bullish": 2.0,      # CE_IV - PE_IV >= this -> Put writers running -> look for short-covering rally
-    "chgpcr_bear_trap": 1.5,     # ChgPCR spikes above this while price is FALLING -> Bear Trap (dip being bought)
-    "chgpcr_bull_trap": 0.5,     # ChgPCR collapses below this while price is RISING -> Bull Trap (rally being sold into)
-    # CALIBRATION NOTE (from the 14-Aug-2026 live session, 635 polls): the original
-    # 0.6 / 0.2 thresholds were an order of magnitude below the Vol/OI this feed
-    # actually produces. Observed range was 0.47 to 21.9, median 8.3 -- so "fresh
-    # money confirmed" fired on 99.7% of polls and "fakeout risk" never fired once.
-    # The conviction tag was pinned to REAL all day and carried no information.
-    # These are today's 75th/25th percentiles, so the tag now actually discriminates.
-    # One day is thin calibration -- the panel shows where the live value sits in
-    # today's own distribution so you can retune these with a week of evidence.
-    "vol_oi_fresh": 13.0,        # Vol/OI >= this -> fresh institutional money, regime is "real"
-    "vol_oi_fakeout": 5.0,       # Vol/OI < this -> just intraday squaring off, ignore the breakout
-    "trend_flat_band_pct": 0.1,  # spot within +-this% of today's open counts as "sideways", not rising/falling
-    "chgpcr_min_ce_chg_abs": 300,       # minimum |net CE OI change| (contracts) in the zone before trusting ChgPCR
-    "chgpcr_min_ce_chg_pct_of_oi": 0.3, # ...OR at least this % of the zone's total OI, whichever floor is higher
+"iv_skew_bearish": -2.0,     # CE_IV - PE_IV <= this -> aggressive Put buying -> look for breakdown
+"iv_skew_bullish": 2.0,      # CE_IV - PE_IV >= this -> Put writers running -> look for short-covering rally
+"chgpcr_bear_trap": 1.5,     # ChgPCR spikes above this while price is FALLING -> Bear Trap (dip being bought)
+"chgpcr_bull_trap": 0.5,     # ChgPCR collapses below this while price is RISING -> Bull Trap (rally being sold into)
+# CALIBRATION NOTE (from the 14-Aug-2026 live session, 635 polls): the original
+# 0.6 / 0.2 thresholds were an order of magnitude below the Vol/OI this feed
+# actually produces. Observed range was 0.47 to 21.9, median 8.3 -- so "fresh
+# money confirmed" fired on 99.7% of polls and "fakeout risk" never fired once.
+# The conviction tag was pinned to REAL all day and carried no information.
+# These are today's 75th/25th percentiles, so the tag now actually discriminates.
+# One day is thin calibration -- the panel shows where the live value sits in
+# today's own distribution so you can retune these with a week of evidence.
+"vol_oi_fresh": 13.0,        # Vol/OI >= this -> fresh institutional money, regime is "real"
+"vol_oi_fakeout": 5.0,       # Vol/OI < this -> just intraday squaring off, ignore the breakout
+"trend_flat_band_pct": 0.1,  # spot within +-this% of today's open counts as "sideways", not rising/falling
+"chgpcr_min_ce_chg_abs": 300,       # minimum |net CE OI change| (contracts) in the zone before trusting ChgPCR
+"chgpcr_min_ce_chg_pct_of_oi": 0.3, # ...OR at least this % of the zone's total OI, whichever floor is higher
 }
-
 # IV LENS settings -- the trade gate that sits below the candlestick chart (and, if
 # enabled, as a compact strip directly under the Master Signal banner).
 #
@@ -145,26 +132,25 @@ DEFAULT_FOOTPRINT_THRESHOLDS = {
 # replaced, there is no unmapped state to toggle. When either leg is FLAT the lens
 # stays silent rather than inventing a verdict -- flat is not one of the four quadrants.
 DEFAULT_IV_LENS_THRESHOLDS = {
-    "lookback_minutes": 15,      # rolling window over which the two changes are measured
-    "iv_significant_pct": 1.5,   # |IV change| below this % (relative) counts as "no significant IV move"
-    "price_significant_pct": 0.10,  # |spot change| below this % counts as "flat"
-    "min_samples": 4,            # need at least this many logged polls in the window before reading it
-    "atm_iv_width": 1,           # ATM IV = mean of CE+PE IV across ATM +- N strikes (N=1 -> ATM straddle-ish)
-    "skew_fade_confirm": 0.0,    # weighted (CE_IV - PE_IV) below this, in the up/up quadrant, confirms the fade
-    "skew_width": 3,             # ATM +- N strikes for the OI-weighted skew the lens consults
-    # ADAPTIVE FLOORS (opt-in, default off). A fixed % floor is calibrated to one
-    # volatility regime and silently changes meaning when the regime changes. On the
-    # 14-Aug session the 0.10% price floor was ~24 pts over 15 min, while the index's
-    # ENTIRE day range was 96 pts -- so price read "flat" on 606 of 623 polls and the
-    # lens was silent 97% of the day. Switched on, the floors are instead set to a
-    # percentile of the session's OWN realized moves over the same lookback, so the
-    # same setting behaves sensibly on a quiet day and a trending one.
-    "adaptive_floors": False,
-    "adaptive_pctile": 70,       # floor = this percentile of today's |move| per window
-    "adaptive_price_min": 0.02, "adaptive_price_max": 0.40,   # clamps, % of spot
-    "adaptive_iv_min": 0.30, "adaptive_iv_max": 6.00,         # clamps, % of IV level
+"lookback_minutes": 15,      # rolling window over which the two changes are measured
+"iv_significant_pct": 1.5,   # |IV change| below this % (relative) counts as "no significant IV move"
+"price_significant_pct": 0.10,  # |spot change| below this % counts as "flat"
+"min_samples": 4,            # need at least this many logged polls in the window before reading it
+"atm_iv_width": 1,           # ATM IV = mean of CE+PE IV across ATM +- N strikes (N=1 -> ATM straddle-ish)
+"skew_fade_confirm": 0.0,    # weighted (CE_IV - PE_IV) below this, in the up/up quadrant, confirms the fade
+"skew_width": 3,             # ATM +- N strikes for the OI-weighted skew the lens consults
+# ADAPTIVE FLOORS (opt-in, default off). A fixed % floor is calibrated to one
+# volatility regime and silently changes meaning when the regime changes. On the
+# 14-Aug session the 0.10% price floor was ~24 pts over 15 min, while the index's
+# ENTIRE day range was 96 pts -- so price read "flat" on 606 of 623 polls and the
+# lens was silent 97% of the day. Switched on, the floors are instead set to a
+# percentile of the session's OWN realized moves over the same lookback, so the
+# same setting behaves sensibly on a quiet day and a trending one.
+"adaptive_floors": False,
+"adaptive_pctile": 70,       # floor = this percentile of today's |move| per window
+"adaptive_price_min": 0.02, "adaptive_price_max": 0.40,   # clamps, % of spot
+"adaptive_iv_min": 0.30, "adaptive_iv_max": 6.00,         # clamps, % of IV level
 }
-
 # BUILDUP DETECTION settings -- the classic price-vs-OI quadrant read, applied
 # per option leg in the Option Chain table:
 #
@@ -178,24 +164,20 @@ DEFAULT_IV_LENS_THRESHOLDS = {
 # read, not an intraday-fresh one. It won't flip quickly through the day, which
 # is correct for this indicator but worth knowing before watching it tick.
 DEFAULT_BUILDUP_THRESHOLDS = {
-    "price_min_pct": 2.0,   # |LTP change| below this % counts as flat -> unclassified
-    "oi_min_pct": 1.0,      # |OI change| below this % of previous OI counts as flat
-    "width": 10,            # ATM +- N strikes shown in the buildup view
+"price_min_pct": 2.0,   # |LTP change| below this % counts as flat -> unclassified
+"oi_min_pct": 1.0,      # |OI change| below this % of previous OI counts as flat
+"width": 10,            # ATM +- N strikes shown in the buildup view
 }
-
-
 # Lens (environment) with Choi flow (trigger) and PCR (standing OI) into one of:
 #   A  Perfect CE Buy    -- lens bullish + flow bullish
 #   B  Perfect PE Buy    -- lens bearish + flow bearish
 #   C  Stay Away         -- lens and flow disagree (or a hard stand-down fires)
 #   WAIT                 -- no environment read, or flow not confirming either way
 DEFAULT_SCENARIO_THRESHOLDS = {
-    "choi_neutral_band": 5.0,        # |Choi_PE - Choi_CE| below this -> flow is neutral, no trigger
-    "level_proximity_strikes": 2,    # within N strikes of the wall counts as "at support/resistance"
-    "pcr_bullish": 1.0,              # PCR above this reads bullish on paper (the Scenario C tension)
+"choi_neutral_band": 5.0,        # |Choi_PE - Choi_CE| below this -> flow is neutral, no trigger
+"level_proximity_strikes": 2,    # within N strikes of the wall counts as "at support/resistance"
+"pcr_bullish": 1.0,              # PCR above this reads bullish on paper (the Scenario C tension)
 }
-
-
 # ==========================================
 # INSTITUTIONAL LAYER (new) — six modules that consume data the app already
 # fetches but never used, plus the two things every desk has and no retail
@@ -220,17 +202,15 @@ DEFAULT_SCENARIO_THRESHOLDS = {
 #                        sizing. Signal without a risk envelope is not a trade.
 # ==========================================
 LOT_SIZE = 65          # NIFTY F&O lot size (revised Jan-2026; was 75). Every rupee figure in
-                       # this app scales off it — verify against the contract master each series.
+# this app scales off it — verify against the contract master each series.
 TRADING_DAYS_YEAR = 252
 SESSION_MINUTES = 375  # 09:15–15:30
-
 DEFAULT_GEX_SETTINGS = {
-    "width": 15,            # ATM ± N strikes included in the GEX profile
-    "lot_size": LOT_SIZE,
-    "time_weight": False,   # Dhan's greeks already price in DTE; see compute_gex() docstring
-    "flip_near_pct": 0.15,  # spot within this % of the flip = "at the flip", regime unstable
+"width": 15,            # ATM ± N strikes included in the GEX profile
+"lot_size": LOT_SIZE,
+"time_weight": False,   # Dhan's greeks already price in DTE; see compute_gex() docstring
+"flip_near_pct": 0.15,  # spot within this % of the flip = "at the flip", regime unstable
 }
-
 # The GEX Decision Card: a fixed intraday playbook whose branches are chosen by the
 # live regime rather than read off a laminated sheet. The point of wiring it into the
 # app instead of keeping it on paper is that every branch condition — which side of
@@ -239,1026 +219,913 @@ DEFAULT_GEX_SETTINGS = {
 # CURRENT state instead of asking the trader to evaluate five conditions under
 # pressure. Discipline rules fail at exactly the moment they matter most.
 DEFAULT_DECISION_CARD = {
-    "cutoff_hour": 15, "cutoff_minute": 0,   # all intraday longs flat by this IST time
-    "cutoff_warn_minutes": 30,               # start warning this long before the cutoff
-    "max_losses": 2,                         # stop for the day at this many losing trades
-    "daily_risk_pct": 1.0,                   # max % of capital at risk across the whole day
-    "per_trade_risk_pct": 0.5,               # ...and per individual trade
+"cutoff_hour": 15, "cutoff_minute": 0,   # all intraday longs flat by this IST time
+"cutoff_warn_minutes": 30,               # start warning this long before the cutoff
+"max_losses": 2,                         # stop for the day at this many losing trades
+"daily_risk_pct": 1.0,                   # max % of capital at risk across the whole day
+"per_trade_risk_pct": 0.5,               # ...and per individual trade
 }
-
 DEFAULT_VELOCITY_SETTINGS = {
-    "width": 5,             # ATM ± N strikes watched for bursts
-    "burst_pctile": 85,     # a poll is a "burst" above this percentile of today's own velocity
-    "min_burst_contracts": 15_000,   # ...and only if the absolute flow clears this, so a dead
-                                     # tape doesn't manufacture a burst out of its own quietness
-    "min_elapsed_s": 3.0,   # anything faster than this is a Streamlit rerun, not a new poll
-    "history_cap": 720,     # ~2 hours of 10s polls kept in memory for the percentile
+"width": 5,             # ATM ± N strikes watched for bursts
+"burst_pctile": 85,     # a poll is a "burst" above this percentile of today's own velocity
+"min_burst_contracts": 15_000,   # ...and only if the absolute flow clears this, so a dead
+# tape doesn't manufacture a burst out of its own quietness
+"min_elapsed_s": 3.0,   # anything faster than this is a Streamlit rerun, not a new poll
+"history_cap": 720,     # ~2 hours of 10s polls kept in memory for the percentile
 }
-
 DEFAULT_EM_SETTINGS = {
-    "straddle_sd_factor": 0.80,   # 1SD move to expiry ≈ 0.8 × ATM straddle (standard approximation)
-    "range_spent_high": 100.0,    # day range ≥ this % of the expected range -> move largely spent
-    "range_spent_low": 40.0,      # day range ≤ this % -> room left, breakouts still have runway
-    "drive_lens_floor": False,    # opt-in: let the straddle set the IV Lens price floor
+"straddle_sd_factor": 0.80,   # 1SD move to expiry ≈ 0.8 × ATM straddle (standard approximation)
+"range_spent_high": 100.0,    # day range ≥ this % of the expected range -> move largely spent
+"range_spent_low": 40.0,      # day range ≤ this % -> room left, breakouts still have runway
+"drive_lens_floor": False,    # opt-in: let the straddle set the IV Lens price floor
 }
-
 DEFAULT_TRACKER_SETTINGS = {
-    "horizon_minutes": 15,   # forward window over which a signal is graded
-    "target_pts": 20,        # forward move (in the signal's own direction) that counts as a win
-    "min_samples": 5,        # below this a hit rate is noise, and is labelled as such
+"horizon_minutes": 15,   # forward window over which a signal is graded
+"target_pts": 20,        # forward move (in the signal's own direction) that counts as a win
+"min_samples": 5,        # below this a hit rate is noise, and is labelled as such
 }
-
 DEFAULT_TERM_SETTINGS = {
-    "throttle_seconds": 60,      # next-expiry chain is a second API call — don't run it every 10s poll
-    "backwardation_pts": 0.5,    # front IV exceeding next IV by this = event premium in the front
-    "divergence_ratio": 0.4,     # front IV moves, next expiry moves less than this fraction of it
-                                 # -> expiry-specific noise, not a vol regime change
+"throttle_seconds": 60,      # next-expiry chain is a second API call — don't run it every 10s poll
+"backwardation_pts": 0.5,    # front IV exceeding next IV by this = event premium in the front
+"divergence_ratio": 0.4,     # front IV moves, next expiry moves less than this fraction of it
+# -> expiry-specific noise, not a vol regime change
 }
-
 DEFAULT_RISK_SETTINGS = {
-    "atr_period": 14,
-    "atr_stop_mult": 1.5,        # stop distance = this × ATR (on the chart's candle interval)
-    "structural_cap_mult": 2.0,  # ignore an OI-wall stop further than this × the ATR stop —
-                                 # past that the wall is a target, not a stop, and using it
-                                 # sizes the position down to nothing
-    "reward_multiple": 2.0,      # target = this × the stop distance
-    "capital": 500_000,          # one NIFTY lot is 75 × spot in notional; at ₹2L, 1% risk
-                                 # cannot fund a single lot on any realistic stop, so the
-                                 # default is set where the sizing math produces a real answer
-    "risk_pct": 0.5,             # % of capital risked per trade — deliberately matched to
-                                 # DEFAULT_DECISION_CARD['per_trade_risk_pct'] so the envelope's
-                                 # lot count and the card's cap agree out of the box. Raise one
-                                 # without the other and the card flags the mismatch.
-    "max_premium_pct": 25.0,     # cap total premium outlay at this % of capital
+"atr_period": 14,
+"atr_stop_mult": 1.5,        # stop distance = this × ATR (on the chart's candle interval)
+"structural_cap_mult": 2.0,  # ignore an OI-wall stop further than this × the ATR stop —
+# past that the wall is a target, not a stop, and using it
+# sizes the position down to nothing
+"reward_multiple": 2.0,      # target = this × the stop distance
+"capital": 500_000,          # one NIFTY lot is 75 × spot in notional; at ₹2L, 1% risk
+# cannot fund a single lot on any realistic stop, so the
+# default is set where the sizing math produces a real answer
+"risk_pct": 0.5,             # % of capital risked per trade — deliberately matched to
+# DEFAULT_DECISION_CARD['per_trade_risk_pct'] so the envelope's
+# lot count and the card's cap agree out of the box. Raise one
+# without the other and the card flags the mismatch.
+"max_premium_pct": 25.0,     # cap total premium outlay at this % of capital
 }
-
-
 SNAPSHOT_DIR = Path("nifty_oi_snapshots")
 SNAPSHOT_DIR.mkdir(exist_ok=True)
 LOG_DIR = Path("nifty_session_logs")
 LOG_DIR.mkdir(exist_ok=True)
-
 GSHEET_SNAPSHOT_SHEET = "closing_snapshot"
 GSHEET_LOG_SHEET = "session_log"
-
-
 def save_chain_snapshot(df: pd.DataFrame, fetched_at: datetime, expiry: str,
-                        spot: float = None):
-    try:
-        out = df.copy()
-        out['_fetched_at'] = fetched_at.isoformat()
-        out['_expiry'] = expiry
-        # Spot is persisted so a closed-market rerun can recover the true ATM.
-        # Without it the ATM fallback used the chain's MEDIAN STRIKE, which is a
-        # property of how wide the chain is, not of where price is -- that is what
-        # produced sub-intrinsic ATM puts and a fabricated IV skew on cached reads.
-        out['_spot'] = float(spot) if spot else np.nan
-        out.to_csv(SNAPSHOT_DIR / f"{fetched_at.strftime('%Y-%m-%d')}.csv", index=False)
-    except Exception as e:
-        st.sidebar.caption(f"⚠️ Chain snapshot save failed: {e}")
-
-
+spot: float = None):
+try:
+out = df.copy()
+out['_fetched_at'] = fetched_at.isoformat()
+out['_expiry'] = expiry
+# Spot is persisted so a closed-market rerun can recover the true ATM.
+# Without it the ATM fallback used the chain's MEDIAN STRIKE, which is a
+# property of how wide the chain is, not of where price is -- that is what
+# produced sub-intrinsic ATM puts and a fabricated IV skew on cached reads.
+out['_spot'] = float(spot) if spot else np.nan
+out.to_csv(SNAPSHOT_DIR / f"{fetched_at.strftime('%Y-%m-%d')}.csv", index=False)
+except Exception as e:
+st.sidebar.caption(f"⚠️ Chain snapshot save failed: {e}")
 def append_log_row(row: dict, date_str: str):
-    """Append one poll's summary row to today's local CSV log (the automated
-    replacement for manually pasting Dash Board!A3:N3 into a new row).
-
-    Schema-change safe: if today's file was started by an older build of this app
-    (i.e. before the ATM_IV / IV_Lens_Stance columns existed), a blind append
-    would silently shift every value one column to the left. So the header is
-    checked first -- same columns in a different order are just reordered, and a
-    genuinely different column set triggers a one-off rewrite with the union of
-    columns (old rows get blanks in the new fields). After that single rewrite,
-    appends go back to being cheap."""
-    try:
-        path = LOG_DIR / f"{date_str}.csv"
-        row_df = pd.DataFrame([row])
-        if path.exists():
-            existing_cols = list(pd.read_csv(path, nrows=0).columns)
-            if set(existing_cols) == set(row.keys()):
-                row_df[existing_cols].to_csv(path, mode='a', header=False, index=False)
-            else:
-                old = pd.read_csv(path)
-                pd.concat([old, row_df], ignore_index=True).to_csv(path, index=False)
-        else:
-            row_df.to_csv(path, mode='w', header=True, index=False)
-    except Exception as e:
-        st.sidebar.caption(f"⚠️ Log append failed: {e}")
-
-
+"""Append one poll's summary row to today's local CSV log (the automated
+replacement for manually pasting Dash Board!A3:N3 into a new row).
+Schema-change safe: if today's file was started by an older build of this app
+(i.e. before the ATM_IV / IV_Lens_Stance columns existed), a blind append
+would silently shift every value one column to the left. So the header is
+checked first -- same columns in a different order are just reordered, and a
+genuinely different column set triggers a one-off rewrite with the union of
+columns (old rows get blanks in the new fields). After that single rewrite,
+appends go back to being cheap."""
+try:
+path = LOG_DIR / f"{date_str}.csv"
+row_df = pd.DataFrame([row])
+if path.exists():
+existing_cols = list(pd.read_csv(path, nrows=0).columns)
+if set(existing_cols) == set(row.keys()):
+row_df[existing_cols].to_csv(path, mode='a', header=False, index=False)
+else:
+old = pd.read_csv(path)
+pd.concat([old, row_df], ignore_index=True).to_csv(path, index=False)
+else:
+row_df.to_csv(path, mode='w', header=True, index=False)
+except Exception as e:
+st.sidebar.caption(f"⚠️ Log append failed: {e}")
 def load_today_log(date_str: str) -> pd.DataFrame:
-    path = LOG_DIR / f"{date_str}.csv"
-    if path.exists():
-        try:
-            return pd.read_csv(path)
-        except Exception:
-            return pd.DataFrame()
-    return pd.DataFrame()
-
-
+path = LOG_DIR / f"{date_str}.csv"
+if path.exists():
+try:
+return pd.read_csv(path)
+except Exception:
+return pd.DataFrame()
+return pd.DataFrame()
 def load_loss_counter(date_str: str) -> int:
-    """The decision card's 'max 2 losses and you're done' rule needs to survive a
-    Streamlit rerun, which happens on every widget click and every 10-second poll.
-    Session state alone would survive reruns but not a redeploy or a browser
-    refresh mid-session, which is precisely when a trader would be tempted to
-    'lose' the count and take a third trade. One small file per day, read on every
-    run, fails soft to zero."""
-    try:
-        path = LOG_DIR / f"discipline_{date_str}.json"
-        if path.exists():
-            import json as _json
-            return int(_json.loads(path.read_text()).get('losses', 0))
-    except Exception:
-        pass
-    return 0
-
-
+"""The decision card's 'max 2 losses and you're done' rule needs to survive a
+Streamlit rerun, which happens on every widget click and every 10-second poll.
+Session state alone would survive reruns but not a redeploy or a browser
+refresh mid-session, which is precisely when a trader would be tempted to
+'lose' the count and take a third trade. One small file per day, read on every
+run, fails soft to zero."""
+try:
+path = LOG_DIR / f"discipline_{date_str}.json"
+if path.exists():
+import json as _json
+return int(_json.loads(path.read_text()).get('losses', 0))
+except Exception:
+pass
+return 0
 def save_loss_counter(date_str: str, losses: int):
-    try:
-        import json as _json
-        (LOG_DIR / f"discipline_{date_str}.json").write_text(
-            _json.dumps({'losses': int(losses), 'updated': datetime.now(IST).isoformat()}))
-    except Exception as e:
-        st.sidebar.caption(f"⚠️ Loss counter save failed: {e}")
-
-
+try:
+import json as _json
+(LOG_DIR / f"discipline_{date_str}.json").write_text(
+_json.dumps({'losses': int(losses), 'updated': datetime.now(IST).isoformat()}))
+except Exception as e:
+st.sidebar.caption(f"⚠️ Loss counter save failed: {e}")
 def load_all_logs(max_days: int = 30) -> pd.DataFrame:
-    """Every session log on disk, concatenated, with a Date column taken from the
-    filename. The signal tracker needs more than one day before a hit rate means
-    anything, and each day is already sitting in LOG_DIR as its own CSV.
-
-    Files are read defensively: a log written by an older build has fewer columns,
-    and one truncated by a crashed session may have a broken final row. Either is
-    skipped rather than being allowed to kill the panel."""
-    frames = []
-    try:
-        for path in sorted(LOG_DIR.glob("*.csv"))[-max_days:]:
-            try:
-                d = pd.read_csv(path)
-                if d.empty or 'Time' not in d.columns:
-                    continue
-                d['Date'] = path.stem
-                frames.append(d)
-            except Exception:
-                continue
-    except Exception:
-        return pd.DataFrame()
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-
-
+"""Every session log on disk, concatenated, with a Date column taken from the
+filename. The signal tracker needs more than one day before a hit rate means
+anything, and each day is already sitting in LOG_DIR as its own CSV.
+Files are read defensively: a log written by an older build has fewer columns,
+and one truncated by a crashed session may have a broken final row. Either is
+skipped rather than being allowed to kill the panel."""
+frames = []
+try:
+for path in sorted(LOG_DIR.glob("*.csv"))[-max_days:]:
+try:
+d = pd.read_csv(path)
+if d.empty or 'Time' not in d.columns:
+continue
+d['Date'] = path.stem
+frames.append(d)
+except Exception:
+continue
+except Exception:
+return pd.DataFrame()
+return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 def gsheets_configured():
-    return "gcp_service_account" in st.secrets and "GOOGLE_SHEET_ID" in st.secrets
-
-
+return "gcp_service_account" in st.secrets and "GOOGLE_SHEET_ID" in st.secrets
 @st.cache_resource(show_spinner=False)
 def get_gsheet_client():
-    import gspread
-    from google.oauth2.service_account import Credentials
-    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-    creds = Credentials.from_service_account_info(dict(st.secrets["gcp_service_account"]), scopes=scopes)
-    return gspread.authorize(creds)
-
-
+import gspread
+from google.oauth2.service_account import Credentials
+scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+creds = Credentials.from_service_account_info(dict(st.secrets["gcp_service_account"]), scopes=scopes)
+return gspread.authorize(creds)
 def get_gsheet_worksheet(name: str, rows=2000, cols=30):
-    import gspread
-    client = get_gsheet_client()
-    sh = client.open_by_key(st.secrets["GOOGLE_SHEET_ID"])
-    try:
-        return sh.worksheet(name)
-    except gspread.exceptions.WorksheetNotFound:
-        return sh.add_worksheet(title=name, rows=rows, cols=cols)
-
-
+import gspread
+client = get_gsheet_client()
+sh = client.open_by_key(st.secrets["GOOGLE_SHEET_ID"])
+try:
+return sh.worksheet(name)
+except gspread.exceptions.WorksheetNotFound:
+return sh.add_worksheet(title=name, rows=rows, cols=cols)
 def save_chain_snapshot_to_gsheet(df: pd.DataFrame, fetched_at: datetime, expiry: str,
-                                  spot: float = None):
-    if not gsheets_configured():
-        return
-    try:
-        from gspread_dataframe import set_with_dataframe
-        ws = get_gsheet_worksheet(GSHEET_SNAPSHOT_SHEET)
-        out = df.copy()
-        out['_fetched_at'] = fetched_at.isoformat()
-        out['_expiry'] = expiry
-        out['_spot'] = float(spot) if spot else np.nan
-        ws.clear()
-        set_with_dataframe(ws, out, include_index=False, resize=True)
-    except Exception as e:
-        st.sidebar.caption(f"⚠️ Google Sheet snapshot save failed: {e}")
-
-
+spot: float = None):
+if not gsheets_configured():
+return
+try:
+from gspread_dataframe import set_with_dataframe
+ws = get_gsheet_worksheet(GSHEET_SNAPSHOT_SHEET)
+out = df.copy()
+out['_fetched_at'] = fetched_at.isoformat()
+out['_expiry'] = expiry
+out['_spot'] = float(spot) if spot else np.nan
+ws.clear()
+set_with_dataframe(ws, out, include_index=False, resize=True)
+except Exception as e:
+st.sidebar.caption(f"⚠️ Google Sheet snapshot save failed: {e}")
 def append_log_row_to_gsheet(row: dict):
-    """Same schema-safety concern as append_log_row(): an existing sheet started by
-    an older build won't have the new columns, so values are written positionally
-    against the sheet's actual header, and any genuinely new keys are appended to
-    the header row first (old rows simply stay blank in those columns)."""
-    if not gsheets_configured():
-        return
-    try:
-        ws = get_gsheet_worksheet(GSHEET_LOG_SHEET)
-        existing = ws.get_all_values()
-        if not existing:
-            header = list(row.keys())
-            ws.append_row(header)
-        else:
-            header = existing[0]
-            missing = [k for k in row.keys() if k not in header]
-            if missing:
-                header = header + missing
-                try:
-                    ws.update(values=[header], range_name='A1')
-                except TypeError:   # older gspread signature: update(range_name, values)
-                    ws.update('A1', [header])
-        ws.append_row([str(row.get(c, "")) for c in header])
-    except Exception as e:
-        st.sidebar.caption(f"⚠️ Google Sheet log append failed: {e}")
-
-
+"""Same schema-safety concern as append_log_row(): an existing sheet started by
+an older build won't have the new columns, so values are written positionally
+against the sheet's actual header, and any genuinely new keys are appended to
+the header row first (old rows simply stay blank in those columns)."""
+if not gsheets_configured():
+return
+try:
+ws = get_gsheet_worksheet(GSHEET_LOG_SHEET)
+existing = ws.get_all_values()
+if not existing:
+header = list(row.keys())
+ws.append_row(header)
+else:
+header = existing[0]
+missing = [k for k in row.keys() if k not in header]
+if missing:
+header = header + missing
+try:
+ws.update(values=[header], range_name='A1')
+except TypeError:   # older gspread signature: update(range_name, values)
+ws.update('A1', [header])
+ws.append_row([str(row.get(c, "")) for c in header])
+except Exception as e:
+st.sidebar.caption(f"⚠️ Google Sheet log append failed: {e}")
 def load_latest_chain_snapshot():
-    try:
-        files = sorted(SNAPSHOT_DIR.glob("*.csv"))
-        if not files:
-            return None, None
-        df = pd.read_csv(files[-1])
-        fetched_at = pd.to_datetime(df['_fetched_at'].iloc[0]) if '_fetched_at' in df.columns else None
-        df = df.drop(columns=[c for c in ['_fetched_at', '_expiry'] if c in df.columns])
-        return df, fetched_at
-    except Exception:
-        return None, None
-
-
+try:
+files = sorted(SNAPSHOT_DIR.glob("*.csv"))
+if not files:
+return None, None
+df = pd.read_csv(files[-1])
+fetched_at = pd.to_datetime(df['_fetched_at'].iloc[0]) if '_fetched_at' in df.columns else None
+df = df.drop(columns=[c for c in ['_fetched_at', '_expiry'] if c in df.columns])
+return df, fetched_at
+except Exception:
+return None, None
 def load_latest_chain_snapshot_from_gsheet():
-    if not gsheets_configured():
-        return None, None
-    try:
-        from gspread_dataframe import get_as_dataframe
-        ws = get_gsheet_worksheet(GSHEET_SNAPSHOT_SHEET)
-        df = get_as_dataframe(ws, evaluate_formulas=True).dropna(how='all')
-        if df.empty:
-            return None, None
-        fetched_at = pd.to_datetime(df['_fetched_at'].iloc[0]) if '_fetched_at' in df.columns else None
-        df = df.drop(columns=[c for c in ['_fetched_at', '_expiry'] if c in df.columns])
-        return df, fetched_at
-    except Exception:
-        return None, None
-
-
+if not gsheets_configured():
+return None, None
+try:
+from gspread_dataframe import get_as_dataframe
+ws = get_gsheet_worksheet(GSHEET_SNAPSHOT_SHEET)
+df = get_as_dataframe(ws, evaluate_formulas=True).dropna(how='all')
+if df.empty:
+return None, None
+fetched_at = pd.to_datetime(df['_fetched_at'].iloc[0]) if '_fetched_at' in df.columns else None
+df = df.drop(columns=[c for c in ['_fetched_at', '_expiry'] if c in df.columns])
+return df, fetched_at
+except Exception:
+return None, None
 # ==========================================
 # MARKET HOURS
 # ==========================================
 def market_status(now_ist=None):
-    now_ist = now_ist or datetime.now(IST)
-    weekday = now_ist.weekday()
-    if weekday >= 5:
-        return False, "Weekend — NSE is closed.", now_ist
-    if now_ist.time() < NSE_OPEN:
-        return False, f"Pre-market — NSE opens at {NSE_OPEN.strftime('%H:%M')} IST.", now_ist
-    if now_ist.time() > NSE_CLOSE:
-        return False, f"Post-market — NSE closed at {NSE_CLOSE.strftime('%H:%M')} IST.", now_ist
-    return True, "Market open.", now_ist
-
-
+now_ist = now_ist or datetime.now(IST)
+weekday = now_ist.weekday()
+if weekday >= 5:
+return False, "Weekend — NSE is closed.", now_ist
+if now_ist.time() < NSE_OPEN:
+return False, f"Pre-market — NSE opens at {NSE_OPEN.strftime('%H:%M')} IST.", now_ist
+if now_ist.time() > NSE_CLOSE:
+return False, f"Post-market — NSE closed at {NSE_CLOSE.strftime('%H:%M')} IST.", now_ist
+return True, "Market open.", now_ist
 # ==========================================
-# CREDENTIALS
+# CREDENTIALS  (DHAN TOKEN FIX)
 # ==========================================
+# The old code read the token ONCE at startup and cached it in DHAN_HEADERS.
+# That meant a regenerated token pasted into Streamlit Cloud Secrets was
+# invisible until the app was redeployed or the container restarted -- which
+# is why the "token expired" banner kept hanging around.
+#
+# The fix: read the token fresh from st.secrets on EVERY API call. Streamlit
+# re-reads secrets on each rerun, so a token pasted into Secrets takes effect
+# on the very next 10-second poll. No redeploy, no restart, no stale banner.
 if 'DHAN_CLIENT_ID' not in st.secrets or 'DHAN_ACCESS_TOKEN' not in st.secrets:
-    st.error("❌ Dhan API credentials not found in Streamlit Secrets!")
-    st.stop()
-
-CLIENT_ID = st.secrets['DHAN_CLIENT_ID']
-ACCESS_TOKEN = st.secrets['DHAN_ACCESS_TOKEN']
-DHAN_HEADERS = {
-    "client-id": CLIENT_ID, "access-token": ACCESS_TOKEN,
-    "Accept": "application/json", "Content-Type": "application/json",
+st.error("❌ Dhan API credentials not found in Streamlit Secrets!")
+st.info("Please add `DHAN_CLIENT_ID` and `DHAN_ACCESS_TOKEN` to your Streamlit Secrets.")
+st.stop()
+def get_dhan_headers():
+"""Build the Dhan API headers dict, reading the access token fresh from
+Streamlit Secrets on every call. This is the fix for the daily-token-
+expiry workflow: when you regenerate the token in the Dhan app and paste
+it into Streamlit Cloud Secrets, the app picks it up on its next poll
+without any redeploy or restart.
+Returns None if the credentials are missing (the caller should treat this
+as an auth failure rather than crashing)."""
+if 'DHAN_CLIENT_ID' not in st.secrets or 'DHAN_ACCESS_TOKEN' not in st.secrets:
+return None
+return {
+"client-id": st.secrets['DHAN_CLIENT_ID'],
+"access-token": st.secrets['DHAN_ACCESS_TOKEN'],
+"Accept": "application/json",
+"Content-Type": "application/json",
 }
 NIFTY_SCRIP, NIFTY_SEG = 13, "IDX_I"
-
 # ==========================================
 # DHAN DATA FETCH
 # ==========================================
 AUTH_ERROR_PREFIX = "🔑 TOKEN_EXPIRED:"
-
-
 def dhan_error_message(status_code: int, text: str) -> str:
-    """Turns a raw Dhan HTTP error into an actionable message. 401/403 almost
-    always means the access token (regenerated daily, per your workflow) has
-    expired or wasn't pasted correctly into Streamlit Secrets — that's a
-    completely different fix from a genuine API/data problem, so it gets a
-    distinct, clearly-flagged message rather than a raw JSON dump."""
-    if status_code in (401, 403):
-        return (f"{AUTH_ERROR_PREFIX} Dhan rejected the request (HTTP {status_code}) — "
-                f"your access token has most likely expired or is missing/incorrect.")
-    if status_code == 429:
-        return "Rate limited by Dhan (1 req/3s on Option Chain). Will retry on the next poll."
-    return f"API Error {status_code}: {text}"
-
-
+"""Turns a raw Dhan HTTP error into an actionable message. 401/403 almost
+always means the access token (regenerated daily, per your workflow) has
+expired or wasn't pasted correctly into Streamlit Secrets — that's a
+completely different fix from a genuine API/data problem, so it gets a
+distinct, clearly-flagged message rather than a raw JSON dump."""
+if status_code in (401, 403):
+return (f"{AUTH_ERROR_PREFIX} Dhan rejected the request (HTTP {status_code}) — "
+f"your access token has most likely expired or is missing/incorrect.")
+if status_code == 429:
+return "Rate limited by Dhan (1 req/3s on Option Chain). Will retry on the next poll."
+return f"API Error {status_code}: {text}"
 def is_auth_error(msg: str) -> bool:
-    return bool(msg) and msg.startswith(AUTH_ERROR_PREFIX)
-
-
+return bool(msg) and msg.startswith(AUTH_ERROR_PREFIX)
 def fetch_expiry_list():
-    try:
-        r = requests.post("https://api.dhan.co/v2/optionchain/expirylist", headers=DHAN_HEADERS,
-                           json={"UnderlyingScrip": NIFTY_SCRIP, "UnderlyingSeg": NIFTY_SEG}, timeout=15)
-        if r.status_code == 200:
-            data = r.json().get("data", [])
-            return (sorted(data), None) if data else (None, "Expiry list came back empty.")
-        return None, dhan_error_message(r.status_code, r.text)
-    except Exception as e:
-        return None, f"Expiry List Connection Error: {e}"
-
-
+try:
+headers = get_dhan_headers()
+if not headers:
+return None, "Dhan API credentials not configured in Streamlit Secrets."
+r = requests.post("https://api.dhan.co/v2/optionchain/expirylist", headers=headers,
+json={"UnderlyingScrip": NIFTY_SCRIP, "UnderlyingSeg": NIFTY_SEG}, timeout=15)
+if r.status_code == 200:
+data = r.json().get("data", [])
+return (sorted(data), None) if data else (None, "Expiry list came back empty.")
+return None, dhan_error_message(r.status_code, r.text)
+except Exception as e:
+return None, f"Expiry List Connection Error: {e}"
 def get_nearest_expiry(expiry_list):
-    today_str = datetime.now(IST).strftime("%Y-%m-%d")
-    upcoming = [e for e in expiry_list if e >= today_str]
-    return upcoming[0] if upcoming else expiry_list[-1]
-
-
+today_str = datetime.now(IST).strftime("%Y-%m-%d")
+upcoming = [e for e in expiry_list if e >= today_str]
+return upcoming[0] if upcoming else expiry_list[-1]
 def fetch_option_chain(expiry_date: str):
-    """
-    Dhan v2 Option Chain response shape:
-      data.last_price               -> underlying spot LTP
-      data.oc["<strike>"].ce / .pe  -> per-side dict with:
-        oi, previous_oi             -> today's OI change = oi - previous_oi (matches
-                                        Sensibull's pre-computed 'OI change' column
-                                        your Excel used to VLOOKUP)
-        volume, previous_volume
-        last_price, previous_close_price
-        implied_volatility
-        greeks: {delta, theta, gamma, vega}
-        top_bid_price, top_bid_quantity, top_ask_price, top_ask_quantity
-    """
-    try:
-        r = requests.post("https://api.dhan.co/v2/optionchain", headers=DHAN_HEADERS,
-                           json={"UnderlyingScrip": NIFTY_SCRIP, "UnderlyingSeg": NIFTY_SEG, "Expiry": expiry_date},
-                           timeout=30)
-        if r.status_code != 200:
-            return None, None, dhan_error_message(r.status_code, r.text)
-
-        payload = r.json().get("data", {})
-        spot = payload.get("last_price")
-        oc = payload.get("oc", {})
-        rows = []
-        for strike_str, sd in oc.items():
-            strike = float(strike_str)
-            ce, pe = (sd.get("ce") or {}), (sd.get("pe") or {})
-            ce_g, pe_g = (ce.get("greeks") or {}), (pe.get("greeks") or {})
-
-            def g(d, key, default=0):
-                v = d.get(key, default)
-                return v if v is not None else default
-
-            rows.append({
-                'Strike': strike,
-                'CE_OI': g(ce, 'oi'), 'CE_OI_prev': g(ce, 'previous_oi'),
-                'CE_Volume': g(ce, 'volume'), 'CE_Volume_prev': g(ce, 'previous_volume'),
-                'CE_LTP': g(ce, 'last_price'), 'CE_prevClose': g(ce, 'previous_close_price'),
-                'CE_IV': g(ce, 'implied_volatility'),
-                'CE_Delta': g(ce_g, 'delta'), 'CE_Theta': g(ce_g, 'theta'),
-                'CE_Gamma': g(ce_g, 'gamma'), 'CE_Vega': g(ce_g, 'vega'),
-                'CE_Bid': g(ce, 'top_bid_price'), 'CE_Ask': g(ce, 'top_ask_price'),
-                'PE_OI': g(pe, 'oi'), 'PE_OI_prev': g(pe, 'previous_oi'),
-                'PE_Volume': g(pe, 'volume'), 'PE_Volume_prev': g(pe, 'previous_volume'),
-                'PE_LTP': g(pe, 'last_price'), 'PE_prevClose': g(pe, 'previous_close_price'),
-                'PE_IV': g(pe, 'implied_volatility'),
-                'PE_Delta': g(pe_g, 'delta'), 'PE_Theta': g(pe_g, 'theta'),
-                'PE_Gamma': g(pe_g, 'gamma'), 'PE_Vega': g(pe_g, 'vega'),
-                'PE_Bid': g(pe, 'top_bid_price'), 'PE_Ask': g(pe, 'top_ask_price'),
-            })
-        if not rows:
-            return None, None, "No strikes returned for this expiry."
-
-        df = pd.DataFrame(rows).sort_values('Strike').reset_index(drop=True)
-        df['CE_OI_chg'] = df['CE_OI'] - df['CE_OI_prev']
-        df['PE_OI_chg'] = df['PE_OI'] - df['PE_OI_prev']
-        df['PCR'] = df['PE_OI'] / df['CE_OI'].replace(0, np.nan)
-        return spot, df, None
-    except Exception as e:
-        return None, None, f"Connection Error: {e}"
-
-
+"""
+Dhan v2 Option Chain response shape:
+data.last_price               -> underlying spot LTP
+data.oc["<strike>"].ce / .pe  -> per-side dict with:
+oi, previous_oi             -> today's OI change = oi - previous_oi (matches
+Sensibull's pre-computed 'OI change' column
+your Excel used to VLOOKUP)
+volume, previous_volume
+last_price, previous_close_price
+implied_volatility
+greeks: {delta, theta, gamma, vega}
+top_bid_price, top_bid_quantity, top_ask_price, top_ask_quantity
+"""
+try:
+headers = get_dhan_headers()
+if not headers:
+return None, None, "Dhan API credentials not configured in Streamlit Secrets."
+r = requests.post("https://api.dhan.co/v2/optionchain", headers=headers,
+json={"UnderlyingScrip": NIFTY_SCRIP, "UnderlyingSeg": NIFTY_SEG, "Expiry": expiry_date},
+timeout=30)
+if r.status_code != 200:
+return None, None, dhan_error_message(r.status_code, r.text)
+payload = r.json().get("data", {})
+spot = payload.get("last_price")
+oc = payload.get("oc", {})
+rows = []
+for strike_str, sd in oc.items():
+strike = float(strike_str)
+ce, pe = (sd.get("ce") or {}), (sd.get("pe") or {})
+ce_g, pe_g = (ce.get("greeks") or {}), (pe.get("greeks") or {})
+def g(d, key, default=0):
+v = d.get(key, default)
+return v if v is not None else default
+rows.append({
+'Strike': strike,
+'CE_OI': g(ce, 'oi'), 'CE_OI_prev': g(ce, 'previous_oi'),
+'CE_Volume': g(ce, 'volume'), 'CE_Volume_prev': g(ce, 'previous_volume'),
+'CE_LTP': g(ce, 'last_price'), 'CE_prevClose': g(ce, 'previous_close_price'),
+'CE_IV': g(ce, 'implied_volatility'),
+'CE_Delta': g(ce_g, 'delta'), 'CE_Theta': g(ce_g, 'theta'),
+'CE_Gamma': g(ce_g, 'gamma'), 'CE_Vega': g(ce_g, 'vega'),
+'CE_Bid': g(ce, 'top_bid_price'), 'CE_Ask': g(ce, 'top_ask_price'),
+'PE_OI': g(pe, 'oi'), 'PE_OI_prev': g(pe, 'previous_oi'),
+'PE_Volume': g(pe, 'volume'), 'PE_Volume_prev': g(pe, 'previous_volume'),
+'PE_LTP': g(pe, 'last_price'), 'PE_prevClose': g(pe, 'previous_close_price'),
+'PE_IV': g(pe, 'implied_volatility'),
+'PE_Delta': g(pe_g, 'delta'), 'PE_Theta': g(pe_g, 'theta'),
+'PE_Gamma': g(pe_g, 'gamma'), 'PE_Vega': g(pe_g, 'vega'),
+'PE_Bid': g(pe, 'top_bid_price'), 'PE_Ask': g(pe, 'top_ask_price'),
+})
+if not rows:
+return None, None, "No strikes returned for this expiry."
+df = pd.DataFrame(rows).sort_values('Strike').reset_index(drop=True)
+df['CE_OI_chg'] = df['CE_OI'] - df['CE_OI_prev']
+df['PE_OI_chg'] = df['PE_OI'] - df['PE_OI_prev']
+df['PCR'] = df['PE_OI'] / df['CE_OI'].replace(0, np.nan)
+return spot, df, None
+except Exception as e:
+return None, None, f"Connection Error: {e}"
 def render_fetch_error(error: str):
-    """Renders a token-expiry error distinctly from a generic API error, since
-    the fix is completely different (regenerate token vs. investigate a real
-    problem) and a raw JSON dump doesn't make that obvious at a glance."""
-    if is_auth_error(error):
-        st.session_state.token_status = 'expired'
-        st.error(
-            "🔑 **Dhan access token has expired or is invalid.**\n\n"
-            "This is expected once a day with a 24-hour token — not a bug. To fix:\n\n"
-            "1. Dhan app/web → **My Profile → DhanHQ Trading APIs → Generate Token**\n"
-            "2. Copy the new token\n"
-            "3. Streamlit Cloud → your app → **Settings → Secrets** → update `DHAN_ACCESS_TOKEN` → Save\n\n"
-            "The app will reconnect automatically on its next poll once the new token is saved "
-            "— no need to redeploy or restart anything manually."
-        )
-    else:
-        st.session_state.token_status = 'ok'
-        st.error(f"❌ {error}")
-    st.stop()
-
-
+"""Renders a token-expiry error distinctly from a generic API error, since
+the fix is completely different (regenerate token vs. investigate a real
+problem) and a raw JSON dump doesn't make that obvious at a glance."""
+if is_auth_error(error):
+st.session_state.token_status = 'expired'
+st.error(
+"🔑 **Dhan access token has expired or is invalid.**\n\n"
+"This is expected once a day with a 24-hour token — not a bug. To fix:\n\n"
+"1. Dhan app/web → **My Profile → DhanHQ Trading APIs → Generate Token**\n\n"
+"2. Copy the new token\n\n"
+"3. Streamlit Cloud → your app → **Settings → Secrets** → update `DHAN_ACCESS_TOKEN` → Save\n\n"
+"The app will reconnect automatically on its next poll once the new token is saved "
+"— no need to redeploy or restart anything manually."
+)
+else:
+st.session_state.token_status = 'ok'
+st.error(f"❌ {error}")
+st.stop()
 def fetch_intraday_ohlc(interval: str = DEFAULT_CANDLE_INTERVAL):
-    """Pulls today's NIFTY spot INDEX intraday OHLCV candles from Dhan's
-    intraday-candle endpoint. This is the single source now used for both
-    the candlestick chart and the VWAP figure in the Confluence panel
-    (previously a second, separate call to this same endpoint just to
-    collapse it into one VWAP scalar -- consolidated here to halve the
-    API hits against this endpoint).
-
-    Dhan's exact segment/instrument code for the NIFTY *index* (as opposed
-    to equity/futures) isn't fully nailed down from public docs, so this
-    fails soft: any schema mismatch just disables the candle panel rather
-    than showing wrong data. If it errors for you, check
-    https://dhanhq.co/docs/v2/historical-data/ for the exact index payload
-    shape and I'll patch the two lines below."""
-    try:
-        today_str = datetime.now(IST).strftime("%Y-%m-%d")
-        payload = {
-            "securityId": str(NIFTY_SCRIP), "exchangeSegment": "IDX_I", "instrument": "INDEX",
-            "interval": interval, "oi": False,
-            "fromDate": f"{today_str} 09:15:00", "toDate": f"{today_str} 23:59:59",
-        }
-        r = requests.post("https://api.dhan.co/v2/charts/intraday", headers=DHAN_HEADERS, json=payload, timeout=15)
-        if r.status_code != 200:
-            return None
-        data = r.json()
-        opens, highs, lows, closes = data.get('open'), data.get('high'), data.get('low'), data.get('close')
-        vols, ts = data.get('volume'), data.get('timestamp')
-        if not opens or not ts:
-            return None
-        out = pd.DataFrame({
-            'time': pd.to_datetime(ts, unit='s', utc=True).tz_convert(IST),
-            'open': opens, 'high': highs, 'low': lows, 'close': closes,
-            'volume': vols if vols else [0] * len(opens),
-        })
-        return out
-    except Exception:
-        return None
-
-
+"""Pulls today's NIFTY spot INDEX intraday OHLCV candles from Dhan's
+intraday-candle endpoint. This is the single source now used for both
+the candlestick chart and the VWAP figure in the Confluence panel
+(previously a second, separate call to this same endpoint just to
+collapse it into one VWAP scalar -- consolidated here to halve the
+API hits against this endpoint).
+Dhan's exact segment/instrument code for the NIFTY *index* (as opposed
+to equity/futures) isn't fully nailed down from public docs, so this
+fails soft: any schema mismatch just disables the candle panel rather
+than showing wrong data. If it errors for you, check
+https://dhanhq.co/docs/v2/historical-data/ for the exact index payload
+shape and I'll patch the two lines below."""
+try:
+headers = get_dhan_headers()
+if not headers:
+return None
+today_str = datetime.now(IST).strftime("%Y-%m-%d")
+payload = {
+"securityId": str(NIFTY_SCRIP), "exchangeSegment": "IDX_I", "instrument": "INDEX",
+"interval": interval, "oi": False,
+"fromDate": f"{today_str} 09:15:00", "toDate": f"{today_str} 23:59:59",
+}
+r = requests.post("https://api.dhan.co/v2/charts/intraday", headers=headers, json=payload, timeout=15)
+if r.status_code != 200:
+return None
+data = r.json()
+opens, highs, lows, closes = data.get('open'), data.get('high'), data.get('low'), data.get('close')
+vols, ts = data.get('volume'), data.get('timestamp')
+if not opens or not ts:
+return None
+out = pd.DataFrame({
+'time': pd.to_datetime(ts, unit='s', utc=True).tz_convert(IST),
+'open': opens, 'high': highs, 'low': lows, 'close': closes,
+'volume': vols if vols else [0] * len(opens),
+})
+return out
+except Exception:
+return None
 def compute_cumulative_vwap(ohlc_df: pd.DataFrame) -> pd.DataFrame:
-    """Adds a 'vwap' column: a running (session-to-date) volume-weighted
-    typical-price average, matching how VWAP is conventionally plotted
-    intraday (each point = VWAP-so-far, not VWAP-of-that-single-candle).
-
-    Falls back to a cumulative simple average of typical price -- labelled
-    distinctly in the UI -- if the feed carries no real volume, since
-    Dhan's INDEX candle feed for NIFTY itself typically reports 0 volume
-    (the index has no traded volume; only its constituents/futures do)."""
-    out = ohlc_df.copy()
-    typical = (out['high'] + out['low'] + out['close']) / 3
-    if out['volume'].sum() > 0:
-        vol = out['volume'].replace(0, np.nan)
-        out['vwap'] = (typical * vol).cumsum() / vol.cumsum()
-    else:
-        out['vwap'] = typical.expanding().mean()
-    return out
-
-
+"""Adds a 'vwap' column: a running (session-to-date) volume-weighted
+typical-price average, matching how VWAP is conventionally plotted
+intraday (each point = VWAP-so-far, not VWAP-of-that-single-candle).
+Falls back to a cumulative simple average of typical price -- labelled
+distinctly in the UI -- if the feed carries no real volume, since
+Dhan's INDEX candle feed for NIFTY itself typically reports 0 volume
+(the index has no traded volume; only its constituents/futures do)."""
+out = ohlc_df.copy()
+typical = (out['high'] + out['low'] + out['close']) / 3
+if out['volume'].sum() > 0:
+vol = out['volume'].replace(0, np.nan)
+out['vwap'] = (typical * vol).cumsum() / vol.cumsum()
+else:
+out['vwap'] = typical.expanding().mean()
+return out
 def analyze_vwap_trend(ohlc_df: pd.DataFrame, interval_minutes: int, confirm_candles: int = 3):
-    """Reads the VWAP-respect pattern: while price keeps *closing* on one side
-    of the running session VWAP, that directional bias has historically tended
-    to persist for the next ~30-60 minutes. This tracks the current streak of
-    consecutive candles closed on one side, and separately flags "touch-and-
-    hold" events -- candles where price dipped/spiked into VWAP intrabar
-    (low <= vwap <= high) but still closed on the streak's side, which is the
-    institutional retest-and-continue pattern that makes a hold more credible
-    than a streak with no retest at all.
-
-    A streak resets the moment a candle *closes* on the opposite side --
-    intrabar wicks through VWAP don't break it, only a close does. That
-    matches "respecting VWAP" as a level, not treating every wick as a flip.
-
-    Descriptive only: reports what price has actually done so far this
-    session. Does not guarantee continuation, and is entirely independent of
-    the OI-based Master Signal."""
-    out = ohlc_df.dropna(subset=['vwap']).copy()
-    if out.empty or len(out) < 2:
-        return None
-
-    out['side'] = np.where(out['close'] > out['vwap'], 'above', 'below')
-    out['touched_vwap'] = (out['low'] <= out['vwap']) & (out['high'] >= out['vwap'])
-
-    current_side = out['side'].iloc[-1]
-    streak = 0
-    streak_start_time = out['time'].iloc[-1]
-    for s, t in zip(out['side'].values[::-1], out['time'].values[::-1]):
-        if s == current_side:
-            streak += 1
-            streak_start_time = t
-        else:
-            break
-
-    streak_slice = out.iloc[-streak:]
-    touch_hold_events = streak_slice[streak_slice['touched_vwap']]
-
-    opposite_side = 'below' if current_side == 'above' else 'above'
-    breaks = out[out['side'] == opposite_side]
-    last_break_time = breaks['time'].iloc[-1] if not breaks.empty else None
-
-    last_close, last_vwap = out['close'].iloc[-1], out['vwap'].iloc[-1]
-    distance_pts = last_close - last_vwap
-    distance_pct = (distance_pts / last_vwap * 100) if last_vwap else None
-
-    return {
-        'side': current_side, 'streak_candles': streak,
-        'streak_minutes': streak * interval_minutes,
-        'streak_start_time': pd.to_datetime(streak_start_time),
-        'confirmed': streak >= confirm_candles,
-        'touch_hold_count': len(touch_hold_events),
-        'touch_hold_df': touch_hold_events[['time', 'vwap']].reset_index(drop=True),
-        'last_break_time': pd.to_datetime(last_break_time) if last_break_time is not None else None,
-        'distance_pts': distance_pts, 'distance_pct': distance_pct,
-        'touched_vwap_now': bool(out['touched_vwap'].iloc[-1]),
-    }
-
-
+"""Reads the VWAP-respect pattern: while price keeps *closing* on one side
+of the running session VWAP, that directional bias has historically tended
+to persist for the next ~30-60 minutes. This tracks the current streak of
+consecutive candles closed on one side, and separately flags "touch-and-
+hold" events -- candles where price dipped/spiked into VWAP intrabar
+(low <= vwap <= high) but still closed on the streak's side, which is the
+institutional retest-and-continue pattern that makes a hold more credible
+than a streak with no retest at all.
+A streak resets the moment a candle *closes* on the opposite side --
+intrabar wicks through VWAP don't break it, only a close does. That
+matches "respecting VWAP" as a level, not treating every wick as a flip.
+Descriptive only: reports what price has actually done so far this
+session. Does not guarantee continuation, and is entirely independent of
+the OI-based Master Signal."""
+out = ohlc_df.dropna(subset=['vwap']).copy()
+if out.empty or len(out) < 2:
+return None
+out['side'] = np.where(out['close'] > out['vwap'], 'above', 'below')
+out['touched_vwap'] = (out['low'] <= out['vwap']) & (out['high'] >= out['vwap'])
+current_side = out['side'].iloc[-1]
+streak = 0
+streak_start_time = out['time'].iloc[-1]
+for s, t in zip(out['side'].values[::-1], out['time'].values[::-1]):
+if s == current_side:
+streak += 1
+streak_start_time = t
+else:
+break
+streak_slice = out.iloc[-streak:]
+touch_hold_events = streak_slice[streak_slice['touched_vwap']]
+opposite_side = 'below' if current_side == 'above' else 'above'
+breaks = out[out['side'] == opposite_side]
+last_break_time = breaks['time'].iloc[-1] if not breaks.empty else None
+last_close, last_vwap = out['close'].iloc[-1], out['vwap'].iloc[-1]
+distance_pts = last_close - last_vwap
+distance_pct = (distance_pts / last_vwap * 100) if last_vwap else None
+return {
+'side': current_side, 'streak_candles': streak,
+'streak_minutes': streak * interval_minutes,
+'streak_start_time': pd.to_datetime(streak_start_time),
+'confirmed': streak >= confirm_candles,
+'touch_hold_count': len(touch_hold_events),
+'touch_hold_df': touch_hold_events[['time', 'vwap']].reset_index(drop=True),
+'last_break_time': pd.to_datetime(last_break_time) if last_break_time is not None else None,
+'distance_pts': distance_pts, 'distance_pct': distance_pct,
+'touched_vwap_now': bool(out['touched_vwap'].iloc[-1]),
+}
 def recover_spot(df: pd.DataFrame):
-    """Spot for a cached / closed-market chain, in order of trustworthiness.
-
-    1. the value persisted alongside the snapshot ('_spot')
-    2. put-call parity: at the strike where |CE_LTP - PE_LTP| is smallest,
-       spot ~= K + CE_LTP - PE_LTP  (rates/carry ignored -- immaterial intraday)
-
-    Returns (spot, source). Deliberately never falls back to the median strike:
-    a median strike describes the chain's WIDTH, not price, and silently
-    substituting it is what corrupted every vol-surface read on cached polls.
-    """
-    if '_spot' in df.columns:
-        v = pd.to_numeric(df['_spot'], errors='coerce').dropna()
-        if len(v) and np.isfinite(v.iloc[0]) and v.iloc[0] > 0:
-            return float(v.iloc[0]), 'snapshot'
-    try:
-        d = df.dropna(subset=['CE_LTP', 'PE_LTP']).copy()
-        d = d[(d['CE_LTP'] > 0) & (d['PE_LTP'] > 0)]
-        if not d.empty:
-            row = d.loc[(d['CE_LTP'] - d['PE_LTP']).abs().idxmin()]
-            synth = float(row['Strike'] + row['CE_LTP'] - row['PE_LTP'])
-            if np.isfinite(synth) and synth > 0:
-                return synth, 'parity'
-    except Exception:
-        pass
-    return None, None
-
-
+"""Spot for a cached / closed-market chain, in order of trustworthiness.
+1. the value persisted alongside the snapshot ('_spot')
+2. put-call parity: at the strike where |CE_LTP - PE_LTP| is smallest,
+spot ~= K + CE_LTP - PE_LTP  (rates/carry ignored -- immaterial intraday)
+Returns (spot, source). Deliberately never falls back to the median strike:
+a median strike describes the chain's WIDTH, not price, and silently
+substituting it is what corrupted every vol-surface read on cached polls.
+"""
+if '_spot' in df.columns:
+v = pd.to_numeric(df['_spot'], errors='coerce').dropna()
+if len(v) and np.isfinite(v.iloc[0]) and v.iloc[0] > 0:
+return float(v.iloc[0]), 'snapshot'
+try:
+d = df.dropna(subset=['CE_LTP', 'PE_LTP']).copy()
+d = d[(d['CE_LTP'] > 0) & (d['PE_LTP'] > 0)]
+if not d.empty:
+row = d.loc[(d['CE_LTP'] - d['PE_LTP']).abs().idxmin()]
+synth = float(row['Strike'] + row['CE_LTP'] - row['PE_LTP'])
+if np.isfinite(synth) and synth > 0:
+return synth, 'parity'
+except Exception:
+pass
+return None, None
 def chain_is_coherent(df: pd.DataFrame, atm: float, spot: float):
-    """Guard rail on the CE/PE alignment. Returns (ok, [problems]).
-
-    Two assertions:
-      * ATM must sit within one strike interval of spot
-      * the ATM put must not trade below intrinsic
-
-    Either failure means the CE and PE legs are being read off different strikes,
-    which silently corrupts IV skew, ChgPCR, the Expected Move envelope and the
-    straddle breakevens. When it trips, the caller blanks those panels rather than
-    publishing them -- a dark panel is safe, a confident wrong number is not.
-    """
-    problems = []
-    if spot is None or atm is None:
-        return False, ["no usable spot -- vol-surface reads suppressed"]
-    if abs(atm - spot) > STRIKE_STEP:
-        problems.append(f"ATM {atm:.0f} is {abs(atm - spot):.0f} pts from spot "
-                        f"{spot:.0f} (max {STRIKE_STEP:.0f})")
-    row = df[df['Strike'] == atm]
-    if not row.empty:
-        pe = row.iloc[0].get('PE_LTP')
-        ce = row.iloc[0].get('CE_LTP')
-        pe_intrinsic = max(0.0, atm - spot)
-        ce_intrinsic = max(0.0, spot - atm)
-        if pd.notna(pe) and pe < pe_intrinsic - 1.0:
-            problems.append(f"ATM PE {pe:.1f} is below intrinsic {pe_intrinsic:.1f}")
-        if pd.notna(ce) and ce < ce_intrinsic - 1.0:
-            problems.append(f"ATM CE {ce:.1f} is below intrinsic {ce_intrinsic:.1f}")
-    return (len(problems) == 0), problems
-
-
+"""Guard rail on the CE/PE alignment. Returns (ok, [problems]).
+Two assertions:
+* ATM must sit within one strike interval of spot
+* the ATM put must not trade below intrinsic
+Either failure means the CE and PE legs are being read off different strikes,
+which silently corrupts IV skew, ChgPCR, the Expected Move envelope and the
+straddle breakevens. When it trips, the caller blanks those panels rather than
+publishing them -- a dark panel is safe, a confident wrong number is not.
+"""
+problems = []
+if spot is None or atm is None:
+return False, ["no usable spot -- vol-surface reads suppressed"]
+if abs(atm - spot) > STRIKE_STEP:
+problems.append(f"ATM {atm:.0f} is {abs(atm - spot):.0f} pts from spot "
+f"{spot:.0f} (max {STRIKE_STEP:.0f})")
+row = df[df['Strike'] == atm]
+if not row.empty:
+pe = row.iloc[0].get('PE_LTP')
+ce = row.iloc[0].get('CE_LTP')
+pe_intrinsic = max(0.0, atm - spot)
+ce_intrinsic = max(0.0, spot - atm)
+if pd.notna(pe) and pe < pe_intrinsic - 1.0:
+problems.append(f"ATM PE {pe:.1f} is below intrinsic {pe_intrinsic:.1f}")
+if pd.notna(ce) and ce < ce_intrinsic - 1.0:
+problems.append(f"ATM CE {ce:.1f} is below intrinsic {ce_intrinsic:.1f}")
+return (len(problems) == 0), problems
 def build_oi_profile(df: pd.DataFrame, atm: float, width: int):
-    """Per-strike OI slice for the chart's right-edge profile, plus the two levels
-    that actually matter for a breakout read: the strike carrying the most CE OI
-    (the resistance wall / where call writers are defending) and the most PE OI
-    (the support floor).
-
-    Today's OI *change* at each of those strikes is carried along too, because the
-    standing OI alone can't tell you whether a wall is being defended or abandoned
-    -- and that distinction is the whole difference between a real breakout and a
-    false one."""
-    band = df[(df['Strike'] >= atm - width * STRIKE_STEP) &
-              (df['Strike'] <= atm + width * STRIKE_STEP)].copy()
-    if band.empty:
-        return None
-    band['Total_OI'] = band['CE_OI'] + band['PE_OI']
-
-    def _peak(col, chg_col):
-        if band[col].max() <= 0:
-            return None, None, None
-        row = band.loc[band[col].idxmax()]
-        return float(row['Strike']), float(row[col]), float(row[chg_col])
-
-    ce_strike, ce_oi, ce_chg = _peak('CE_OI', 'CE_OI_chg')
-    pe_strike, pe_oi, pe_chg = _peak('PE_OI', 'PE_OI_chg')
-
-    return {
-        'band': band,
-        'max_ce_strike': ce_strike, 'max_ce_oi': ce_oi, 'max_ce_chg': ce_chg,
-        'max_pe_strike': pe_strike, 'max_pe_oi': pe_oi, 'max_pe_chg': pe_chg,
-        'max_side_oi': float(max(band['CE_OI'].max(), band['PE_OI'].max())),
-        'max_total_oi': float(band['Total_OI'].max()),
-    }
-
-
+"""Per-strike OI slice for the chart's right-edge profile, plus the two levels
+that actually matter for a breakout read: the strike carrying the most CE OI
+(the resistance wall / where call writers are defending) and the most PE OI
+(the support floor).
+Today's OI *change* at each of those strikes is carried along too, because the
+standing OI alone can't tell you whether a wall is being defended or abandoned
+-- and that distinction is the whole difference between a real breakout and a
+false one."""
+band = df[(df['Strike'] >= atm - width * STRIKE_STEP) &
+(df['Strike'] <= atm + width * STRIKE_STEP)].copy()
+if band.empty:
+return None
+band['Total_OI'] = band['CE_OI'] + band['PE_OI']
+def _peak(col, chg_col):
+if band[col].max() <= 0:
+return None, None, None
+row = band.loc[band[col].idxmax()]
+return float(row['Strike']), float(row[col]), float(row[chg_col])
+ce_strike, ce_oi, ce_chg = _peak('CE_OI', 'CE_OI_chg')
+pe_strike, pe_oi, pe_chg = _peak('PE_OI', 'PE_OI_chg')
+return {
+'band': band,
+'max_ce_strike': ce_strike, 'max_ce_oi': ce_oi, 'max_ce_chg': ce_chg,
+'max_pe_strike': pe_strike, 'max_pe_oi': pe_oi, 'max_pe_chg': pe_chg,
+'max_side_oi': float(max(band['CE_OI'].max(), band['PE_OI'].max())),
+'max_total_oi': float(band['Total_OI'].max()),
+}
 # ==========================================
 # IV LENS — trade gate (replaces the earlier four-rule IV vs Price panel)
 # ==========================================
 def compute_atm_iv(df: pd.DataFrame, atm: float, width: int = 1):
-    """Single 'the market's IV right now' scalar: the mean of CE and PE implied
-    vol across ATM +- width strikes. Zero/blank IVs are dropped rather than
-    averaged in, because Dhan returns 0 for strikes it has no IV for and
-    including those would drag the average down and manufacture a fake
-    'IV falling' reading. Width 1 keeps it close to the ATM straddle, which is
-    the cleanest proxy for at-the-money vol and the least contaminated by wing
-    skew moving around."""
-    zone = df[(df['Strike'] >= atm - width * STRIKE_STEP) & (df['Strike'] <= atm + width * STRIKE_STEP)]
-    if zone.empty:
-        return np.nan
-    ivs = pd.to_numeric(pd.concat([zone['CE_IV'], zone['PE_IV']], ignore_index=True), errors='coerce')
-    ivs = ivs[ivs > 0]
-    return float(ivs.mean()) if len(ivs) else np.nan
-
-
+"""Single 'the market's IV right now' scalar: the mean of CE and PE implied
+vol across ATM +- width strikes. Zero/blank IVs are dropped rather than
+averaged in, because Dhan returns 0 for strikes it has no IV for and
+including those would drag the average down and manufacture a fake
+'IV falling' reading. Width 1 keeps it close to the ATM straddle, which is
+the cleanest proxy for at-the-money vol and the least contaminated by wing
+skew moving around."""
+zone = df[(df['Strike'] >= atm - width * STRIKE_STEP) & (df['Strike'] <= atm + width * STRIKE_STEP)]
+if zone.empty:
+return np.nan
+ivs = pd.to_numeric(pd.concat([zone['CE_IV'], zone['PE_IV']], ignore_index=True), errors='coerce')
+ivs = ivs[ivs > 0]
+return float(ivs.mean()) if len(ivs) else np.nan
 def compute_lens_skew(df: pd.DataFrame, atm: float, width: int = 3):
-    """OI-weighted CE_IV - PE_IV across ATM +- width strikes, used by the lens
-    only in the price-up + IV-up quadrant to confirm a squeeze fade.
-
-    Computed standalone rather than reusing the Institutional Footprint's skew,
-    so the lens keeps working with the Footprint panel switched off and with its
-    own band width. Strikes with a zero/blank IV on either leg are dropped
-    instead of being treated as 0 vol, which would manufacture a large fake
-    negative skew and falsely 'confirm' a fade."""
-    zone = df[(df['Strike'] >= atm - width * STRIKE_STEP) &
-              (df['Strike'] <= atm + width * STRIKE_STEP)].copy()
-    if zone.empty:
-        return np.nan
-    ce = pd.to_numeric(zone['CE_IV'], errors='coerce')
-    pe = pd.to_numeric(zone['PE_IV'], errors='coerce')
-    w = pd.to_numeric(zone['CE_OI'] + zone['PE_OI'], errors='coerce')
-    skew = ce - pe
-    mask = skew.notna() & (ce > 0) & (pe > 0) & w.notna() & (w > 0)
-    if not mask.any():
-        return np.nan
-    return float((skew[mask] * w[mask]).sum() / w[mask].sum())
-
-
+"""OI-weighted CE_IV - PE_IV across ATM +- width strikes, used by the lens
+only in the price-up + IV-up quadrant to confirm a squeeze fade.
+Computed standalone rather than reusing the Institutional Footprint's skew,
+so the lens keeps working with the Footprint panel switched off and with its
+own band width. Strikes with a zero/blank IV on either leg are dropped
+instead of being treated as 0 vol, which would manufacture a large fake
+negative skew and falsely 'confirm' a fade."""
+zone = df[(df['Strike'] >= atm - width * STRIKE_STEP) &
+(df['Strike'] <= atm + width * STRIKE_STEP)].copy()
+if zone.empty:
+return np.nan
+ce = pd.to_numeric(zone['CE_IV'], errors='coerce')
+pe = pd.to_numeric(zone['PE_IV'], errors='coerce')
+w = pd.to_numeric(zone['CE_OI'] + zone['PE_OI'], errors='coerce')
+skew = ce - pe
+mask = skew.notna() & (ce > 0) & (pe > 0) & w.notna() & (w > 0)
+if not mask.any():
+return np.nan
+return float((skew[mask] * w[mask]).sum() / w[mask].sum())
 def _edge_means(values: np.ndarray, edge_n: int):
-    """Start/end levels of a window, averaged over a few samples at each end so
-    one jumpy 10-second poll can't flip the whole read."""
-    return float(np.mean(values[:edge_n])), float(np.mean(values[-edge_n:]))
-
-
+"""Start/end levels of a window, averaged over a few samples at each end so
+one jumpy 10-second poll can't flip the whole read."""
+return float(np.mean(values[:edge_n])), float(np.mean(values[-edge_n:]))
 def _session_move_floor(ts, values, lookback_minutes: int, pctile: float,
-                        lo: float, hi: float, min_windows: int = 6):
-    """Significance floor derived from the session's own realized moves rather
-    than a fixed constant.
-
-    The series is resampled into NON-OVERLAPPING buckets the same length as the
-    lookback window, and the floor is set to a percentile of those buckets'
-    absolute % changes. Non-overlapping matters: overlapping windows share most
-    of their samples, so their moves are heavily autocorrelated and a percentile
-    taken over them would be far too tight.
-
-    Returns (floor, n_windows), or (None, n) while there aren't enough completed
-    buckets yet to estimate anything -- the caller falls back to the fixed floor
-    during that warm-up rather than guessing from two data points."""
-    try:
-        s = pd.Series(np.asarray(values, dtype=float), index=pd.to_datetime(ts))
-        res = s.resample(f'{int(lookback_minutes)}min').last().dropna()
-        moves = res.pct_change().dropna().abs() * 100
-        if len(moves) < min_windows:
-            return None, len(moves)
-        return float(np.clip(np.percentile(moves, pctile), lo, hi)), len(moves)
-    except Exception:
-        return None, 0
-
-
+lo: float, hi: float, min_windows: int = 6):
+"""Significance floor derived from the session's own realized moves rather
+than a fixed constant.
+The series is resampled into NON-OVERLAPPING buckets the same length as the
+lookback window, and the floor is set to a percentile of those buckets'
+absolute % changes. Non-overlapping matters: overlapping windows share most
+of their samples, so their moves are heavily autocorrelated and a percentile
+taken over them would be far too tight.
+Returns (floor, n_windows), or (None, n) while there aren't enough completed
+buckets yet to estimate anything -- the caller falls back to the fixed floor
+during that warm-up rather than guessing from two data points."""
+try:
+s = pd.Series(np.asarray(values, dtype=float), index=pd.to_datetime(ts))
+res = s.resample(f'{int(lookback_minutes)}min').last().dropna()
+moves = res.pct_change().dropna().abs() * 100
+if len(moves) < min_windows:
+return None, len(moves)
+return float(np.clip(np.percentile(moves, pctile), lo, hi)), len(moves)
+except Exception:
+return None, 0
 def measure_price_iv_window(log_records, date_str: str, t: dict):
-    """Measures, without interpreting: the change in spot and the change in ATM
-    IV over the rolling window, and which direction each of those counts as.
-
-    Both series come from THIS APP'S session log (spot + ATM IV recorded on the
-    same poll), deliberately -- not from the candle feed for price and the chain
-    for IV. Mixing two clocks would compare a price change measured over one
-    interval against an IV change measured over a slightly different one, which
-    is exactly the kind of small misalignment that flips a borderline quadrant
-    call for no real reason -- and with a veto hanging off that call, a spurious
-    flip is expensive.
-
-    'Significant' is relative, not absolute: IV is judged as a % change of the
-    IV level itself (so 0.3 vol points means something different at 9 IV than at
-    22 IV), and price as a % of spot. Both floors are tunable in the sidebar.
-
-    Returns None when there's no usable history, or a dict with ready=False
-    while the window is still filling up."""
-    if not log_records:
-        return None
-    hist = pd.DataFrame(log_records)
-    if not {'Time', 'Spot', 'ATM_IV'}.issubset(hist.columns):
-        return None
-
-    hist = hist[['Time', 'Spot', 'ATM_IV']].copy()
-    hist['Spot'] = pd.to_numeric(hist['Spot'], errors='coerce')
-    hist['ATM_IV'] = pd.to_numeric(hist['ATM_IV'], errors='coerce')
-    hist = hist.dropna(subset=['Spot', 'ATM_IV'])
-    hist = hist[(hist['ATM_IV'] > 0) & (hist['Spot'] > 0)]
-    if hist.empty:
-        return None
-
-    hist['ts'] = pd.to_datetime(date_str + ' ' + hist['Time'].astype(str), errors='coerce')
-    hist = hist.dropna(subset=['ts']).sort_values('ts').reset_index(drop=True)
-    if hist.empty:
-        return None
-
-    end_ts = hist['ts'].iloc[-1]
-    window = hist[hist['ts'] >= end_ts - timedelta(minutes=t['lookback_minutes'])]
-    samples = len(window)
-    span_minutes = ((window['ts'].iloc[-1] - window['ts'].iloc[0]).total_seconds() / 60) if samples > 1 else 0.0
-
-    if samples < t['min_samples']:
-        return {'ready': False, 'samples': samples, 'needed': int(t['min_samples']),
-                'span_minutes': span_minutes, 'series': hist,
-                'window_start': window['ts'].iloc[0] if samples else None, 'window_end': end_ts}
-
-    edge = max(1, min(3, samples // 4))
-    p_start, p_end = _edge_means(window['Spot'].values, edge)
-    iv_start, iv_end = _edge_means(window['ATM_IV'].values, edge)
-
-    price_chg_pts = p_end - p_start
-    price_chg_pct = (price_chg_pts / p_start * 100) if p_start else np.nan
-    iv_chg_pts = iv_end - iv_start
-    iv_chg_pct = (iv_chg_pts / iv_start * 100) if iv_start else np.nan
-
-    p_th, iv_th = t['price_significant_pct'], t['iv_significant_pct']
-    floor_source, floor_windows = 'fixed', 0
-    if t.get('adaptive_floors'):
-        pf, floor_windows = _session_move_floor(
-            hist['ts'], hist['Spot'], t['lookback_minutes'], t['adaptive_pctile'],
-            t['adaptive_price_min'], t['adaptive_price_max'])
-        vf, _ = _session_move_floor(
-            hist['ts'], hist['ATM_IV'], t['lookback_minutes'], t['adaptive_pctile'],
-            t['adaptive_iv_min'], t['adaptive_iv_max'])
-        # Both floors switch together or neither does, so the two legs are always
-        # judged on the same basis -- a mixed pair would make the quadrant depend
-        # on which series happened to have enough history.
-        if pf is not None and vf is not None:
-            p_th, iv_th, floor_source = pf, vf, 'adaptive'
-        else:
-            floor_source = 'fixed (adaptive warming up)'
-
-    price_dir = 'rising' if price_chg_pct > p_th else ('falling' if price_chg_pct < -p_th else 'flat')
-    iv_dir = 'rising' if iv_chg_pct > iv_th else ('falling' if iv_chg_pct < -iv_th else 'flat')
-
-    return {
-        'ready': True,
-        'price_dir': price_dir, 'iv_dir': iv_dir,
-        'price_floor': p_th, 'iv_floor': iv_th,
-        'floor_source': floor_source, 'floor_windows': floor_windows,
-        'price_chg_pct': price_chg_pct, 'price_chg_pts': price_chg_pts,
-        'iv_chg_pct': iv_chg_pct, 'iv_chg_pts': iv_chg_pts,
-        'price_start': p_start, 'price_end': p_end,
-        'iv_start': iv_start, 'iv_end': iv_end,
-        'samples': samples, 'span_minutes': span_minutes, 'edge_n': edge,
-        'series': hist, 'window_start': window['ts'].iloc[0], 'window_end': end_ts,
-    }
-
-
+"""Measures, without interpreting: the change in spot and the change in ATM
+IV over the rolling window, and which direction each of those counts as.
+Both series come from THIS APP'S session log (spot + ATM IV recorded on the
+same poll), deliberately -- not from the candle feed for price and the chain
+for IV. Mixing two clocks would compare a price change measured over one
+interval against an IV change measured over a slightly different one, which
+is exactly the kind of small misalignment that flips a borderline quadrant
+call for no real reason -- and with a veto hanging off that call, a spurious
+flip is expensive.
+'Significant' is relative, not absolute: IV is judged as a % change of the
+IV level itself (so 0.3 vol points means something different at 9 IV than at
+22 IV), and price as a % of spot. Both floors are tunable in the sidebar.
+Returns None when there's no usable history, or a dict with ready=False
+while the window is still filling up."""
+if not log_records:
+return None
+hist = pd.DataFrame(log_records)
+if not {'Time', 'Spot', 'ATM_IV'}.issubset(hist.columns):
+return None
+hist = hist[['Time', 'Spot', 'ATM_IV']].copy()
+hist['Spot'] = pd.to_numeric(hist['Spot'], errors='coerce')
+hist['ATM_IV'] = pd.to_numeric(hist['ATM_IV'], errors='coerce')
+hist = hist.dropna(subset=['Spot', 'ATM_IV'])
+hist = hist[(hist['ATM_IV'] > 0) & (hist['Spot'] > 0)]
+if hist.empty:
+return None
+hist['ts'] = pd.to_datetime(date_str + ' ' + hist['Time'].astype(str), errors='coerce')
+hist = hist.dropna(subset=['ts']).sort_values('ts').reset_index(drop=True)
+if hist.empty:
+return None
+end_ts = hist['ts'].iloc[-1]
+window = hist[hist['ts'] >= end_ts - timedelta(minutes=t['lookback_minutes'])]
+samples = len(window)
+span_minutes = ((window['ts'].iloc[-1] - window['ts'].iloc[0]).total_seconds() / 60) if samples > 1 else 0.0
+if samples < t['min_samples']:
+return {'ready': False, 'samples': samples, 'needed': int(t['min_samples']),
+'span_minutes': span_minutes, 'series': hist,
+'window_start': window['ts'].iloc[0] if samples else None, 'window_end': end_ts}
+edge = max(1, min(3, samples // 4))
+p_start, p_end = _edge_means(window['Spot'].values, edge)
+iv_start, iv_end = _edge_means(window['ATM_IV'].values, edge)
+price_chg_pts = p_end - p_start
+price_chg_pct = (price_chg_pts / p_start * 100) if p_start else np.nan
+iv_chg_pts = iv_end - iv_start
+iv_chg_pct = (iv_chg_pts / iv_start * 100) if iv_start else np.nan
+p_th, iv_th = t['price_significant_pct'], t['iv_significant_pct']
+floor_source, floor_windows = 'fixed', 0
+if t.get('adaptive_floors'):
+pf, floor_windows = _session_move_floor(
+hist['ts'], hist['Spot'], t['lookback_minutes'], t['adaptive_pctile'],
+t['adaptive_price_min'], t['adaptive_price_max'])
+vf, _ = _session_move_floor(
+hist['ts'], hist['ATM_IV'], t['lookback_minutes'], t['adaptive_pctile'],
+t['adaptive_iv_min'], t['adaptive_iv_max'])
+# Both floors switch together or neither does, so the two legs are always
+# judged on the same basis -- a mixed pair would make the quadrant depend
+# on which series happened to have enough history.
+if pf is not None and vf is not None:
+p_th, iv_th, floor_source = pf, vf, 'adaptive'
+else:
+floor_source = 'fixed (adaptive warming up)'
+price_dir = 'rising' if price_chg_pct > p_th else ('falling' if price_chg_pct < -p_th else 'flat')
+iv_dir = 'rising' if iv_chg_pct > iv_th else ('falling' if iv_chg_pct < -iv_th else 'flat')
+return {
+'ready': True,
+'price_dir': price_dir, 'iv_dir': iv_dir,
+'price_floor': p_th, 'iv_floor': iv_th,
+'floor_source': floor_source, 'floor_windows': floor_windows,
+'price_chg_pct': price_chg_pct, 'price_chg_pts': price_chg_pts,
+'iv_chg_pct': iv_chg_pct, 'iv_chg_pts': iv_chg_pts,
+'price_start': p_start, 'price_end': p_end,
+'iv_start': iv_start, 'iv_end': iv_end,
+'samples': samples, 'span_minutes': span_minutes, 'edge_n': edge,
+'series': hist, 'window_start': window['ts'].iloc[0], 'window_end': end_ts,
+}
 def apply_iv_lens(measured, iv_skew, t: dict):
-    """Maps the measured quadrant onto your lens ruleset.
-
-      Price DOWN + IV DOWN -> Shakeout      -> longable
-      Price DOWN + IV UP   -> Distribution  -> stand down, however good the OI looks
-      Price UP   + IV UP   -> Fear bid      -> never chase; negative skew confirms the fade
-      Price UP   + IV DOWN -> Conviction    -> controlled accumulation
-
-    Kept separate from measure_price_iv_window() on purpose: that function only
-    describes what happened, this one is the only place a verdict is asserted,
-    so retuning the rules never touches the measurement.
-
-    When either leg is FLAT the lens returns a no-read rather than guessing --
-    flat isn't one of the four quadrants, and a gate that vetoes trades should
-    stay silent instead of improvising. Returns None until the window is ready."""
-    if not measured or not measured.get('ready'):
-        return None
-
-    p, v = measured['price_dir'], measured['iv_dir']
-    skew_txt = f"{iv_skew:+.2f}" if pd.notna(iv_skew) else "n/a"
-    notes = []
-
-    # Which leg (if any) is holding the lens silent, and by how much. Without this
-    # a silent lens is indistinguishable from a broken one -- on the 14-Aug session
-    # it read "NO LENS READ" on 97% of polls and there was no way to see from the
-    # panel that price was simply 16 points short of the floor.
-    p_floor = measured.get('price_floor', t['price_significant_pct'])
-    iv_floor = measured.get('iv_floor', t['iv_significant_pct'])
-    blockers = []
-    if p == 'flat':
-        short_pct = p_floor - abs(measured['price_chg_pct'])
-        short_pts = short_pct / 100 * measured['price_end'] if measured.get('price_end') else None
-        pts_txt = f" (~{short_pts:.0f} pts)" if short_pts is not None else ""
-        blockers.append(("price", f"moved {measured['price_chg_pct']:+.3f}% over the window, floor is "
-                                  f"±{p_floor:.3f}% — short by {short_pct:.3f}%{pts_txt}"))
-    if v == 'flat':
-        short_iv = iv_floor - abs(measured['iv_chg_pct'])
-        blockers.append(("IV", f"moved {measured['iv_chg_pct']:+.2f}% over the window, floor is "
-                               f"±{iv_floor:.2f}% — short by {short_iv:.2f}%"))
-
-    if p == 'falling' and v == 'falling':
-        stance, headline, color = 'shakeout', "🟢 SHAKEOUT — longable", "#1e7e34"
-        action = "Longs permitted into weakness"
-        direction, veto, chase_block = 'bullish', False, False
-        notes.append("Price coming off while vol bleeds — nobody is paying up for protection on the way down. "
-                     "That's positioning being flushed, not risk being repriced. Dips here are the buyable kind.")
-    elif p == 'falling' and v == 'rising':
-        stance, headline, color = 'distribution', "⛔ DISTRIBUTION — stand down", "#c82333"
-        action = "No new positions — the OI read does not apply"
-        direction, veto, chase_block = 'bearish', True, False
-        notes.append("Price down with vol bid is genuine repricing, not a flush: protection is being paid for "
-                     "into the decline. Stand down regardless of how constructive the OI/Master Signal looks.")
-    elif p == 'rising' and v == 'rising':
-        stance, headline, color = 'fear_bid', "🟠 FEAR BID / SQUEEZE — do not chase", "#d97706"
-        action = "No chasing — wait for the fade or a pullback"
-        direction, veto, chase_block = 'bearish', False, True
-        notes.append("Price and vol rising together is a squeeze / fear bid, not accumulation — the move is "
-                     "being paid for in premium. Never chase strength in this quadrant.")
-        if pd.isna(iv_skew):
-            notes.append("Skew unavailable this poll, so the fade confirmation can't be checked.")
-        elif iv_skew < t['skew_fade_confirm']:
-            notes.append(f"Skew {skew_txt} has flipped negative (CE_IV below PE_IV) — **fade confirmed**: calls "
-                         "are being sold into the rip while puts stay bid.")
-        else:
-            notes.append(f"Skew {skew_txt} has not flipped negative yet — the squeeze may still have legs, so "
-                         "the fade is not confirmed. Still no chasing either way.")
-    elif p == 'rising' and v == 'falling':
-        stance, headline, color = 'accumulation', "🟢 CONVICTION — controlled accumulation", "#1e7e34"
-        action = "Trend longs — the smart-money grind"
-        direction, veto, chase_block = 'bullish', False, False
-        notes.append("Price grinding up while vol bleeds out: size is being absorbed without anyone paying up "
-                     "for protection. This is the accumulation regime, not a chase.")
-    else:
-        stance, headline, color = 'no_read', "⚪ NO LENS READ", "#6c757d"
-        action = "Lens is silent"
-        direction, veto, chase_block = 'neutral', False, False
-        notes.append(f"Price is {p} and IV is {v}. The lens is defined only for the four up/down quadrants, so "
-                     "no verdict is being asserted.")
-        for lbl, gap in blockers:
-            notes.append(f"Blocked by {lbl}: {gap}")
-
-    fade_confirmed = bool(stance == 'fear_bid' and pd.notna(iv_skew) and iv_skew < t['skew_fade_confirm'])
-
-    return {
-        'stance': stance, 'headline': headline, 'action': action, 'color': color,
-        'direction': direction, 'veto': veto, 'chase_block': chase_block,
-        'fade_confirmed': fade_confirmed, 'notes': notes, 'blockers': blockers,
-        'price_dir': p, 'iv_dir': v, 'iv_skew': iv_skew,
-    }
-
-
+"""Maps the measured quadrant onto your lens ruleset.
+Price DOWN + IV DOWN -> Shakeout      -> longable
+Price DOWN + IV UP   -> Distribution  -> stand down, however good the OI looks
+Price UP   + IV UP   -> Fear bid      -> never chase; negative skew confirms the fade
+Price UP   + IV DOWN -> Conviction    -> controlled accumulation
+Kept separate from measure_price_iv_window() on purpose: that function only
+describes what happened, this one is the only place a verdict is asserted,
+so retuning the rules never touches the measurement.
+When either leg is FLAT the lens returns a no-read rather than guessing --
+flat isn't one of the four quadrants, and a gate that vetoes trades should
+stay silent instead of improvising. Returns None until the window is ready."""
+if not measured or not measured.get('ready'):
+return None
+p, v = measured['price_dir'], measured['iv_dir']
+skew_txt = f"{iv_skew:+.2f}" if pd.notna(iv_skew) else "n/a"
+notes = []
+# Which leg (if any) is holding the lens silent, and by how much. Without this
+# a silent lens is indistinguishable from a broken one -- on the 14-Aug session
+# it read "NO LENS READ" on 97% of polls and there was no way to see from the
+# panel that price was simply 16 points short of the floor.
+p_floor = measured.get('price_floor', t['price_significant_pct'])
+iv_floor = measured.get('iv_floor', t['iv_significant_pct'])
+blockers = []
+if p == 'flat':
+short_pct = p_floor - abs(measured['price_chg_pct'])
+short_pts = short_pct / 100 * measured['price_end'] if measured.get('price_end') else None
+pts_txt = f" (~{short_pts:.0f} pts)" if short_pts is not None else ""
+blockers.append(("price", f"moved {measured['price_chg_pct']:+.3f}% over the window, floor is "
+f"±{p_floor:.3f}% — short by {short_pct:.3f}%{pts_txt}"))
+if v == 'flat':
+short_iv = iv_floor - abs(measured['iv_chg_pct'])
+blockers.append(("IV", f"moved {measured['iv_chg_pct']:+.2f}% over the window, floor is "
+f"±{iv_floor:.2f}% — short by {short_iv:.2f}%"))
+if p == 'falling' and v == 'falling':
+stance, headline, color = 'shakeout', "🟢 SHAKEOUT — longable", "#1e7e34"
+action = "Longs permitted into weakness"
+direction, veto, chase_block = 'bullish', False, False
+notes.append("Price coming off while vol bleeds — nobody is paying up for protection on the way down. "
+"That's positioning being flushed, not risk being repriced. Dips here are the buyable kind.")
+elif p == 'falling' and v == 'rising':
+stance, headline, color = 'distribution', "⛔ DISTRIBUTION — stand down", "#c82333"
+action = "No new positions — the OI read does not apply"
+direction, veto, chase_block = 'bearish', True, False
+notes.append("Price down with vol bid is genuine repricing, not a flush: protection is being paid for "
+"into the decline. Stand down regardless of how constructive the OI/Master Signal looks.")
+elif p == 'rising' and v == 'rising':
+stance, headline, color = 'fear_bid', "🟠 FEAR BID / SQUEEZE — do not chase", "#d97706"
+action = "No chasing — wait for the fade or a pullback"
+direction, veto, chase_block = 'bearish', False, True
+notes.append("Price and vol rising together is a squeeze / fear bid, not accumulation — the move is "
+"being paid for in premium. Never chase strength in this quadrant.")
+if pd.isna(iv_skew):
+notes.append("Skew unavailable this poll, so the fade confirmation can't be checked.")
+elif iv_skew < t['skew_fade_confirm']:
+notes.append(f"Skew {skew_txt} has flipped negative (CE_IV below PE_IV) — **fade confirmed**: calls "
+"are being sold into the rip while puts stay bid.")
+else:
+notes.append(f"Skew {skew_txt} has not flipped negative yet — the squeeze may still have legs, so "
+"the fade is not confirmed. Still no chasing either way.")
+elif p == 'rising' and v == 'falling':
+stance, headline, color = 'accumulation', "🟢 CONVICTION — controlled accumulation", "#1e7e34"
+action = "Trend longs — the smart-money grind"
+direction, veto, chase_block = 'bullish', False, False
+notes.append("Price grinding up while vol bleeds out: size is being absorbed without anyone paying up "
+"for protection. This is the accumulation regime, not a chase.")
+else:
+stance, headline, color = 'no_read', "⚪ NO LENS READ", "#6c757d"
+action = "Lens is silent"
+direction, veto, chase_block = 'neutral', False, False
+notes.append(f"Price is {p} and IV is {v}. The lens is defined only for the four up/down quadrants, so "
+"no verdict is being asserted.")
+for lbl, gap in blockers:
+notes.append(f"Blocked by {lbl}: {gap}")
+fade_confirmed = bool(stance == 'fear_bid' and pd.notna(iv_skew) and iv_skew < t['skew_fade_confirm'])
+return {
+'stance': stance, 'headline': headline, 'action': action, 'color': color,
+'direction': direction, 'veto': veto, 'chase_block': chase_block,
+'fade_confirmed': fade_confirmed, 'notes': notes, 'blockers': blockers,
+'price_dir': p, 'iv_dir': v, 'iv_skew': iv_skew,
+}
 def evaluate_confluence_scenario(iv_lens, choi_ce, choi_pe, pcr, spot,
-                                 support_strike, resistance_strike, t: dict,
-                                 distribution_hard_stop: bool = False):
-    """Combines the IV Lens (environment) with Choi flow (trigger) and PCR
-    (standing OI) into a single A / B / C / WAIT verdict.
-
-    The organising idea is AGREEMENT vs CONTRADICTION, not the lens state alone:
-    Scenario B and Scenario C both fire on a bearish lens, so the thing that
-    separates them has to be whether today's flow confirms the environment or
-    fights it. Flow confirming -> take the trade (B). Flow contradicting ->
-    stand aside (C). PCR is standing OI from yesterday's positions, so when it
-    disagrees with both the lens and today's flow it downgrades conviction
-    rather than blocking -- otherwise a stale number would veto a live one.
-
-    `distribution_hard_stop` restores the stricter original rule (price down +
-    IV up = stand down unconditionally, so B can only fire on Fear Bid).
-
-    Level context: Shakeout is only 'longable at support' and Fear Bid only
-    'shortable at resistance', per the spec. Those are reported as conviction
-    flags rather than hard gates, because the OI walls move intraday and a
-    hard gate on a shifting level would silently suppress valid setups.
-
-    Returns None when there's no lens object at all."""
-    if iv_lens is None:
-        return None
-
-    stance = iv_lens['stance']
-    lens_bias = {'shakeout': 'bullish', 'accumulation': 'bullish',
-                 'distribution': 'bearish', 'fear_bid': 'bearish'}.get(stance)
-
-    diff = choi_pe - choi_ce
-    band = t['choi_neutral_band']
-    flow_bias = 'bullish' if diff > band else ('bearish' if diff < -band else 'neutral')
-    flow_txt = f"Choi_PE {choi_pe:.1f}% vs Choi_CE {choi_ce:.1f}% (Δ {diff:+.1f})"
-
-    prox = t['level_proximity_strikes'] * STRIKE_STEP
-    at_support = bool(spot and support_strike and abs(spot - support_strike) <= prox)
-    at_resistance = bool(spot and resistance_strike and abs(spot - resistance_strike) <= prox)
-
-    checks, warnings = [], []
-    checks.append(("IV Lens environment",
-                   iv_lens['headline'].split(" — ")[0] if lens_bias else "no read",
-                   lens_bias is not None))
-    checks.append(("Choi flow trigger",
-                   {'bullish': 'Put writers defending', 'bearish': 'Call writers attacking',
-                    'neutral': 'no clear side'}[flow_bias] + f" — {flow_txt}",
-                   flow_bias != 'neutral'))
-
-    # --- resolve ---------------------------------------------------------
-    if lens_bias is None:
-        scen, side, color = "WAIT", None, "#6c757d"
-        headline = "⏸️ WAIT — no environment read"
-        action = "No trade. The IV Lens is silent, so there's nothing to confirm."
-        warnings.append("The lens is the environment half of this setup. Without it, Choi flow alone "
-                        "is a trigger with nothing to trigger against.")
-    elif distribution_hard_stop and stance == 'distribution':
-        scen, side, color = "C", None, "#c82333"
-        headline = "⛔ SCENARIO C — STAND DOWN (distribution)"
-        action = "No trade. Distribution is set as an absolute stand-down."
-        warnings.append("Price falling into rising IV. The hard-stop toggle is on, so this blocks shorts "
-                        "as well as longs — switch it off in the sidebar to allow a flow-confirmed PE buy here.")
-    elif flow_bias == 'neutral':
-        scen, side, color = "WAIT", None, "#6c757d"
-        headline = "⏸️ WAIT — environment set, flow not confirming"
-        action = f"No trade yet. Environment is {lens_bias}, but Choi is inside the ±{band:.0f} neutral band."
-        warnings.append("This is the half-setup: the environment is in place but nobody has committed yet. "
-                        "Watch for Choi to separate.")
-    elif lens_bias != flow_bias:
-        scen, side, color = "C", None, "#c82333"
-        headline = "⛔ SCENARIO C — STAY AWAY (lens vs flow conflict)"
-        action = "DO NOT TRADE. The environment and the live flow are pointing opposite ways."
-        warnings.append(f"IV Lens reads **{lens_bias}** while Choi flow reads **{flow_bias}**. This is the "
-                        f"exact trap the scenario is built to catch — one of the two is wrong and there's no "
-                        f"way to know which in advance.")
-    elif lens_bias == 'bullish':
-        scen, side, color = "A", "CE", "#1e7e34"
-        headline = "🟢 SCENARIO A — CE BUY (long)"
-        action = "Execute the CE Buy. Environment favourable, flow confirming."
-    else:
-        scen, side, color = "B", "PE", "#c82333"
-        headline = "🔴 SCENARIO B — PE BUY (short)"
-        action = "Execute the PE Buy. Environment fearful, flow confirming the breakdown."
-
-    # --- conviction qualifiers (never flip the verdict, only grade it) ----
-    if scen in ("A", "B"):
-        if stance == 'shakeout':
-            checks.append(("At support (required for Shakeout)",
-                           f"put floor {support_strike:.0f}" if support_strike else "no put floor found",
-                           at_support))
-            if not at_support:
-                warnings.append("Shakeout is only longable **at support** — spot isn't near the put floor, "
-                                "so this is a weaker version of Scenario A.")
-        if stance == 'fear_bid':
-            checks.append(("At resistance (required for Fear Bid)",
-                           f"call wall {resistance_strike:.0f}" if resistance_strike else "no call wall found",
-                           at_resistance))
-            if not at_resistance:
-                warnings.append("Fear Bid is only shortable **at resistance** — spot isn't near the call wall, "
-                                "so this is a weaker version of Scenario B.")
-        if stance == 'fear_bid' and not iv_lens['fade_confirmed']:
-            warnings.append("Skew hasn't flipped negative, so the squeeze fade isn't confirmed. The short is "
-                            "the earlier, riskier version of this setup.")
-
-        pcr_agrees = (pcr > t['pcr_bullish']) if side == 'CE' else (pcr <= t['pcr_bullish'])
-        checks.append(("Standing OI (PCR) agrees", f"PCR {pcr:.2f}" if pd.notna(pcr) else "n/a", bool(pcr_agrees)))
-        if not pcr_agrees:
-            warnings.append(f"PCR {pcr:.2f} points the other way. That's yesterday's standing OI against today's "
-                            f"live IV and flow — it doesn't block the trade, but it's the Scenario C tension "
-                            f"showing up, so size down.")
-
-    met = sum(1 for _, _, ok in checks if ok)
-    return {
-        'scenario': scen, 'side': side, 'headline': headline, 'action': action, 'color': color,
-        'lens_bias': lens_bias, 'flow_bias': flow_bias, 'checks': checks, 'warnings': warnings,
-        'conviction': met, 'conviction_total': len(checks),
-        'at_support': at_support, 'at_resistance': at_resistance,
-        'support_strike': support_strike, 'resistance_strike': resistance_strike,
-    }
-
-
+support_strike, resistance_strike, t: dict,
+distribution_hard_stop: bool = False):
+"""Combines the IV Lens (environment) with Choi flow (trigger) and PCR
+(standing OI) into a single A / B / C / WAIT verdict.
+The organising idea is AGREEMENT vs CONTRADICTION, not the lens state alone:
+Scenario B and Scenario C both fire on a bearish lens, so the thing that
+separates them has to be whether today's flow confirms the environment or
+fights it. Flow confirming -> take the trade (B). Flow contradicting ->
+stand aside (C). PCR is standing OI from yesterday's positions, so when it
+disagrees with both the lens and today's flow it downgrades conviction
+rather than blocking -- otherwise a stale number would veto a live one.
+`distribution_hard_stop` restores the stricter original rule (price down +
+IV up = stand down unconditionally, so B can only fire on Fear Bid).
+Level context: Shakeout is only 'longable at support' and Fear Bid only
+'shortable at resistance', per the spec. Those are reported as conviction
+flags rather than hard gates, because the OI walls move intraday and a
+hard gate on a shifting level would silently suppress valid setups.
+Returns None when there's no lens object at all."""
+if iv_lens is None:
+return None
+stance = iv_lens['stance']
+lens_bias = {'shakeout': 'bullish', 'accumulation': 'bullish',
+'distribution': 'bearish', 'fear_bid': 'bearish'}.get(stance)
+diff = choi_pe - choi_ce
+band = t['choi_neutral_band']
+flow_bias = 'bullish' if diff > band else ('bearish' if diff < -band else 'neutral')
+flow_txt = f"Choi_PE {choi_pe:.1f}% vs Choi_CE {choi_ce:.1f}% (Δ {diff:+.1f})"
+prox = t['level_proximity_strikes'] * STRIKE_STEP
+at_support = bool(spot and support_strike and abs(spot - support_strike) <= prox)
+at_resistance = bool(spot and resistance_strike and abs(spot - resistance_strike) <= prox)
+checks, warnings = [], []
+checks.append(("IV Lens environment",
+iv_lens['headline'].split(" — ")[0] if lens_bias else "no read",
+lens_bias is not None))
+checks.append(("Choi flow trigger",
+{'bullish': 'Put writers defending', 'bearish': 'Call writers attacking',
+'neutral': 'no clear side'}[flow_bias] + f" — {flow_txt}",
+flow_bias != 'neutral'))
+# --- resolve ---------------------------------------------------------
+if lens_bias is None:
+scen, side, color = "WAIT", None, "#6c757d"
+headline = "⏸️ WAIT — no environment read"
+action = "No trade. The IV Lens is silent, so there's nothing to confirm."
+warnings.append("The lens is the environment half of this setup. Without it, Choi flow alone "
+"is a trigger with nothing to trigger against.")
+elif distribution_hard_stop and stance == 'distribution':
+scen, side, color = "C", None, "#c82333"
+headline = "⛔ SCENARIO C — STAND DOWN (distribution)"
+action = "No trade. Distribution is set as an absolute stand-down."
+warnings.append("Price falling into rising IV. The hard-stop toggle is on, so this blocks shorts "
+"as well as longs — switch it off in the sidebar to allow a flow-confirmed PE buy here.")
+elif flow_bias == 'neutral':
+scen, side, color = "WAIT", None, "#6c757d"
+headline = "⏸️ WAIT — environment set, flow not confirming"
+action = f"No trade yet. Environment is {lens_bias}, but Choi is inside the ±{band:.0f} neutral band."
+warnings.append("This is the half-setup: the environment is in place but nobody has committed yet. "
+"Watch for Choi to separate.")
+elif lens_bias != flow_bias:
+scen, side, color = "C", None, "#c82333"
+headline = "⛔ SCENARIO C — STAY AWAY (lens vs flow conflict)"
+action = "DO NOT TRADE. The environment and the live flow are pointing opposite ways."
+warnings.append(f"IV Lens reads **{lens_bias}** while Choi flow reads **{flow_bias}**. This is the "
+f"exact trap the scenario is built to catch — one of the two is wrong and there's no "
+f"way to know which in advance.")
+elif lens_bias == 'bullish':
+scen, side, color = "A", "CE", "#1e7e34"
+headline = "🟢 SCENARIO A — CE BUY (long)"
+action = "Execute the CE Buy. Environment favourable, flow confirming."
+else:
+scen, side, color = "B", "PE", "#c82333"
+headline = "🔴 SCENARIO B — PE BUY (short)"
+action = "Execute the PE Buy. Environment fearful, flow confirming the breakdown."
+# --- conviction qualifiers (never flip the verdict, only grade it) ----
+if scen in ("A", "B"):
+if stance == 'shakeout':
+checks.append(("At support (required for Shakeout)",
+f"put floor {support_strike:.0f}" if support_strike else "no put floor found",
+at_support))
+if not at_support:
+warnings.append("Shakeout is only longable **at support** — spot isn't near the put floor, "
+"so this is a weaker version of Scenario A.")
+if stance == 'fear_bid':
+checks.append(("At resistance (required for Fear Bid)",
+f"call wall {resistance_strike:.0f}" if resistance_strike else "no call wall found",
+at_resistance))
+if not at_resistance:
+warnings.append("Fear Bid is only shortable **at resistance** — spot isn't near the call wall, "
+"so this is a weaker version of Scenario B.")
+if stance == 'fear_bid' and not iv_lens['fade_confirmed']:
+warnings.append("Skew hasn't flipped negative, so the squeeze fade isn't confirmed. The short is "
+"the earlier, riskier version of this setup.")
+pcr_agrees = (pcr > t['pcr_bullish']) if side == 'CE' else (pcr <= t['pcr_bullish'])
+checks.append(("Standing OI (PCR) agrees", f"PCR {pcr:.2f}" if pd.notna(pcr) else "n/a", bool(pcr_agrees)))
+if not pcr_agrees:
+warnings.append(f"PCR {pcr:.2f} points the other way. That's yesterday's standing OI against today's "
+f"live IV and flow — it doesn't block the trade, but it's the Scenario C tension "
+f"showing up, so size down.")
+met = sum(1 for _, _, ok in checks if ok)
+return {
+'scenario': scen, 'side': side, 'headline': headline, 'action': action, 'color': color,
+'lens_bias': lens_bias, 'flow_bias': flow_bias, 'checks': checks, 'warnings': warnings,
+'conviction': met, 'conviction_total': len(checks),
+'at_support': at_support, 'at_resistance': at_resistance,
+'support_strike': support_strike, 'resistance_strike': resistance_strike,
+}
 def build_iv_price_chart(series_df: pd.DataFrame, window_start=None, window_end=None):
-    """Dual-axis session view of spot (left) against ATM IV (right) — the visual
-    behind the lens verdict, so you can see whether the two lines are converging
-    or diverging rather than trusting a single label."""
-    f = make_subplots(specs=[[{"secondary_y": True}]])
-    f.add_trace(go.Scatter(x=series_df['ts'], y=series_df['Spot'], name='Spot',
-                           line=dict(color='#0d6efd', width=1.7)), secondary_y=False)
-    f.add_trace(go.Scatter(x=series_df['ts'], y=series_df['ATM_IV'], name='ATM IV',
-                           line=dict(color='#ffa500', width=1.7)), secondary_y=True)
-    if window_start is not None and window_end is not None and window_start != window_end:
-        f.add_vrect(x0=window_start, x1=window_end, fillcolor="#6c757d", opacity=0.12,
-                    line_width=0, annotation_text="lens window", annotation_position="top left")
-    f.update_yaxes(title_text="Spot", secondary_y=False)
-    f.update_yaxes(title_text="ATM IV (%)", secondary_y=True)
-    f.update_layout(height=320, margin=dict(l=10, r=10, t=10, b=10),
-                    legend=dict(orientation="h", y=1.16))
-    return f
-
-
+"""Dual-axis session view of spot (left) against ATM IV (right) — the visual
+behind the lens verdict, so you can see whether the two lines are converging
+or diverging rather than trusting a single label."""
+f = make_subplots(specs=[[{"secondary_y": True}]])
+f.add_trace(go.Scatter(x=series_df['ts'], y=series_df['Spot'], name='Spot',
+line=dict(color='#0d6efd', width=1.7)), secondary_y=False)
+f.add_trace(go.Scatter(x=series_df['ts'], y=series_df['ATM_IV'], name='ATM IV',
+line=dict(color='#ffa500', width=1.7)), secondary_y=True)
+if window_start is not None and window_end is not None and window_start != window_end:
+f.add_vrect(x0=window_start, x1=window_end, fillcolor="#6c757d", opacity=0.12,
+line_width=0, annotation_text="lens window", annotation_position="top left")
+f.update_yaxes(title_text="Spot", secondary_y=False)
+f.update_yaxes(title_text="ATM IV (%)", secondary_y=True)
+f.update_layout(height=320, margin=dict(l=10, r=10, t=10, b=10),
+legend=dict(orientation="h", y=1.16))
+return f
 # ==========================================
 # BUILDUP DETECTION (new — Option Chain visual: long/short buildup,
 # short covering, long unwinding, per option leg)
@@ -1271,17 +1138,15 @@ def build_iv_price_chart(series_df: pd.DataFrame, window_start=None, window_end=
 # Throughout this section colour now means DIRECTION FOR NIFTY, and the type
 # is carried by the glyph, the bar pattern and the label text.
 BUILDUP_STYLES = {
-    "Long Buildup":    {"label": "▲ Long Buildup",    "pattern": ""},
-    "Short Buildup":   {"label": "▼ Short Buildup",   "pattern": "/"},
-    "Short Covering":  {"label": "↺ Short Covering",  "pattern": "x"},
-    "Long Unwinding":  {"label": "↘ Long Unwinding",  "pattern": "."},
-    "Flat":            {"label": "· Flat",            "pattern": ""},
-    "No data":         {"label": "— No data",         "pattern": ""},
+"Long Buildup":    {"label": "▲ Long Buildup",    "pattern": ""},
+"Short Buildup":   {"label": "▼ Short Buildup",   "pattern": "/"},
+"Short Covering":  {"label": "↺ Short Covering",  "pattern": "x"},
+"Long Unwinding":  {"label": "↘ Long Unwinding",  "pattern": "."},
+"Flat":            {"label": "· Flat",            "pattern": ""},
+"No data":         {"label": "— No data",         "pattern": ""},
 }
-
 # The only colour axis in this section: what it means for the underlying.
 BUILDUP_BIAS_COLOR = {"bullish": "#28a745", "bearish": "#dc3545", "": "#adb5bd"}
-
 # MOBILE FIX: these tints MUST set an explicit foreground colour, not just a
 # background. A background-only rule leaves the text at whatever colour the
 # active Streamlit theme inherits -- dark on desktop light mode (readable on
@@ -1293,127 +1158,109 @@ BUILDUP_BIAS_COLOR = {"bullish": "#28a745", "bearish": "#dc3545", "": "#adb5bd"}
 # on a dark background rather than turning into black-on-black.
 BUILDUP_TEXT_COLOR = "#000000"
 BUILDUP_BIAS_TINT = {
-    "bullish": f"background-color: #d4edda; color: {BUILDUP_TEXT_COLOR}; font-weight: 600",
-    "bearish": f"background-color: #f8d7da; color: {BUILDUP_TEXT_COLOR}; font-weight: 600",
-    "": "",
+"bullish": f"background-color: #d4edda; color: {BUILDUP_TEXT_COLOR}; font-weight: 600",
+"bearish": f"background-color: #f8d7da; color: {BUILDUP_TEXT_COLOR}; font-weight: 600",
+"": "",
 }
-
 # leg -> raw buildup -> bias for the UNDERLYING (not for the option itself)
 BUILDUP_BIAS = {
-    'CE': {"Long Buildup": "bullish", "Short Buildup": "bearish",
-           "Short Covering": "bullish", "Long Unwinding": "bearish"},
-    'PE': {"Long Buildup": "bearish", "Short Buildup": "bullish",
-           "Short Covering": "bearish", "Long Unwinding": "bullish"},
+'CE': {"Long Buildup": "bullish", "Short Buildup": "bearish",
+"Short Covering": "bullish", "Long Unwinding": "bearish"},
+'PE': {"Long Buildup": "bearish", "Short Buildup": "bullish",
+"Short Covering": "bearish", "Long Unwinding": "bullish"},
 }
-
-
 def classify_buildup(price_chg_pct, oi_chg_pct, t: dict) -> str:
-    """The four-quadrant label, with a neutral band on both axes.
-
-    Anything inside the band is 'Flat' rather than being forced into a
-    quadrant -- near-zero moves would otherwise flip label on noise and
-    make the whole column look busy when nothing is happening.
-
-    Returns 'No data' when the previous close or previous OI is missing,
-    which Dhan does return as 0 for illiquid strikes. Treating a 0 previous
-    close as a 100% price rise would paint fake Long Buildup across the
-    wings, so those are excluded rather than guessed at."""
-    if price_chg_pct is None or oi_chg_pct is None or pd.isna(price_chg_pct) or pd.isna(oi_chg_pct):
-        return "No data"
-    if abs(price_chg_pct) < t['price_min_pct'] or abs(oi_chg_pct) < t['oi_min_pct']:
-        return "Flat"
-    if price_chg_pct > 0 and oi_chg_pct > 0:
-        return "Long Buildup"
-    if price_chg_pct < 0 and oi_chg_pct > 0:
-        return "Short Buildup"
-    if price_chg_pct > 0 and oi_chg_pct < 0:
-        return "Short Covering"
-    return "Long Unwinding"
-
-
+"""The four-quadrant label, with a neutral band on both axes.
+Anything inside the band is 'Flat' rather than being forced into a
+quadrant -- near-zero moves would otherwise flip label on noise and
+make the whole column look busy when nothing is happening.
+Returns 'No data' when the previous close or previous OI is missing,
+which Dhan does return as 0 for illiquid strikes. Treating a 0 previous
+close as a 100% price rise would paint fake Long Buildup across the
+wings, so those are excluded rather than guessed at."""
+if price_chg_pct is None or oi_chg_pct is None or pd.isna(price_chg_pct) or pd.isna(oi_chg_pct):
+return "No data"
+if abs(price_chg_pct) < t['price_min_pct'] or abs(oi_chg_pct) < t['oi_min_pct']:
+return "Flat"
+if price_chg_pct > 0 and oi_chg_pct > 0:
+return "Long Buildup"
+if price_chg_pct < 0 and oi_chg_pct > 0:
+return "Short Buildup"
+if price_chg_pct > 0 and oi_chg_pct < 0:
+return "Short Covering"
+return "Long Unwinding"
 def compute_buildup_table(df: pd.DataFrame, atm: float, width: int, t: dict) -> pd.DataFrame:
-    """Per-strike buildup for both legs across ATM +- width strikes."""
-    z = df[(df['Strike'] >= atm - width * STRIKE_STEP) &
-           (df['Strike'] <= atm + width * STRIKE_STEP)].copy()
-    if z.empty:
-        return z
-
-    for leg in ('CE', 'PE'):
-        prev_ltp = pd.to_numeric(z.get(f'{leg}_prevClose'), errors='coerce')
-        prev_oi = pd.to_numeric(z.get(f'{leg}_OI_prev'), errors='coerce')
-        ltp = pd.to_numeric(z[f'{leg}_LTP'], errors='coerce')
-        oi_chg = pd.to_numeric(z[f'{leg}_OI_chg'], errors='coerce')
-
-        z[f'{leg}_LTP_chg_pct'] = np.where(prev_ltp > 0, (ltp - prev_ltp) / prev_ltp * 100, np.nan)
-        z[f'{leg}_OI_chg_pct'] = np.where(prev_oi > 0, oi_chg / prev_oi * 100, np.nan)
-        z[f'{leg}_Buildup'] = [
-            classify_buildup(p, o, t)
-            for p, o in zip(z[f'{leg}_LTP_chg_pct'], z[f'{leg}_OI_chg_pct'])
-        ]
-        z[f'{leg}_Bias'] = [BUILDUP_BIAS[leg].get(b, "") for b in z[f'{leg}_Buildup']]
-    return z.reset_index(drop=True)
-
-
+"""Per-strike buildup for both legs across ATM +- width strikes."""
+z = df[(df['Strike'] >= atm - width * STRIKE_STEP) &
+(df['Strike'] <= atm + width * STRIKE_STEP)].copy()
+if z.empty:
+return z
+for leg in ('CE', 'PE'):
+prev_ltp = pd.to_numeric(z.get(f'{leg}_prevClose'), errors='coerce')
+prev_oi = pd.to_numeric(z.get(f'{leg}_OI_prev'), errors='coerce')
+ltp = pd.to_numeric(z[f'{leg}_LTP'], errors='coerce')
+oi_chg = pd.to_numeric(z[f'{leg}_OI_chg'], errors='coerce')
+z[f'{leg}_LTP_chg_pct'] = np.where(prev_ltp > 0, (ltp - prev_ltp) / prev_ltp * 100, np.nan)
+z[f'{leg}_OI_chg_pct'] = np.where(prev_oi > 0, oi_chg / prev_oi * 100, np.nan)
+z[f'{leg}_Buildup'] = [
+classify_buildup(p, o, t)
+for p, o in zip(z[f'{leg}_LTP_chg_pct'], z[f'{leg}_OI_chg_pct'])
+]
+z[f'{leg}_Bias'] = [BUILDUP_BIAS[leg].get(b, "") for b in z[f'{leg}_Buildup']]
+return z.reset_index(drop=True)
 def summarize_buildup(bt: pd.DataFrame, spot):
-    """Rolls the per-strike labels into a directional tally.
-
-    Strikes are weighted by the SIZE of the OI change, not counted equally:
-    one strike where 6M contracts were written matters more than four wing
-    strikes that moved a few thousand each, and an unweighted count would
-    let the thin wings outvote the money."""
-    if bt.empty:
-        return None
-    rows = []
-    for leg in ('CE', 'PE'):
-        for _, r in bt.iterrows():
-            b = r[f'{leg}_Buildup']
-            if b in ("Flat", "No data"):
-                continue
-            rows.append({'leg': leg, 'strike': r['Strike'], 'buildup': b,
-                         'bias': r[f'{leg}_Bias'], 'weight': abs(r[f'{leg}_OI_chg'])})
-    if not rows:
-        return None
-    a = pd.DataFrame(rows)
-    bull = a.loc[a['bias'] == 'bullish', 'weight'].sum()
-    bear = a.loc[a['bias'] == 'bearish', 'weight'].sum()
-    total = bull + bear
-    net_pct = ((bull - bear) / total * 100) if total else 0.0
-    counts = a.groupby(['leg', 'buildup'])['weight'].sum().unstack(fill_value=0)
-
-    # Where the biggest single commitment sits, and on which side of spot.
-    top = a.loc[a['weight'].idxmax()]
-    side = ("above spot" if spot and top['strike'] > spot else
-            "below spot" if spot and top['strike'] < spot else "at spot")
-
-    if net_pct > 20:
-        verdict, color = "🟢 Net BULLISH buildup", "#1e7e34"
-    elif net_pct < -20:
-        verdict, color = "🔴 Net BEARISH buildup", "#c82333"
-    else:
-        verdict, color = "⚪ Mixed / two-way buildup", "#6c757d"
-
-    # Complete 2x4 matrix, zeros included. Absent categories previously just
-    # disappeared, which reads as a broken feature rather than as "no CE Long
-    # Buildup happened today" -- a real and fairly common state, e.g. when both
-    # legs are bleeding to IV crush and nothing anywhere is being bought.
-    matrix = {}
-    for leg in ('CE', 'PE'):
-        for lab in ("Long Buildup", "Short Buildup", "Short Covering", "Long Unwinding"):
-            sub = a[(a['leg'] == leg) & (a['buildup'] == lab)]
-            matrix[(leg, lab)] = {
-                'weight': float(sub['weight'].sum()),
-                'strikes': int(len(sub)),
-                'bias': BUILDUP_BIAS[leg][lab],
-                'top_strike': float(sub.loc[sub['weight'].idxmax(), 'strike']) if not sub.empty else None,
-            }
-
-    return {'bull_weight': bull, 'bear_weight': bear, 'net_pct': net_pct,
-            'verdict': verdict, 'color': color, 'counts': counts, 'detail': a,
-            'matrix': matrix,
-            'top_leg': top['leg'], 'top_strike': top['strike'],
-            'top_buildup': top['buildup'], 'top_weight': top['weight'], 'top_side': side}
-
-
+"""Rolls the per-strike labels into a directional tally.
+Strikes are weighted by the SIZE of the OI change, not counted equally:
+one strike where 6M contracts were written matters more than four wing
+strikes that moved a few thousand each, and an unweighted count would
+let the thin wings outvote the money."""
+if bt.empty:
+return None
+rows = []
+for leg in ('CE', 'PE'):
+for _, r in bt.iterrows():
+b = r[f'{leg}_Buildup']
+if b in ("Flat", "No data"):
+continue
+rows.append({'leg': leg, 'strike': r['Strike'], 'buildup': b,
+'bias': r[f'{leg}_Bias'], 'weight': abs(r[f'{leg}_OI_chg'])})
+if not rows:
+return None
+a = pd.DataFrame(rows)
+bull = a.loc[a['bias'] == 'bullish', 'weight'].sum()
+bear = a.loc[a['bias'] == 'bearish', 'weight'].sum()
+total = bull + bear
+net_pct = ((bull - bear) / total * 100) if total else 0.0
+counts = a.groupby(['leg', 'buildup'])['weight'].sum().unstack(fill_value=0)
+# Where the biggest single commitment sits, and on which side of spot.
+top = a.loc[a['weight'].idxmax()]
+side = ("above spot" if spot and top['strike'] > spot else
+"below spot" if spot and top['strike'] < spot else "at spot")
+if net_pct > 20:
+verdict, color = "🟢 Net BULLISH buildup", "#1e7e34"
+elif net_pct < -20:
+verdict, color = "🔴 Net BEARISH buildup", "#c82333"
+else:
+verdict, color = "⚪ Mixed / two-way buildup", "#6c757d"
+# Complete 2x4 matrix, zeros included. Absent categories previously just
+# disappeared, which reads as a broken feature rather than as "no CE Long
+# Buildup happened today" -- a real and fairly common state, e.g. when both
+# legs are bleeding to IV crush and nothing anywhere is being bought.
+matrix = {}
+for leg in ('CE', 'PE'):
+for lab in ("Long Buildup", "Short Buildup", "Short Covering", "Long Unwinding"):
+sub = a[(a['leg'] == leg) & (a['buildup'] == lab)]
+matrix[(leg, lab)] = {
+'weight': float(sub['weight'].sum()),
+'strikes': int(len(sub)),
+'bias': BUILDUP_BIAS[leg][lab],
+'top_strike': float(sub.loc[sub['weight'].idxmax(), 'strike']) if not sub.empty else None,
+}
+return {'bull_weight': bull, 'bear_weight': bear, 'net_pct': net_pct,
+'verdict': verdict, 'color': color, 'counts': counts, 'detail': a,
+'matrix': matrix,
+'top_leg': top['leg'], 'top_strike': top['strike'],
+'top_buildup': top['buildup'], 'top_weight': top['weight'], 'top_side': side}
 # ==========================================
 # ZONE A — PCR REGIME CLASSIFICATION (Analysis!A2:E16)
 # ==========================================
@@ -1433,84 +1280,74 @@ def summarize_buildup(bt: pd.DataFrame, spot):
 # know your OverBought/Bullish/Bearish/Oversold thresholds may need
 # retuning if you do, since the zone's OI totals will shift.
 def zone_a_classification(df: pd.DataFrame, atm: float, width: int, thresholds: dict, symmetric: bool = False):
-    lower = atm - width * STRIKE_STEP
-    upper = atm + width * STRIKE_STEP if symmetric else atm + (width - 1) * STRIKE_STEP
-    zone = df[(df['Strike'] >= lower) & (df['Strike'] <= upper)]
-    ce_oi_sum, pe_oi_sum = zone['CE_OI'].sum(), zone['PE_OI'].sum()
-    pcr = (pe_oi_sum / ce_oi_sum) if ce_oi_sum else np.nan
-    if pd.isna(pcr):
-        classification = "N/A"
-    elif pcr > thresholds['overbought']:
-        classification = "OverBought"
-    elif pcr > thresholds['bullish']:
-        classification = "Bullish"
-    elif pcr == thresholds['bullish']:
-        classification = "Neutral"
-    elif pcr > thresholds['bearish']:
-        classification = "Bearish"
-    else:
-        classification = "Oversold"
-    return {'zone': zone, 'ce_oi_sum': ce_oi_sum, 'pe_oi_sum': pe_oi_sum, 'pcr': pcr, 'classification': classification}
-
-
+lower = atm - width * STRIKE_STEP
+upper = atm + width * STRIKE_STEP if symmetric else atm + (width - 1) * STRIKE_STEP
+zone = df[(df['Strike'] >= lower) & (df['Strike'] <= upper)]
+ce_oi_sum, pe_oi_sum = zone['CE_OI'].sum(), zone['PE_OI'].sum()
+pcr = (pe_oi_sum / ce_oi_sum) if ce_oi_sum else np.nan
+if pd.isna(pcr):
+classification = "N/A"
+elif pcr > thresholds['overbought']:
+classification = "OverBought"
+elif pcr > thresholds['bullish']:
+classification = "Bullish"
+elif pcr == thresholds['bullish']:
+classification = "Neutral"
+elif pcr > thresholds['bearish']:
+classification = "Bearish"
+else:
+classification = "Oversold"
+return {'zone': zone, 'ce_oi_sum': ce_oi_sum, 'pe_oi_sum': pe_oi_sum, 'pcr': pcr, 'classification': classification}
 # ==========================================
 # ZONE B — OI-CHANGE WRITER SIGNAL (Analysis!A19:H29)
 # ==========================================
 def zone_b_signal(df: pd.DataFrame, atm: float, width: int, thresholds: dict):
-    zone = df[(df['Strike'] >= atm - width * STRIKE_STEP) & (df['Strike'] <= atm + width * STRIKE_STEP)]
-    ce_chg_sum, pe_chg_sum = zone['CE_OI_chg'].sum(), zone['PE_OI_chg'].sum()
-    total_chg_base = ce_chg_sum + pe_chg_sum
-    if total_chg_base == 0:
-        choi_ce, choi_pe = 0.0, 0.0
-    else:
-        choi_ce = ce_chg_sum / total_chg_base * 100
-        choi_pe = pe_chg_sum / total_chg_base * 100
-
-    ce_vol_sum, pe_vol_sum = zone['CE_Volume'].sum(), zone['PE_Volume'].sum()
-    total_vol = ce_vol_sum + pe_vol_sum
-    ce_vol_pct = (ce_vol_sum / total_vol * 100) if total_vol else 50.0
-    pe_vol_pct = 100 - ce_vol_pct
-    ce_vol_imbalance = ce_vol_pct - pe_vol_pct  # Analysis!F19 = E20-F20, E20=CE vol%, F20=PE vol%
-
-    diff = choi_pe - choi_ce
-    if diff > thresholds['strong']:
-        signal = "Buy CE"
-    elif diff > thresholds['mild']:
-        signal = "Write PE"
-    elif -diff > thresholds['strong']:
-        signal = "Buy PE"
-    elif -diff > thresholds['mild']:
-        signal = "Write CE"
-    else:
-        signal = "Neutral"
-
-    ce_ltp_avg = zone['CE_LTP'].mean() if len(zone) else np.nan
-    pe_ltp_avg = zone['PE_LTP'].mean() if len(zone) else np.nan
-
-    return {
-        'zone': zone, 'ce_chg_sum': ce_chg_sum, 'pe_chg_sum': pe_chg_sum,
-        'choi_ce': choi_ce, 'choi_pe': choi_pe, 'ce_vol_imbalance': ce_vol_imbalance,
-        'signal': signal, 'ce_ltp_avg': ce_ltp_avg, 'pe_ltp_avg': pe_ltp_avg,
-    }
-
-
+zone = df[(df['Strike'] >= atm - width * STRIKE_STEP) & (df['Strike'] <= atm + width * STRIKE_STEP)]
+ce_chg_sum, pe_chg_sum = zone['CE_OI_chg'].sum(), zone['PE_OI_chg'].sum()
+total_chg_base = ce_chg_sum + pe_chg_sum
+if total_chg_base == 0:
+choi_ce, choi_pe = 0.0, 0.0
+else:
+choi_ce = ce_chg_sum / total_chg_base * 100
+choi_pe = pe_chg_sum / total_chg_base * 100
+ce_vol_sum, pe_vol_sum = zone['CE_Volume'].sum(), zone['PE_Volume'].sum()
+total_vol = ce_vol_sum + pe_vol_sum
+ce_vol_pct = (ce_vol_sum / total_vol * 100) if total_vol else 50.0
+pe_vol_pct = 100 - ce_vol_pct
+ce_vol_imbalance = ce_vol_pct - pe_vol_pct  # Analysis!F19 = E20-F20, E20=CE vol%, F20=PE vol%
+diff = choi_pe - choi_ce
+if diff > thresholds['strong']:
+signal = "Buy CE"
+elif diff > thresholds['mild']:
+signal = "Write PE"
+elif -diff > thresholds['strong']:
+signal = "Buy PE"
+elif -diff > thresholds['mild']:
+signal = "Write CE"
+else:
+signal = "Neutral"
+ce_ltp_avg = zone['CE_LTP'].mean() if len(zone) else np.nan
+pe_ltp_avg = zone['PE_LTP'].mean() if len(zone) else np.nan
+return {
+'zone': zone, 'ce_chg_sum': ce_chg_sum, 'pe_chg_sum': pe_chg_sum,
+'choi_ce': choi_ce, 'choi_pe': choi_pe, 'ce_vol_imbalance': ce_vol_imbalance,
+'signal': signal, 'ce_ltp_avg': ce_ltp_avg, 'pe_ltp_avg': pe_ltp_avg,
+}
 # ==========================================
 # MASTER SIGNAL — 'Dash Board'!F1
 # ==========================================
 def master_signal(pcr, ce_vol_imbalance, choi_ce, choi_pe, ce_ltp, pe_ltp, t: dict):
-    if pd.isna(pcr):
-        return "wait for data confirmation"
-    if pcr > t['pcr_high'] and ce_vol_imbalance < -t['vol_imbalance_strong'] and choi_pe > choi_ce and ce_ltp > pe_ltp:
-        return "Strong CE Buy"
-    if pcr < t['pcr_low'] and ce_vol_imbalance > t['vol_imbalance_strong'] and choi_pe < choi_ce and ce_ltp < pe_ltp:
-        return "Strong PE Buy"
-    if pcr >= t['pcr_high'] and choi_pe > choi_ce and ce_vol_imbalance < -t['vol_imbalance_mild']:
-        return "PE writers strong"
-    if pcr < t['pcr_ce_writers'] and choi_ce > choi_pe and ce_vol_imbalance > t['vol_imbalance_mild']:
-        return "CE writers strong"
-    return "wait for data confirmation"
-
-
+if pd.isna(pcr):
+return "wait for data confirmation"
+if pcr > t['pcr_high'] and ce_vol_imbalance < -t['vol_imbalance_strong'] and choi_pe > choi_ce and ce_ltp > pe_ltp:
+return "Strong CE Buy"
+if pcr < t['pcr_low'] and ce_vol_imbalance > t['vol_imbalance_strong'] and choi_pe < choi_ce and ce_ltp < pe_ltp:
+return "Strong PE Buy"
+if pcr >= t['pcr_high'] and choi_pe > choi_ce and ce_vol_imbalance < -t['vol_imbalance_mild']:
+return "PE writers strong"
+if pcr < t['pcr_ce_writers'] and choi_ce > choi_pe and ce_vol_imbalance > t['vol_imbalance_mild']:
+return "CE writers strong"
+return "wait for data confirmation"
 # ==========================================
 # SIGNAL PROGRESS — how close is each tier to firing?
 # ==========================================
@@ -1524,89 +1361,79 @@ def master_signal(pcr, ce_vol_imbalance, choi_ce, choi_pe, ce_ltp, pe_ltp, t: di
 # does), so showing it as a staircase would misrepresent your own formula.
 # Instead each tier gets its own honest checklist.
 def evaluate_signal_tiers(pcr, ce_vol_imbalance, choi_ce, choi_pe, ce_ltp, pe_ltp, t: dict):
-    if pd.isna(pcr):
-        return {}
-
-    tier_defs = {
-        "Strong CE Buy": [
-            (f"PCR > {t['pcr_high']:.2f}", pcr > t['pcr_high'], pcr - t['pcr_high']),
-            (f"CE Vol Imbalance < -{t['vol_imbalance_strong']:.0f}",
-             ce_vol_imbalance < -t['vol_imbalance_strong'], (-t['vol_imbalance_strong']) - ce_vol_imbalance),
-            ("Choi_PE > Choi_CE", choi_pe > choi_ce, choi_pe - choi_ce),
-            ("CE LTP > PE LTP", ce_ltp > pe_ltp, ce_ltp - pe_ltp),
-        ],
-        "Strong PE Buy": [
-            (f"PCR < {t['pcr_low']:.2f}", pcr < t['pcr_low'], t['pcr_low'] - pcr),
-            (f"CE Vol Imbalance > {t['vol_imbalance_strong']:.0f}",
-             ce_vol_imbalance > t['vol_imbalance_strong'], ce_vol_imbalance - t['vol_imbalance_strong']),
-            ("Choi_PE < Choi_CE", choi_pe < choi_ce, choi_ce - choi_pe),
-            ("CE LTP < PE LTP", ce_ltp < pe_ltp, pe_ltp - ce_ltp),
-        ],
-        "PE writers strong": [
-            (f"PCR >= {t['pcr_high']:.2f}", pcr >= t['pcr_high'], pcr - t['pcr_high']),
-            ("Choi_PE > Choi_CE", choi_pe > choi_ce, choi_pe - choi_ce),
-            (f"CE Vol Imbalance < -{t['vol_imbalance_mild']:.0f}",
-             ce_vol_imbalance < -t['vol_imbalance_mild'], (-t['vol_imbalance_mild']) - ce_vol_imbalance),
-        ],
-        "CE writers strong": [
-            (f"PCR < {t['pcr_ce_writers']:.2f}", pcr < t['pcr_ce_writers'], t['pcr_ce_writers'] - pcr),
-            ("Choi_CE > Choi_PE", choi_ce > choi_pe, choi_ce - choi_pe),
-            (f"CE Vol Imbalance > {t['vol_imbalance_mild']:.0f}",
-             ce_vol_imbalance > t['vol_imbalance_mild'], ce_vol_imbalance - t['vol_imbalance_mild']),
-        ],
-    }
-
-    report = {}
-    for tier, conditions in tier_defs.items():
-        met = sum(1 for _, ok, _ in conditions if ok)
-        report[tier] = {'met': met, 'total': len(conditions), 'conditions': conditions}
-    return report
-
-
+if pd.isna(pcr):
+return {}
+tier_defs = {
+"Strong CE Buy": [
+(f"PCR > {t['pcr_high']:.2f}", pcr > t['pcr_high'], pcr - t['pcr_high']),
+(f"CE Vol Imbalance < -{t['vol_imbalance_strong']:.0f}",
+ce_vol_imbalance < -t['vol_imbalance_strong'], (-t['vol_imbalance_strong']) - ce_vol_imbalance),
+("Choi_PE > Choi_CE", choi_pe > choi_ce, choi_pe - choi_ce),
+("CE LTP > PE LTP", ce_ltp > pe_ltp, ce_ltp - pe_ltp),
+],
+"Strong PE Buy": [
+(f"PCR < {t['pcr_low']:.2f}", pcr < t['pcr_low'], t['pcr_low'] - pcr),
+(f"CE Vol Imbalance > {t['vol_imbalance_strong']:.0f}",
+ce_vol_imbalance > t['vol_imbalance_strong'], ce_vol_imbalance - t['vol_imbalance_strong']),
+("Choi_PE < Choi_CE", choi_pe < choi_ce, choi_ce - choi_pe),
+("CE LTP < PE LTP", ce_ltp < pe_ltp, pe_ltp - ce_ltp),
+],
+"PE writers strong": [
+(f"PCR >= {t['pcr_high']:.2f}", pcr >= t['pcr_high'], pcr - t['pcr_high']),
+("Choi_PE > Choi_CE", choi_pe > choi_ce, choi_pe - choi_ce),
+(f"CE Vol Imbalance < -{t['vol_imbalance_mild']:.0f}",
+ce_vol_imbalance < -t['vol_imbalance_mild'], (-t['vol_imbalance_mild']) - ce_vol_imbalance),
+],
+"CE writers strong": [
+(f"PCR < {t['pcr_ce_writers']:.2f}", pcr < t['pcr_ce_writers'], t['pcr_ce_writers'] - pcr),
+("Choi_CE > Choi_PE", choi_ce > choi_pe, choi_ce - choi_pe),
+(f"CE Vol Imbalance > {t['vol_imbalance_mild']:.0f}",
+ce_vol_imbalance > t['vol_imbalance_mild'], ce_vol_imbalance - t['vol_imbalance_mild']),
+],
+}
+report = {}
+for tier, conditions in tier_defs.items():
+met = sum(1 for _, ok, _ in conditions if ok)
+report[tier] = {'met': met, 'total': len(conditions), 'conditions': conditions}
+return report
 # ==========================================
 # ACTION TAG — 'Dash Board'!L3 (ordered lookup, first match wins)
 # ==========================================
 ACTION_RULES = [
-    ("Oversold", "Neutral", "Write PE"),
-    ("Bearish", "Neutral", "wait"),
-    ("OverBought", "Neutral", "Write CE"),
-    ("Bullish", "Neutral", "wait"),
-    ("Bullish", "Write PE", "Buy CE"),
-    ("Bearish", "Write CE", "Buy PE"),
-    ("Oversold", "Write PE", "Write PE"),
-    ("Bearish", "Write PE", "Write PE"),
-    ("Bearish", "Buy CE", "Reversal"),
-    ("Bullish", "Buy PE", "Reversal"),
-    ("Bullish", "Buy CE", "Buy CE"),
-    ("Oversold", "Buy PE", "Buy PE/Write CE"),
-    ("Oversold", "Buy CE", "Buy CE/Write PE"),
-    ("Oversold", "Write CE", "Write CE"),
+("Oversold", "Neutral", "Write PE"),
+("Bearish", "Neutral", "wait"),
+("OverBought", "Neutral", "Write CE"),
+("Bullish", "Neutral", "wait"),
+("Bullish", "Write PE", "Buy CE"),
+("Bearish", "Write CE", "Buy PE"),
+("Oversold", "Write PE", "Write PE"),
+("Bearish", "Write PE", "Write PE"),
+("Bearish", "Buy CE", "Reversal"),
+("Bullish", "Buy PE", "Reversal"),
+("Bullish", "Buy CE", "Buy CE"),
+("Oversold", "Buy PE", "Buy PE/Write CE"),
+("Oversold", "Buy CE", "Buy CE/Write PE"),
+("Oversold", "Write CE", "Write CE"),
 ]
-
-
 def action_tag(classification: str, signal: str) -> str:
-    for cls, sig, action in ACTION_RULES:
-        if classification == cls and signal == sig:
-            return action
-    return ""
-
-
+for cls, sig, action in ACTION_RULES:
+if classification == cls and signal == sig:
+return action
+return ""
 # ==========================================
 # MAX PAIN (new — not in the original workbook)
 # ==========================================
 def max_pain(df: pd.DataFrame):
-    strikes = df['Strike'].values
-    ce_oi = df['CE_OI'].values
-    pe_oi = df['PE_OI'].values
-    pains = []
-    for k in strikes:
-        call_writer_loss = np.sum(ce_oi * np.maximum(k - strikes, 0))
-        put_writer_loss = np.sum(pe_oi * np.maximum(strikes - k, 0))
-        pains.append(call_writer_loss + put_writer_loss)
-    idx = int(np.argmin(pains))
-    return float(strikes[idx])
-
-
+strikes = df['Strike'].values
+ce_oi = df['CE_OI'].values
+pe_oi = df['PE_OI'].values
+pains = []
+for k in strikes:
+call_writer_loss = np.sum(ce_oi * np.maximum(k - strikes, 0))
+put_writer_loss = np.sum(pe_oi * np.maximum(strikes - k, 0))
+pains.append(call_writer_loss + put_writer_loss)
+idx = int(np.argmin(pains))
+return float(strikes[idx])
 # ==========================================
 # MODULE 1 — GAMMA (GEX) & DELTA (DEX) EXPOSURE, DEALER GAMMA FLIP LEVEL
 # ==========================================
