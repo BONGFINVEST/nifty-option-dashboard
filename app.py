@@ -483,17 +483,14 @@ def render_fetch_error(error: str):
     """Renders a token-expiry error distinctly from a generic API error, since
     the fix is completely different (regenerate token vs. investigate a real
     problem) and a raw JSON dump doesn't make that obvious at a glance."""
-    if is_auth_error(error):
+        if is_auth_error(error):
         st.session_state.token_status = 'expired'
         st.error(
             "🔑 **Dhan access token has expired or is invalid.**\n\n"
-            "This is expected once a day with a 24-hour token — not a bug. To fix:\n\n"
-            "1. Dhan app/web → **My Profile → DhanHQ Trading APIs → Generate Token**\n\n"
-            "2. Copy the new token\n\n"
-            "3. Streamlit Cloud → your app → **Settings → Secrets** → update `DHAN_ACCESS_TOKEN` → Save\n\n"
-            "The app will reconnect automatically on its next poll once the new token is saved "
+            ...
             "— no need to redeploy or restart anything manually."
         )
+        st.stop()   # ← ADD THIS LINE
     else:
         st.session_state.token_status = 'ok'
         st.error(f"❌ {error}")
