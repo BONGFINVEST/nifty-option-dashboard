@@ -1,5 +1,5 @@
 """
-INSTITUTIONAL NIFTY OI SCANNER
+INSTITUTIONAL NIFTY OI SCANNER | Bong Finvest
 ==============================
 This automates the exact manual workflow from OI_Analysis_NIFTY.xlsx:
 
