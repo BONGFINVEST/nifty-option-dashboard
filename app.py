@@ -1,5 +1,5 @@
 """
-INSTITUTIONAL NIFTY OI SCANNER | Bong Finvest
+INSTITUTIONAL NIFTY OI SCANNER 
 ==============================
 This automates the exact manual workflow from OI_Analysis_NIFTY.xlsx:
 
@@ -67,7 +67,7 @@ from pathlib import Path
 import requests
 from streamlit_autorefresh import st_autorefresh
 
-st.set_page_config(page_title="Institutional NIFTY OI Scanner | Bong Finvest", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Institutional NIFTY OI Scanner", layout="wide", initial_sidebar_state="expanded")
 
 # ==========================================
 # CONSTANTS
