@@ -70,56 +70,6 @@ from streamlit_autorefresh import st_autorefresh
 st.set_page_config(page_title="Institutional NIFTY OI Scanner", layout="wide", initial_sidebar_state="expanded")
 
 # ==========================================
-# 🔍 PASTE DIAGNOSTIC SCRIPT HERE
-# ==========================================
-st.title("🔍 Dhan Token Diagnostic")
-st.write("Running diagnostic... please wait.")
-
-# 1. Check Secrets
-if 'DHAN_ACCESS_TOKEN' not in st.secrets or 'DHAN_CLIENT_ID' not in st.secrets:
-    st.error("❌ Secrets not found! Check Settings -> Secrets.")
-    st.stop()
-
-token = st.secrets['DHAN_ACCESS_TOKEN']
-client_id = st.secrets['DHAN_CLIENT_ID']
-
-st.subheader("1. Secret Analysis")
-st.write(f"**Token Length:** {len(token)}")
-st.write(f"**Client ID:** {client_id}")
-
-if token != token.strip():
-    st.error("⚠️ **CRITICAL:** Hidden spaces/newlines found in token!")
-else:
-    st.success("✅ Token looks clean (no leading/trailing spaces).")
-
-# 2. Test API
-st.subheader("2. Dhan API Test")
-headers = {
-    "access-token": token.strip(),
-    "client-id": str(client_id).strip(),
-    "Accept": "application/json",
-    "Content-Type": "application/json"
-}
-
-try:
-    response = requests.get("https://api.dhan.co/v2/profile", headers=headers, timeout=10)
-    st.write(f"**HTTP Status:** {response.status_code}")
-
-    if response.status_code == 200:
-        st.success(" SUCCESS! Token is valid and working.")
-        st.json(response.json())
-    else:
-        st.error(f"❌ Dhan rejected request (HTTP {response.status_code})")
-        st.code(response.text)
-except Exception as e:
-    st.error(f"Connection error: {e}")
-
-st.stop() # <--- THIS STOPS THE REST OF THE APP FROM RUNNING WHILE WE DEBUG
-# ==========================================
-# END DIAGNOSTIC SCRIPT
-# ==========================================
-
-# ==========================================
 # CONSTANTS
 # ==========================================
 REFRESH_INTERVAL_MS = 10_000
@@ -578,7 +528,7 @@ def get_dhan_headers():
     if 'DHAN_CLIENT_ID' not in st.secrets or 'DHAN_ACCESS_TOKEN' not in st.secrets:
         return None
     return {
-        # .strip() automatically removes any invisible trailing spaces/newlines from copy-pasting
+        # .strip() is critical to remove invisible spaces/newlines from copy-pasting
         "client-id": str(st.secrets['DHAN_CLIENT_ID']).strip(),
         "access-token": str(st.secrets['DHAN_ACCESS_TOKEN']).strip(),
         "Accept": "application/json",
