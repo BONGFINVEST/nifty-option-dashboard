@@ -523,13 +523,12 @@ if 'DHAN_CLIENT_ID' not in st.secrets or 'DHAN_ACCESS_TOKEN' not in st.secrets:
     st.error("❌ Dhan API credentials not found in Streamlit Secrets!")
     st.stop()
 
-# NEW CODE:
 def get_dhan_headers():
     """Read credentials fresh from secrets on each call, so token updates take effect immediately."""
     if 'DHAN_CLIENT_ID' not in st.secrets or 'DHAN_ACCESS_TOKEN' not in st.secrets:
         return None
     return {
-        # .strip() removes any invisible trailing spaces/newlines from copy-pasting
+        # .strip() automatically removes any invisible trailing spaces/newlines from copy-pasting
         "client-id": str(st.secrets['DHAN_CLIENT_ID']).strip(),
         "access-token": str(st.secrets['DHAN_ACCESS_TOKEN']).strip(),
         "Accept": "application/json",
