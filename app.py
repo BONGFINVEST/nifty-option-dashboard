@@ -529,12 +529,12 @@ def get_dhan_headers():
     if 'DHAN_CLIENT_ID' not in st.secrets or 'DHAN_ACCESS_TOKEN' not in st.secrets:
         return None
     return {
-        "client-id": st.secrets['DHAN_CLIENT_ID'],
-        "access-token": st.secrets['DHAN_ACCESS_TOKEN'],
+        # .strip() removes any invisible trailing spaces/newlines from copy-pasting
+        "client-id": str(st.secrets['DHAN_CLIENT_ID']).strip(),
+        "access-token": str(st.secrets['DHAN_ACCESS_TOKEN']).strip(),
         "Accept": "application/json",
         "Content-Type": "application/json",
     }
-
 # 🔧 FIX: Assign the headers to the global variable expected by the fetch functions.
 # Because Streamlit reruns the script on every 10s poll/interaction, this still 
 # satisfies the "read credentials fresh" requirement.
